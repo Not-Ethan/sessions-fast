@@ -59,6 +59,91 @@ pub fn pack(s: &[u8]) -> Option<u64> {
     Some((acc << (6 * (10 - n) + 4)) | n as u64)
 }
 
+/// `pack(s)` for a string at most 10 bytes long whose first 16 bytes from
+/// its start are readable (they may extend past `s`). Branch-free.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn pack_wide(s: &[u8]) -> Option<u64> {
+    use std::arch::x86_64::*;
+    // x86-64-v2 baseline: SSSE3 / SSE4.1 are always available.
+    let n = s.len();
+    let v = _mm_loadu_si128(s.as_ptr() as *const __m128i);
+    let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let inlen = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), idx);
+    let hi = _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0F));
+    let lo = _mm_and_si128(v, _mm_set1_epi8(0x0F));
+    // class bits: b0 '-' (hi 2), b1 digits (hi 3), b2 hi 4/6 low 1-F,
+    // b3 hi 5 low 0-A or F, b4 hi 7 low 0-A
+    let lut_hi = _mm_setr_epi8(0, 0, 1, 2, 4, 8, 4, 16, 0, 0, 0, 0, 0, 0, 0, 0);
+    let lut_lo = _mm_setr_epi8(
+        2 | 8 | 16,
+        2 | 4 | 8 | 16,
+        2 | 4 | 8 | 16,
+        2 | 4 | 8 | 16,
+        2 | 4 | 8 | 16,
+        2 | 4 | 8 | 16,
+        2 | 4 | 8 | 16,
+        2 | 4 | 8 | 16,
+        2 | 4 | 8 | 16,
+        2 | 4 | 8 | 16,
+        4 | 8 | 16,
+        4,
+        4,
+        1 | 4,
+        4,
+        4 | 8,
+    );
+    let cls = _mm_and_si128(_mm_shuffle_epi8(lut_hi, hi), _mm_shuffle_epi8(lut_lo, lo));
+    let invalid = _mm_and_si128(_mm_cmpeq_epi8(cls, _mm_setzero_si128()), inlen);
+    let off = _mm_shuffle_epi8(
+        _mm_setr_epi8(0, 0, -0x2D, -0x2F, -0x36, -0x36, -0x3B, -0x3B, 0, 0, 0, 0, 0, 0, 0, 0),
+        hi,
+    );
+    let us = _mm_and_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(0x5F)), _mm_set1_epi8(-4));
+    let codes = _mm_and_si128(_mm_add_epi8(_mm_add_epi8(v, off), us), inlen);
+    let t = _mm_maddubs_epi16(codes, _mm_set1_epi16(0x0140));
+    let u = _mm_madd_epi16(t, _mm_set1_epi32(0x0001_1000));
+    let l0 = _mm_cvtsi128_si32(u) as u32 as u64;
+    let l1 = _mm_extract_epi32::<1>(u) as u32 as u64;
+    let l2 = _mm_extract_epi32::<2>(u) as u32 as u64;
+    let key = (((l0 << 36) | (l1 << 12) | (l2 >> 12)) << 4) | n as u64;
+    if (_mm_movemask_epi8(invalid) == 0) & (n.wrapping_sub(1) < 10) {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+/// `pack(s)` for a string whose first 16 bytes from its start are readable.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn pack_wide(s: &[u8]) -> Option<u64> {
+    let n = s.len();
+    let p = s.as_ptr();
+    let mut acc = 0u64;
+    let mut bad = 0u8;
+    for i in 0..10 {
+        let code = CODE[*p.add(i) as usize];
+        let m = if i < n { 0xFF } else { 0 };
+        bad |= code & m;
+        acc = (acc << 6) | (code & m & 63) as u64;
+    }
+    if (bad & INVALID == 0) & (n.wrapping_sub(1) < 10) {
+        Some((acc << 4) | n as u64)
+    } else {
+        None
+    }
+}
+
+/// `key_of(s)` with the 16-byte readability guarantee of `pack_wide`.
+#[inline(always)]
+pub unsafe fn key_of_wide(s: &[u8]) -> u64 {
+    match pack_wide(s) {
+        Some(k) => k,
+        None => intern(s),
+    }
+}
+
 /// Key of a non-empty string.
 #[inline(always)]
 pub fn key_of(s: &[u8]) -> u64 {
@@ -147,6 +232,51 @@ pub fn mix(k: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pack_wide` agrees with `pack` on every string, whatever follows it.
+    #[test]
+    fn pack_wide_matches_pack() {
+        let mut x: u64 = 0xDEAD_BEEF_1234_5677;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut ok = 0u64;
+        for round in 0..5_000_000u64 {
+            let n = (next() % 14) as usize;
+            let mut s = Vec::with_capacity(n + 20);
+            for _ in 0..n {
+                let r = next();
+                let c = match r % 8 {
+                    0 => (r >> 8) as u8,
+                    1 => ALPHABET[((r >> 8) % 64) as usize].wrapping_add(((r >> 16) % 3) as u8).wrapping_sub(1),
+                    _ => ALPHABET[((r >> 8) % 64) as usize],
+                };
+                s.push(c);
+            }
+            let want = pack(&s);
+            ok += want.is_some() as u64;
+            for _ in 0..20 {
+                s.push(if round % 2 == 0 { (next() & 0xFF) as u8 } else { ALPHABET[(next() % 64) as usize] });
+            }
+            assert_eq!(unsafe { pack_wide(&s[..n]) }, want, "{:?}", &s[..n]);
+        }
+        assert!(ok > 1_000_000);
+        // every single byte value at every position
+        for n in 1..=11usize {
+            for pos in 0..n {
+                for c in 0..=255u8 {
+                    let mut s = vec![b'a'; n];
+                    s[pos] = c;
+                    let want = pack(&s);
+                    s.extend_from_slice(&[0xFF; 20]);
+                    assert_eq!(unsafe { pack_wide(&s[..n]) }, want);
+                }
+            }
+        }
+    }
 
     #[test]
     fn roundtrip_and_order() {

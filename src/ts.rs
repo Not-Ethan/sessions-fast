@@ -283,6 +283,119 @@ impl TsParser {
     }
 }
 
+/// Bytes `at..at + 8` of `p` as a little-endian u64 (no bounds check).
+#[inline(always)]
+unsafe fn rd(p: *const u8, at: usize) -> u64 {
+    u64::from_le(std::ptr::read_unaligned(p.add(at) as *const u64))
+}
+
+/// Nonzero iff some byte lane selected by `lanes` is not an ASCII digit.
+#[inline(always)]
+fn digits_bad(w: u64, lanes: u64) -> u64 {
+    let hi = (w & 0xF0F0_F0F0_F0F0_F0F0) ^ 0x3030_3030_3030_3030;
+    let lo = ((w & 0x0F0F_0F0F_0F0F_0F0F) + 0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0;
+    (hi | lo) & lanes
+}
+
+impl TsParser {
+    /// `YYYY-MM-DDTHH:MM:SS` at p (bytes 0..19) with the day cache:
+    /// (epoch ms, shape and values valid, cache miss). A cache miss means the
+    /// month is outside the cache and the general parser must decide.
+    #[inline(always)]
+    unsafe fn civil_wide(&self, p: *const u8) -> (i64, bool, bool) {
+        let w0 = rd(p, 0);
+        let w1 = rd(p, 8);
+        let w2 = rd(p, 12);
+        let bad = ((w0 & SEP_MASK_W0) ^ SEP_W0)
+            | ((w1 & SEP_MASK_W1) ^ SEP_W1)
+            | ((w2 & SEP_MASK_W2) ^ SEP_W2)
+            | digits_bad(w0, DIGIT_LANES_W0)
+            | digits_bad(w1, DIGIT_LANES_W1)
+            | digits_bad(w2, DIGIT_LANES_W2);
+        let p0 = pairs(w0);
+        let p1 = pairs(w1);
+        let p2 = pairs(w2);
+        let y = lane(p0, 0) * 100 + lane(p0, 2);
+        let mo = lane(p0, 5);
+        let d = lane(p1, 0);
+        let h = lane(p1, 3);
+        let mi = lane(p1, 6);
+        let s = lane(p2, 5);
+        let range_ok = (mo.wrapping_sub(1) < 12) & (d.wrapping_sub(1) < 31) & (h <= 23) & (mi <= 59) & (s <= 59);
+        let month = (y as i64) * 12 + (mo as i64 - 1) - self.base_month;
+        let in_cache = (month as u64) < self.nmonths as u64;
+        let idx = if in_cache { (month * 32) as usize + (d & 31) as usize } else { 0 };
+        let day = *self.days.get_unchecked(idx);
+        let shape_ok = bad == 0 && range_ok;
+        let ok = shape_ok & in_cache & (day != i32::MIN);
+        let ms = ((day as i64 * 24 + h as i64) * 60 + mi as i64) * 60_000 + s as i64 * 1000;
+        (ms, ok, shape_ok & !in_cache)
+    }
+
+    /// Same result as `parse_ts(b)` for every input. `b` must start at `p`,
+    /// and 32 bytes from `p` must be readable (they may extend past `b`).
+    /// The three common shapes (F1, F2, 13-digit F3) are decoded without
+    /// branching on the shape; anything else goes to the general parser.
+    #[inline(always)]
+    pub unsafe fn parse_wide(&self, b: &[u8]) -> Option<i64> {
+        let p = b.as_ptr();
+        let n = b.len();
+        let b19 = *p.add(19);
+        let is_f1 = (n == 20) & (b19 == b'Z');
+        let is_f2 = (n == 25) & ((b19 == b'+') | (b19 == b'-')) & (*p.add(22) == b':');
+        let is_f3 = n == 13;
+        if !(is_f1 | is_f2 | is_f3) {
+            return parse_ts(b);
+        }
+        let (civil, civil_ok, miss) = self.civil_wide(p);
+        // F2 offset: w3 = bytes 17..25, lanes 3-4 HH, lanes 6-7 MM
+        let w3 = rd(p, 17);
+        let p3 = pairs(w3);
+        let (oh, om) = (lane(p3, 3), lane(p3, 6));
+        let off_ok = (digits_bad(w3, 0xFFFF_00FF_FF00_0000) == 0) & (oh <= 23) & (om <= 59);
+        let off = (oh * 60 + om) as i64 * 60_000;
+        let f2 = if b19 == b'+' { civil - off } else { civil + off };
+        // F3: 13 digits
+        let wa = rd(p, 0);
+        let wb = rd(p, 5);
+        let f3_ok = (digits_bad(wa, !0) | digits_bad(wb, !0)) == 0;
+        let f3 = (parse8(wa) * 100_000 + parse8((wb & !0xFF_FFFF) | 0x30_3030)) as i64;
+        let civil_shape = !is_f3 & (is_f1 | off_ok);
+        if miss & civil_shape {
+            return parse_ts(b); // month outside the cache: rare
+        }
+        let ok = (is_f3 & f3_ok) | (civil_ok & civil_shape);
+        let v = if is_f3 {
+            f3
+        } else if is_f1 {
+            civil
+        } else {
+            f2
+        };
+        if ok {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    /// `parse_wide` for a field that is almost always F1 (ingest_ts).
+    #[inline(always)]
+    pub unsafe fn parse_wide_f1(&self, b: &[u8]) -> Option<i64> {
+        let p = b.as_ptr();
+        if b.len() == 20 && *p.add(19) == b'Z' {
+            let (civil, ok, miss) = self.civil_wide(p);
+            if ok {
+                return Some(civil);
+            }
+            if !miss {
+                return None;
+            }
+        }
+        parse_ts(b)
+    }
+}
+
 fn civil_year_month(z: i64) -> (i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
@@ -376,6 +489,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `parse_wide` / `parse_wide_f1` agree with `parse_ts` on every input,
+    /// whatever bytes follow the field.
+    #[test]
+    fn wide_matches_general() {
+        let mut x: u64 = 0x1234_5678_9ABC_DEF1;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"0123456789-+:TZtz .e\"\r";
+        let mut count = 0u64;
+        let mut ws = 0i64;
+        let mut p = TsParser::new(0, 1);
+        for round in 0..6_000_000u64 {
+            if round % 2000 == 0 {
+                let r = next();
+                ws = parse_ts(b"2025-01-01T00:00:00Z").unwrap() + ((r >> 3) % (4 * 366)) as i64 * 86_400_000;
+                p = TsParser::new(ws - 10 * 86_400_000, ws + 24 * 86_400_000);
+            }
+            let ms = ws + (next() % (70 * 86_400_000)) as i64 - 30 * 86_400_000;
+            let days = ms.div_euclid(86_400_000);
+            let (y, m) = civil_year_month(days);
+            let dom = days - days_from_civil(y, m, 1) + 1;
+            let sod = ms.rem_euclid(86_400_000) / 1000;
+            let r2 = next();
+            let mut s = match r2 % 6 {
+                0 | 1 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, dom, sod / 3600, sod / 60 % 60, sod % 60),
+                2 => format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+                    y, m, dom, sod / 3600, sod / 60 % 60, sod % 60,
+                    if r2 & 64 == 0 { '+' } else { '-' }, (r2 >> 8) % 26, (r2 >> 16) % 62
+                ),
+                3 => format!("{}", ms),
+                4 => format!("{:0w$}", ms, w = (13 + (r2 >> 8) % 8) as usize),
+                _ => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", 1990 + (r2 >> 9) % 100, (r2 >> 20) % 14,
+                             (r2 >> 30) % 33, (r2 >> 40) % 26, (r2 >> 45) % 62, (r2 >> 50) % 62),
+            }
+            .into_bytes();
+            let k = next();
+            if k % 3 == 0 && !s.is_empty() {
+                let at = (next() as usize) % s.len();
+                s[at] = alphabet[(next() as usize) % alphabet.len()];
+            }
+            if k % 11 == 0 {
+                s.truncate((next() as usize) % (s.len() + 1));
+            }
+            if k % 13 == 0 {
+                s.push(alphabet[(next() as usize) % alphabet.len()]);
+            }
+            // the field followed by random bytes (32 readable bytes guaranteed)
+            let mut buf = s.clone();
+            for _ in 0..40 {
+                buf.push(if round % 2 == 0 { (next() & 0xFF) as u8 } else { alphabet[(next() as usize) % alphabet.len()] });
+            }
+            let field = &buf[..s.len()];
+            let want = parse_ts(&s);
+            assert_eq!(unsafe { p.parse_wide(field) }, want, "{:?}", String::from_utf8_lossy(&s));
+            assert_eq!(unsafe { p.parse_wide_f1(field) }, want, "{:?}", String::from_utf8_lossy(&s));
+            count += want.is_some() as u64;
+        }
+        assert!(count > 2_000_000, "{}", count);
     }
 
     #[test]

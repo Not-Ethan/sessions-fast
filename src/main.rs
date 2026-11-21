@@ -373,14 +373,68 @@ struct ParseOut {
     c: Parts<CRec>,
 }
 
-/// One chunk of events/: parse, validate, route by event_id.
+/// One event line, where 32 bytes from the start of every field are readable.
 #[inline(always)]
-fn event_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, e: &mut Parts<ERec>) {
+fn event_line_wide(f: &[&[u8]; 7], ctx: &Ctx, e: &mut Parts<ERec>) {
     let (ws, we) = (ctx.ws, ctx.we);
+    let Some(ing) = (unsafe { ctx.tsp.parse_wide_f1(f[3]) }) else { return };
+    let eid = keys::mix(unsafe { keys::key_of_wide(f[0]) });
+    let mut r = ERec { eid, ingest: ingest_rel(ing, ctx.ws_s), ..Default::default() };
+    'v: {
+        if f[1].is_empty() || f[5].is_empty() {
+            break 'v;
+        }
+        let Some(t) = (unsafe { ctx.tsp.parse_wide(f[2]) }) else { break 'v };
+        if t < ws || t >= we {
+            break 'v;
+        }
+        let ty = f[4];
+        let w = u64::from_le(unsafe { std::ptr::read_unaligned(ty.as_ptr() as *const u64) });
+        let w4 = w & 0xFFFF_FFFF;
+        let n4 = ty.len();
+        let mut pay = 0u32;
+        if n4 == 8 && w == u64::from_le_bytes(*b"purchase") {
+            let Some(price) = ts::parse_price(f[6]) else { break 'v };
+            let mut cat = unsafe { ctx.products.get_wide(f[5]) } as u32;
+            if cat == NONE as u32 {
+                cat = ctx.unknown_cat;
+            }
+            pay = price | (cat << 24);
+        } else if !(n4 == 4 && (w4 == u32::from_le_bytes(*b"view") as u64 || w4 == u32::from_le_bytes(*b"cart") as u64)) {
+            break 'v;
+        }
+        if ing - t > LATE {
+            break 'v;
+        }
+        r.user = unsafe { keys::key_of_wide(f[1]) };
+        r.ts = (t - ws) as u32 | OK_BIT;
+        r.pay = pay;
+    }
+    e.push((eid >> (64 - ctx.pe_bits)) as usize, r);
+}
+
+/// One chunk of events/: parse, validate, route by event_id. `safe_end` is
+/// the end address of readable memory after `b` (at least `b`'s end).
+#[inline(always)]
+fn event_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, e: &mut Parts<ERec>, safe_end: usize) {
     scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
         if f[0].is_empty() {
             return;
         }
+        if f[6].as_ptr() as usize + 32 <= safe_end {
+            event_line_wide(f, ctx, e);
+        } else {
+            event_line_slow(f, ctx, e);
+        }
+    });
+}
+
+/// One event line, general path (near the end of a buffer).
+#[inline(never)]
+#[cold]
+fn event_line_slow(f: &[&[u8]; 7], ctx: &Ctx, e: &mut Parts<ERec>) {
+    let (ws, we) = (ctx.ws, ctx.we);
+    {
         let Some(ing) = ctx.tsp.parse(f[3]) else { return };
         let eid = keys::mix(keys::key_of(f[0]));
         let mut r = ERec { eid, ingest: ingest_rel(ing, ctx.ws_s), ..Default::default() };
@@ -412,12 +466,12 @@ fn event_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, e: &mut Parts<E
             r.pay = pay;
         }
         e.push((eid >> (64 - ctx.pe_bits)) as usize, r);
-    });
+    }
 }
 
 /// One chunk of clicks/: parse, validate, resolve the person, route by person.
 #[inline(always)]
-fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>) {
+fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>, safe_end: usize) {
     let we = ctx.we;
     let cws = ctx.ws - WEEK;
     // Person lookups go through a small ring so the link-table slot can be
@@ -434,18 +488,21 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let Some(t) = ctx.tsp.parse(f[3]) else { return };
+        let wide = f[3].as_ptr() as usize + 32 <= safe_end;
+        let t = if wide { unsafe { ctx.tsp.parse_wide(f[3]) } } else { ctx.tsp.parse(f[3]) };
+        let Some(t) = t else { return };
         if t < cws || t >= we {
             return;
         }
-        let camp = ctx.campaigns.get(f[2]);
+        let camp = if wide { unsafe { ctx.campaigns.get_wide(f[2]) } } else { ctx.campaigns.get(f[2]) };
         if camp == NONE {
             return;
         }
-        let user = keys::key_of(f[1]);
+        let user = if wide { unsafe { keys::key_of_wide(f[1]) } } else { keys::key_of(f[1]) };
         lt.prefetch(user);
+        let ck = if wide { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) };
         // `person` holds the user key until the lookup in `emit`
-        let r = CRec { person: user, ck: keys::key_of(f[0]), ts: (t - cws) as u32, camp: camp as u32 };
+        let r = CRec { person: user, ck, ts: (t - cws) as u32, camp: camp as u32 };
         if rn == RING {
             emit(c, ring[rh]);
             ring[rh] = r;
@@ -462,14 +519,14 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn event_task_avx2(b: &[u8], task: Task, ctx: &Ctx, e: &mut Parts<ERec>) {
-    event_task::<true>(b, task, ctx, e)
+unsafe fn event_task_avx2(b: &[u8], task: Task, ctx: &Ctx, e: &mut Parts<ERec>, safe_end: usize) {
+    event_task::<true>(b, task, ctx, e, safe_end)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn click_task_avx2(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>) {
-    click_task::<true>(b, task, ctx, lt, c)
+unsafe fn click_task_avx2(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>, safe_end: usize) {
+    click_task::<true>(b, task, ctx, lt, c, safe_end)
 }
 
 /// AVX2 + BMI1/2 available and not disabled with SS_NOAVX2.
@@ -515,7 +572,7 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
     let max_task = ev.tasks.iter().chain(cl.tasks.iter()).map(|t| t.end - t.start).max().unwrap_or(0);
     let outs = par(ctx.threads, |t| {
         let mut out = ParseOut { e: Parts::new(pe, cap_e), c: Parts::new(ps, cap_c) };
-        let mut rbuf: Vec<u8> = if use_read { vec![0u8; max_task] } else { Vec::new() };
+        let mut rbuf: Vec<u8> = if use_read { vec![0u8; max_task + 64] } else { Vec::new() };
         if t < nl {
             link_worker(t, links_in, &lnext, &pairs, &bar, &cell, &f1, &f2);
             if t == 0 {
@@ -530,19 +587,21 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
             if i < ev.tasks.len() {
                 let mut task = ev.tasks[i];
                 let mut b = ev.maps[task.file as usize].bytes();
+                let mut safe_end = b.as_ptr() as usize + b.len();
                 if use_read {
                     let n = task.end - task.start;
                     ev.maps[task.file as usize].read_at(&mut rbuf[..n], task.start);
+                    safe_end = rbuf.as_ptr() as usize + rbuf.len();
                     b = &rbuf[..n];
                     task = Task { file: task.file, start: 0, end: n };
                 }
                 if avx2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        event_task_avx2(b, task, ctx, &mut out.e)
+                        event_task_avx2(b, task, ctx, &mut out.e, safe_end)
                     }
                 } else {
-                    event_task::<false>(b, task, ctx, &mut out.e)
+                    event_task::<false>(b, task, ctx, &mut out.e, safe_end)
                 }
             } else {
                 while !ready.load(Ordering::Acquire) {
@@ -551,19 +610,21 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
                 let lt = cell.get().unwrap();
                 let mut task = cl.tasks[i - ev.tasks.len()];
                 let mut b = cl.maps[task.file as usize].bytes();
+                let mut safe_end = b.as_ptr() as usize + b.len();
                 if use_read {
                     let n = task.end - task.start;
                     cl.maps[task.file as usize].read_at(&mut rbuf[..n], task.start);
+                    safe_end = rbuf.as_ptr() as usize + rbuf.len();
                     b = &rbuf[..n];
                     task = Task { file: task.file, start: 0, end: n };
                 }
                 if avx2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        click_task_avx2(b, task, ctx, lt, &mut out.c)
+                        click_task_avx2(b, task, ctx, lt, &mut out.c, safe_end)
                     }
                 } else {
-                    click_task::<false>(b, task, ctx, lt, &mut out.c)
+                    click_task::<false>(b, task, ctx, lt, &mut out.c, safe_end)
                 }
             }
         }
