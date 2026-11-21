@@ -37,6 +37,19 @@ for seed in $SEEDS; do
     $G --seed $seed --events 20000000 --clicks 5000000 --output $D --threads 2 > /dev/null
   fi
   echo "=== seed $seed: $(du -sh $D | cut -f1), $(ls $D/events | wc -l) event files"
+  if has stages; then
+    echo "--- single-thread stage costs (new binary, best of 3 passes)"
+    SS_BENCH=touch,scan,ts,tsw,keys,keysw,line,ev "$W/new-bin" $D $O/x 2>&1
+    SS_NOAVX2=1 SS_BENCH=scan,line "$W/new-bin" $D $O/x 2>&1 | sed 's/^/noavx2 /'
+    PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
+    if [ -n "$PERF" ]; then
+      sudo env SS_BENCH=ev "$PERF" record -F 4999 -o /tmp/perf_ev.data "$W/prof-bin" $D $O/x 2>&1 | tail -1
+      sudo "$PERF" report -i /tmp/perf_ev.data --stdio --no-children --sort symbol 2>/dev/null | grep -E "^ +[0-9]" | head -12 | cut -c1-150
+      SYM=$(sudo "$PERF" report -i /tmp/perf_ev.data --stdio --no-children --sort symbol 2>/dev/null | grep -E "^ +[0-9]" | head -1 | sed 's/.*\] //' | sed 's/ *$//')
+      echo "--- annotate top symbol: $SYM"
+      sudo "$PERF" annotate -i /tmp/perf_ev.data --stdio -l "$SYM" 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+" | sort -rn | head -60
+    fi
+  fi
   if has native; then
     for n in 2 1; do
       reps=3; [ $n = 1 ] && reps=1

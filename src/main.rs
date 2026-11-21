@@ -369,104 +369,109 @@ fn ingest_rel(ms: i64, ws_s: i64) -> u32 {
 }
 
 struct ParseOut {
-    e: Parts<ERec>,
+    e: (Parts<ERec>, u32),
     c: Parts<CRec>,
 }
 
-/// One event line, where 32 bytes from the start of every field are readable.
-#[inline(always)]
-fn event_line_wide(f: &[&[u8]; 7], ctx: &Ctx, e: &mut Parts<ERec>) {
-    let (ws, we) = (ctx.ws, ctx.we);
-    let Some(ing) = (unsafe { ctx.tsp.parse_wide_f1(f[3]) }) else { return };
-    let eid = keys::mix(unsafe { keys::key_of_wide(f[0]) });
-    let mut r = ERec { eid, ingest: ingest_rel(ing, ctx.ws_s), ..Default::default() };
-    'v: {
-        if f[1].is_empty() || f[5].is_empty() {
-            break 'v;
-        }
-        let Some(t) = (unsafe { ctx.tsp.parse_wide(f[2]) }) else { break 'v };
-        if t < ws || t >= we {
-            break 'v;
-        }
-        let ty = f[4];
-        let w = u64::from_le(unsafe { std::ptr::read_unaligned(ty.as_ptr() as *const u64) });
-        let w4 = w & 0xFFFF_FFFF;
-        let n4 = ty.len();
-        let mut pay = 0u32;
-        if n4 == 8 && w == u64::from_le_bytes(*b"purchase") {
-            let Some(price) = ts::parse_price(f[6]) else { break 'v };
-            let mut cat = unsafe { ctx.products.get_wide(f[5]) } as u32;
-            if cat == NONE as u32 {
-                cat = ctx.unknown_cat;
-            }
-            pay = price | (cat << 24);
-        } else if !(n4 == 4 && (w4 == u32::from_le_bytes(*b"view") as u64 || w4 == u32::from_le_bytes(*b"cart") as u64)) {
-            break 'v;
-        }
-        if ing - t > LATE {
-            break 'v;
-        }
-        r.user = unsafe { keys::key_of_wide(f[1]) };
-        r.ts = (t - ws) as u32 | OK_BIT;
-        r.pay = pay;
-    }
-    e.push((eid >> (64 - ctx.pe_bits)) as usize, r);
+/// Receives every parsed event copy: its event_id (`keys::mix` of the key),
+/// ingest (`ingest_rel`), and for a copy that passes validation and is not
+/// late, (user key, ts - window_start in ms, pay).
+trait EvSink {
+    fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>);
 }
 
-/// One chunk of events/: parse, validate, route by event_id. `safe_end` is
-/// the end address of readable memory after `b` (at least `b`'s end).
+/// Legacy pipeline: one ERec per copy, routed by event_id.
+impl EvSink for (Parts<ERec>, u32) {
+    #[inline(always)]
+    fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>) {
+        let mut r = ERec { eid, ingest, ..Default::default() };
+        if let Some((user, ts, pay)) = valid {
+            r.user = user;
+            r.ts = ts | OK_BIT;
+            r.pay = pay;
+        }
+        self.0.push((eid >> (64 - self.1)) as usize, r);
+    }
+}
+
+/// Type and price of a valid event: Some(pay) for view/cart (0) or a valid
+/// purchase (price | category rank << 24).
 #[inline(always)]
-fn event_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, e: &mut Parts<ERec>, safe_end: usize) {
+fn event_pay(ty: &[u8], price: &[u8], product: &[u8], ctx: &Ctx, wide: bool) -> Option<u32> {
+    let n4 = ty.len();
+    let is_purchase;
+    let is_vc;
+    if wide {
+        let w = u64::from_le(unsafe { std::ptr::read_unaligned(ty.as_ptr() as *const u64) });
+        let w4 = w & 0xFFFF_FFFF;
+        is_purchase = n4 == 8 && w == u64::from_le_bytes(*b"purchase");
+        is_vc = n4 == 4 && (w4 == u32::from_le_bytes(*b"view") as u64 || w4 == u32::from_le_bytes(*b"cart") as u64);
+    } else {
+        is_purchase = ty == b"purchase";
+        is_vc = ty == b"view" || ty == b"cart";
+    }
+    if is_purchase {
+        let price = ts::parse_price(price)?;
+        let mut cat = if wide { unsafe { ctx.products.get_wide(product) } } else { ctx.products.get(product) } as u32;
+        if cat == NONE as u32 {
+            cat = ctx.unknown_cat;
+        }
+        Some(price | (cat << 24))
+    } else if is_vc {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// One event line (event_id non-empty). With `WIDE`, 32 bytes from the start
+/// of every field must be readable.
+#[inline(always)]
+fn event_line<const WIDE: bool, S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut S) {
+    let (ws, we) = (ctx.ws, ctx.we);
+    let ing = if WIDE { unsafe { ctx.tsp.parse_wide_f1(f[3]) } } else { ctx.tsp.parse(f[3]) };
+    let Some(ing) = ing else { return };
+    let eid = keys::mix(if WIDE { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) });
+    let ingest = ingest_rel(ing, ctx.ws_s);
+    let valid = 'v: {
+        if f[1].is_empty() || f[5].is_empty() {
+            break 'v None;
+        }
+        let t = if WIDE { unsafe { ctx.tsp.parse_wide(f[2]) } } else { ctx.tsp.parse(f[2]) };
+        let Some(t) = t else { break 'v None };
+        if t < ws || t >= we {
+            break 'v None;
+        }
+        let Some(pay) = event_pay(f[4], f[6], f[5], ctx, WIDE) else { break 'v None };
+        if ing - t > LATE {
+            break 'v None;
+        }
+        let user = if WIDE { unsafe { keys::key_of_wide(f[1]) } } else { keys::key_of(f[1]) };
+        Some((user, (t - ws) as u32, pay))
+    };
+    sink.copy(eid, ingest, valid);
+}
+
+#[inline(never)]
+#[cold]
+fn event_line_slow<S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut S) {
+    event_line::<false, S>(f, ctx, sink)
+}
+
+/// One chunk of events/: parse, validate, hand every copy to `sink`.
+/// `safe_end` is the end address of readable memory after `b` (>= its end).
+#[inline(always)]
+fn event_task<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
     scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
         if f[0].is_empty() {
             return;
         }
         if f[6].as_ptr() as usize + 32 <= safe_end {
-            event_line_wide(f, ctx, e);
+            event_line::<true, S>(f, ctx, sink);
         } else {
-            event_line_slow(f, ctx, e);
+            event_line_slow(f, ctx, sink);
         }
     });
-}
-
-/// One event line, general path (near the end of a buffer).
-#[inline(never)]
-#[cold]
-fn event_line_slow(f: &[&[u8]; 7], ctx: &Ctx, e: &mut Parts<ERec>) {
-    let (ws, we) = (ctx.ws, ctx.we);
-    {
-        let Some(ing) = ctx.tsp.parse(f[3]) else { return };
-        let eid = keys::mix(keys::key_of(f[0]));
-        let mut r = ERec { eid, ingest: ingest_rel(ing, ctx.ws_s), ..Default::default() };
-        'v: {
-            if f[1].is_empty() || f[5].is_empty() {
-                break 'v;
-            }
-            let Some(t) = ctx.tsp.parse(f[2]) else { break 'v };
-            if t < ws || t >= we {
-                break 'v;
-            }
-            let ty = f[4];
-            let mut pay = 0u32;
-            if ty == b"purchase" {
-                let Some(price) = ts::parse_price(f[6]) else { break 'v };
-                let mut cat = ctx.products.get(f[5]) as u32;
-                if cat == NONE as u32 {
-                    cat = ctx.unknown_cat;
-                }
-                pay = price | (cat << 24);
-            } else if ty != b"view" && ty != b"cart" {
-                break 'v;
-            }
-            if ing - t > LATE {
-                break 'v;
-            }
-            r.user = keys::key_of(f[1]);
-            r.ts = (t - ws) as u32 | OK_BIT;
-            r.pay = pay;
-        }
-        e.push((eid >> (64 - ctx.pe_bits)) as usize, r);
-    }
 }
 
 /// One chunk of clicks/: parse, validate, resolve the person, route by person.
@@ -519,8 +524,8 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn event_task_avx2(b: &[u8], task: Task, ctx: &Ctx, e: &mut Parts<ERec>, safe_end: usize) {
-    event_task::<true>(b, task, ctx, e, safe_end)
+unsafe fn event_task_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, e: &mut S, safe_end: usize) {
+    event_task::<true, S>(b, task, ctx, e, safe_end)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -571,7 +576,7 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
     let use_read = std::env::var("SS_READ").is_ok();
     let max_task = ev.tasks.iter().chain(cl.tasks.iter()).map(|t| t.end - t.start).max().unwrap_or(0);
     let outs = par(ctx.threads, |t| {
-        let mut out = ParseOut { e: Parts::new(pe, cap_e), c: Parts::new(ps, cap_c) };
+        let mut out = ParseOut { e: (Parts::new(pe, cap_e), ctx.pe_bits), c: Parts::new(ps, cap_c) };
         let mut rbuf: Vec<u8> = if use_read { vec![0u8; max_task + 64] } else { Vec::new() };
         if t < nl {
             link_worker(t, links_in, &lnext, &pairs, &bar, &cell, &f1, &f2);
@@ -601,7 +606,7 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
                         event_task_avx2(b, task, ctx, &mut out.e, safe_end)
                     }
                 } else {
-                    event_task::<false>(b, task, ctx, &mut out.e, safe_end)
+                    event_task::<false, _>(b, task, ctx, &mut out.e, safe_end)
                 }
             } else {
                 while !ready.load(Ordering::Acquire) {
@@ -1282,10 +1287,6 @@ fn ceil_log2(x: usize) -> u32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() == 4 && args[1] == "--bench" {
-        bench(&args[2], Path::new(&args[3]));
-        return;
-    }
     if args.len() == 2 && args[1] == "--self-test" {
         self_test();
         return;
@@ -1390,11 +1391,17 @@ fn main() {
         threads,
     };
     marks.mark("setup");
+    if let Ok(stage) = std::env::var("SS_BENCH") {
+        for st in stage.split(',') {
+            bench_stages(st, &events_in, &ctx);
+        }
+        std::process::exit(0);
+    }
 
     let (lt, pouts) = parse_all(&links_in, &events_in, &clicks_in, &ctx);
     marks.mark("parse");
 
-    let (ebufs, cbufs): (Vec<Parts<ERec>>, Vec<Parts<CRec>>) = pouts.into_iter().map(|po| (po.e, po.c)).unzip();
+    let (ebufs, cbufs): (Vec<Parts<ERec>>, Vec<Parts<CRec>>) = pouts.into_iter().map(|po| (po.e.0, po.c)).unzip();
     let sbufs = dedup(&ebufs, &lt, &ctx);
     marks.mark("dedup");
     // Not freed: unmapping costs more than it saves; the process exits soon.
@@ -1448,64 +1455,91 @@ fn main() {
     std::process::exit(0);
 }
 
-/// Hidden micro-benchmark: `sessions --bench STAGE DATA`. Parses events/ with
-/// increasing amounts of work per line, single-threaded, 3 passes.
-#[allow(dead_code)]
-fn bench(stage: &str, data: &Path) {
-    let ev = load_input(&data.join("events"), 2 << 20);
-    let ws = 0i64;
-    let tsp = ts::TsParser::new(1_700_000_000_000, 1_900_000_000_000);
-    let mut acc = 0u64;
-    let t = Instant::now();
-    let pbits = env_usize("SS_PE_BITS").unwrap_or(11) as u32;
-    let mut parts: Vec<Vec<ERec>> = (0..(1usize << pbits)).map(|_| Vec::with_capacity(16)).collect();
-    for _ in 0..3 {
-        for p in parts.iter_mut() {
-            p.clear();
-        }
-        for task in &ev.tasks {
-            let b = ev.maps[task.file as usize].bytes();
-            match stage {
-                "none" => acc += b[task.start] as u64,
-                "probe" => acc += ts::ss_probe_parse(&tsp, &b[task.start..task.start + 20]).unwrap_or(0) as u64,
-                "touch" => {
-                    let mut s = task.start;
-                    while s < task.end {
-                        acc += b[s] as u64;
-                        s += 4096;
-                    }
-                }
-                "lines" => {
-                    let mut s = task.start;
-                    while s < task.end {
-                        let e = scan::next_line_start(b, s);
-                        acc += (e - s) as u64;
-                        s = e;
-                    }
-                }
-                "scan" => scan::for_each_record::<7, _>(b, task.start, task.end, |f| acc += f[3].len() as u64),
-                "ts" => scan::for_each_record::<7, _>(b, task.start, task.end, |f| {
-                    acc += tsp.parse(f[3]).unwrap_or(0) as u64 + tsp.parse(f[2]).unwrap_or(0) as u64
-                }),
-                "keys" => scan::for_each_record::<7, _>(b, task.start, task.end, |f| {
-                    acc += keys::key_of(f[0]) ^ keys::key_of(f[1])
-                }),
-                "all" | "push" => scan::for_each_record::<7, _>(b, task.start, task.end, |f| {
-                    let i = tsp.parse(f[3]).unwrap_or(0);
-                    let t = tsp.parse(f[2]).unwrap_or(0);
-                    let e = keys::key_of(f[0]);
-                    let u = keys::key_of(f[1]);
-                    let r = ERec { eid: e, user: u, ingest: ingest_rel(i, ws), ts: t as u32, pay: f[4].len() as u32 };
-                    if stage == "push" {
-                        parts[part(e, pbits)].push(r);
-                    } else {
-                        acc += { r.eid } ^ { r.user } ^ { r.ts } as u64 ^ { r.ingest } as u64;
-                    }
-                }),
-                _ => fail("unknown stage"),
-            }
+/// Null sink for the stage benchmark.
+struct NullSink(u64);
+impl EvSink for NullSink {
+    #[inline(always)]
+    fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>) {
+        self.0 = self.0.wrapping_add(eid ^ ingest as u64);
+        if let Some((u, t, p)) = valid {
+            self.0 = self.0.wrapping_add(u ^ t as u64 ^ p as u64);
         }
     }
-    let n: usize = parts.iter().map(|p| p.len()).sum();
-    eprintln!("bench {}: {:.1}ms per pass (acc {} n {})", stage, t.elapsed().as_secs_f64() * 1e3 / 3.0, acc, n);
+}
+
+#[inline(always)]
+fn bench_task<const AVX2: bool>(stage: &str, b: &[u8], task: Task, ctx: &Ctx, parts: &mut (Parts<ERec>, u32)) -> u64 {
+    let mut acc = 0u64;
+    let end = b.as_ptr() as usize + b.len();
+    match stage {
+        "touch" => {
+            let mut s = task.start;
+            while s < task.end {
+                acc += b[s] as u64;
+                s += 4096;
+            }
+        }
+        "scan" => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| acc += f[3].len() as u64),
+        "ts" => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
+            acc += ctx.tsp.parse(f[3]).unwrap_or(0) as u64 + ctx.tsp.parse(f[2]).unwrap_or(0) as u64
+        }),
+        "tsw" => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
+            if f[6].as_ptr() as usize + 32 <= end {
+                acc += unsafe { ctx.tsp.parse_wide_f1(f[3]).unwrap_or(0) as u64 + ctx.tsp.parse_wide(f[2]).unwrap_or(0) as u64 }
+            }
+        }),
+        "keys" => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
+            if !f[0].is_empty() && !f[1].is_empty() {
+                acc += keys::key_of(f[0]) ^ keys::key_of(f[1])
+            }
+        }),
+        "keysw" => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
+            if !f[0].is_empty() && !f[1].is_empty() && f[6].as_ptr() as usize + 32 <= end {
+                acc += unsafe { keys::key_of_wide(f[0]) ^ keys::key_of_wide(f[1]) }
+            }
+        }),
+        "line" => {
+            let mut ns = NullSink(0);
+            event_task::<AVX2, _>(b, task, ctx, &mut ns, end);
+            acc = ns.0;
+        }
+        "ev" => event_task::<AVX2, _>(b, task, ctx, parts, end),
+        _ => fail("unknown SS_BENCH stage"),
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn bench_task_avx2(stage: &str, b: &[u8], task: Task, ctx: &Ctx, parts: &mut (Parts<ERec>, u32)) -> u64 {
+    bench_task::<true>(stage, b, task, ctx, parts)
+}
+
+/// SS_BENCH=STAGE: single-threaded stage benchmark over events/, best of 3
+/// passes (the first pass also maps the pages in).
+fn bench_stages(stage: &str, ev: &Input, ctx: &Ctx) {
+    let est = ev.bytes / 70 + 1;
+    let mut best = f64::MAX;
+    let mut acc = 0u64;
+    let lines: usize = ev.tasks.len();
+    for _ in 0..3 {
+        let mut parts = (Parts::<ERec>::new(1 << ctx.pe_bits, est / (1 << ctx.pe_bits) * 3 / 2 + 64), ctx.pe_bits);
+        let t = Instant::now();
+        for task in &ev.tasks {
+            let b = ev.maps[task.file as usize].bytes();
+            acc = acc.wrapping_add(if ctx.avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    bench_task_avx2(stage, b, *task, ctx, &mut parts)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                0
+            } else {
+                bench_task::<false>(stage, b, *task, ctx, &mut parts)
+            });
+        }
+        best = best.min(t.elapsed().as_secs_f64() * 1e3);
+        acc = acc.wrapping_add(parts.0.total() as u64);
+    }
+    eprintln!("bench {:6} {:8.1} ms  ({} tasks, {} MB, avx2={}, acc {})", stage, best, lines, ev.bytes >> 20, ctx.avx2, acc % 1000);
 }
