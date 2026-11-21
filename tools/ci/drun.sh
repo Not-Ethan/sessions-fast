@@ -6,7 +6,7 @@
 set -u
 LABEL=$1; IMAGE=$2; DATA=$3; OUT=$4; shift 4
 CPUS=${CPUS:-$(nproc)}; MEM=${MEM:-5g}; NCPU=${NCPU:-$CPUS}
-rm -rf "$OUT"; mkdir -p "$OUT"; chmod 777 "$OUT"
+sudo rm -rf "$OUT"; mkdir -p "$OUT"; chmod 777 "$OUT"
 SCR=$(mktemp -d); chmod 777 "$SCR"
 ENVS=()
 for kv in "$@"; do ENVS+=(-e "$kv"); done
@@ -26,7 +26,7 @@ RC=$?
 T1=$(date +%s%N)
 INS=$(docker inspect -f '{{.State.StartedAt}} {{.State.FinishedAt}}' "$NAME")
 docker rm "$NAME" > /dev/null
-rm -rf "$SCR"
+sudo rm -rf "$SCR"
 python3 - "$LABEL" "$T0" "$T1" "$INS" "$RC" <<'EOF'
 import re, sys
 label, t0, t1, ins, rc = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
