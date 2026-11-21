@@ -7,6 +7,7 @@ mod lookup;
 mod parquet;
 mod prof;
 mod cbench;
+mod sess;
 mod scan;
 mod sys;
 mod ts;
@@ -2024,10 +2025,20 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let cd = out_dir.join("campaign_daily");
     std::fs::create_dir_all(&ud).unwrap_or_else(|e| fail(&format!("{}: {}", ud.display(), e)));
     std::fs::create_dir_all(&cd).unwrap_or_else(|e| fail(&format!("{}: {}", cd.display(), e)));
-    let souts = sessions(&sbufs, &cbufs, &ctx, &ud);
-    marks.mark("sessions");
-    write_campaign_daily(&cd.join("part-0.parquet"), &souts, &ctx);
-    marks.mark("write");
+    // SS_OLDSESS: the previous sessions phase (sort per person), for comparison
+    let rows: usize = if std::env::var("SS_OLDSESS").is_ok() {
+        let souts = sessions(&sbufs, &cbufs, &ctx, &ud);
+        marks.mark("sessions");
+        write_campaign_daily(&cd.join("part-0.parquet"), &souts, &ctx);
+        marks.mark("write");
+        souts.iter().map(|s| s.nrows).sum()
+    } else {
+        let outs = sess::sessions2(&sbufs, &cbufs, &ctx, &ud);
+        marks.mark("sessions");
+        sess::write_campaign_daily2(&cd.join("part-0.parquet"), &outs, &ctx);
+        marks.mark("write");
+        outs.iter().map(|o| o.nrows).sum()
+    };
     if std::env::var("SS_FREE").is_ok() {
         // Experiment: release arena pages on all threads (MADV_DONTNEED takes
         // the mmap lock shared) so that the kernel's single-threaded exit
@@ -2062,7 +2073,6 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     }
 
     if verbose {
-        let rows: usize = souts.iter().map(|s| s.nrows).sum();
         return format!(
             "sessions: {} | pipeline={} links={:.1}ms threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB {} | sub:{}",
             marks.report(),

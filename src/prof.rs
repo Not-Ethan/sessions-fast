@@ -11,6 +11,8 @@ pub static ON: AtomicBool = AtomicBool::new(false);
 pub const N: usize = 16;
 static SUM: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static MAX: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+static CNT: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+static CNAMES: std::sync::Mutex<[&'static str; N]> = std::sync::Mutex::new([""; N]);
 static NAMES: std::sync::Mutex<[&'static str; N]> = std::sync::Mutex::new([""; N]);
 static CAL: std::sync::Mutex<Option<(Instant, u64)>> = std::sync::Mutex::new(None);
 
@@ -48,16 +50,22 @@ pub fn name(i: usize, n: &'static str) {
     NAMES.lock().unwrap()[i] = n;
 }
 
+/// Names counter slot `i` (for the report).
+pub fn cname(i: usize, n: &'static str) {
+    CNAMES.lock().unwrap()[i] = n;
+}
+
 pub struct Acc {
     on: bool,
     t: u64,
     v: [u64; N],
+    c: [u64; N],
 }
 
 impl Acc {
     pub fn new() -> Acc {
         let on = ON.load(Ordering::Relaxed);
-        Acc { on, t: if on { tick() } else { 0 }, v: [0; N] }
+        Acc { on, t: if on { tick() } else { 0 }, v: [0; N], c: [0; N] }
     }
     #[inline(always)]
     pub fn on(&self) -> bool {
@@ -79,14 +87,23 @@ impl Acc {
             self.t = now;
         }
     }
+    /// Adds `v` to counter `i`.
+    #[inline(always)]
+    pub fn count(&mut self, i: usize, v: u64) {
+        if self.on {
+            self.c[i] += v;
+        }
+    }
     /// Adds this thread's sums to the global ones.
     pub fn commit(&mut self) {
         if self.on {
             for i in 0..N {
                 SUM[i].fetch_add(self.v[i], Ordering::Relaxed);
                 MAX[i].fetch_max(self.v[i], Ordering::Relaxed);
+                CNT[i].fetch_add(self.c[i], Ordering::Relaxed);
             }
             self.v = [0; N];
+            self.c = [0; N];
         }
     }
 }
@@ -102,6 +119,13 @@ pub fn report() -> String {
         let m = MAX[i].swap(0, Ordering::Relaxed);
         if !names[i].is_empty() && v > 0 {
             s.push_str(&format!(" {}={:.1}({:.1})", names[i], v as f64 * k, m as f64 * k));
+        }
+    }
+    let cn = CNAMES.lock().unwrap();
+    for i in 0..N {
+        let v = CNT[i].swap(0, Ordering::Relaxed);
+        if !cn[i].is_empty() {
+            s.push_str(&format!(" #{}={}", cn[i], v));
         }
     }
     s

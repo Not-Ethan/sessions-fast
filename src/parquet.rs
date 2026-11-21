@@ -20,13 +20,13 @@ pub struct Column<'a> {
 }
 
 // Parquet enums
-const T_INT32: i32 = 1;
-const T_INT64: i32 = 2;
-const T_BYTE_ARRAY: i32 = 6;
+pub const T_INT32: i32 = 1;
+pub const T_INT64: i32 = 2;
+pub const T_BYTE_ARRAY: i32 = 6;
 const REQUIRED: i32 = 0;
 const OPTIONAL: i32 = 1;
-const CONV_UTF8: i32 = 0;
-const CONV_DATE: i32 = 6;
+pub const CONV_UTF8: i32 = 0;
+pub const CONV_DATE: i32 = 6;
 const ENC_PLAIN: i32 = 0;
 const ENC_RLE: i32 = 3;
 
@@ -265,24 +265,34 @@ pub fn encode(nrows: usize, cols: &[Column]) -> Vec<u8> {
         }
     }
 
-    // FileMetaData
+    let schema: Vec<(&str, i32, i32, Option<i32>)> = cols
+        .iter()
+        .map(|c| match &c.data {
+            Data::Str { valid, .. } => (c.name, T_BYTE_ARRAY, if valid.is_some() { OPTIONAL } else { REQUIRED }, Some(CONV_UTF8)),
+            Data::I32 { date, .. } => (c.name, T_INT32, REQUIRED, if *date { Some(CONV_DATE) } else { None }),
+            Data::I64 { .. } => (c.name, T_INT64, REQUIRED, None),
+        })
+        .collect();
+    let m = footer(&schema, nrows, &metas);
+    out.extend_from_slice(&m);
+    out
+}
+
+/// FileMetaData (Thrift), its length and the trailing magic.
+/// `schema`: (name, physical type, repetition, converted type) per column.
+fn footer(schema: &[(&str, i32, i32, Option<i32>)], nrows: usize, metas: &[ChunkMeta]) -> Vec<u8> {
     let mut m = Thrift::new();
     m.i32(1, 1);
-    m.list_begin(2, CT_STRUCT, cols.len() + 1);
+    m.list_begin(2, CT_STRUCT, schema.len() + 1);
     m.elem_begin();
     m.binary(4, b"schema");
-    m.i32(5, cols.len() as i32);
+    m.i32(5, schema.len() as i32);
     m.struct_end();
-    for c in cols {
+    for &(name, ty, rep, conv) in schema {
         m.elem_begin();
-        let (ty, rep, conv) = match &c.data {
-            Data::Str { valid, .. } => (T_BYTE_ARRAY, if valid.is_some() { OPTIONAL } else { REQUIRED }, Some(CONV_UTF8)),
-            Data::I32 { date, .. } => (T_INT32, REQUIRED, if *date { Some(CONV_DATE) } else { None }),
-            Data::I64 { .. } => (T_INT64, REQUIRED, None),
-        };
         m.i32(1, ty);
         m.i32(3, rep);
-        m.binary(4, c.name.as_bytes());
+        m.binary(4, name.as_bytes());
         if let Some(cv) = conv {
             m.i32(6, cv);
             // LogicalType union: STRING = field 1, DATE = field 6 (empty structs)
@@ -299,7 +309,7 @@ pub fn encode(nrows: usize, cols: &[Column]) -> Vec<u8> {
         m.elem_begin();
         m.list_begin(1, CT_STRUCT, metas.len());
         let mut total = 0i64;
-        for cm in &metas {
+        for cm in metas {
             total += cm.size;
             m.elem_begin();
             m.i64(2, cm.offset);
@@ -326,8 +336,81 @@ pub fn encode(nrows: usize, cols: &[Column]) -> Vec<u8> {
     }
     m.binary(6, b"shopping-sessions");
     m.buf.push(0);
-    out.extend_from_slice(&m.buf);
-    out.extend_from_slice(&(m.buf.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    out
+    let len = m.buf.len() as u32;
+    m.buf.extend_from_slice(&len.to_le_bytes());
+    m.buf.extend_from_slice(b"PAR1");
+    m.buf
 }
+
+/// A column whose PLAIN-encoded values are already built.
+pub enum Raw<'a> {
+    /// REQUIRED column: `ty` T_INT32 / T_INT64 / T_BYTE_ARRAY, optional
+    /// converted type (CONV_UTF8 / CONV_DATE), PLAIN body.
+    Req { name: &'a str, ty: i32, conv: Option<i32>, body: &'a [u8] },
+    /// OPTIONAL UTF8 BYTE_ARRAY: `def` has one bit per row (LSB first, 1 =
+    /// non-null), `body` the PLAIN values of the non-null rows.
+    OptStr { name: &'a str, def: &'a [u8], body: &'a [u8] },
+}
+
+/// Fixed-width integers as their little-endian bytes.
+pub fn le_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    assert!(cfg!(target_endian = "little"));
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// Writes one Parquet file (one row group, one PLAIN data page per column)
+/// from pre-encoded columns, with a few large writes and no copy of the
+/// column bodies.
+pub fn write_raw(path: &Path, nrows: usize, cols: &[Raw]) -> io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    let mut head: Vec<u8> = b"PAR1".to_vec();
+    let mut pos = 0usize;
+    let mut metas = Vec::new();
+    let mut schema = Vec::new();
+    for c in cols {
+        let (name, ty, rep, conv, prefix, body): (&str, i32, i32, Option<i32>, Vec<u8>, &[u8]) = match c {
+            Raw::Req { name, ty, conv, body } => (name, *ty, REQUIRED, *conv, Vec::new(), body),
+            Raw::OptStr { name, def, body } => {
+                let groups = nrows.div_ceil(8);
+                assert_eq!(def.len(), groups);
+                let mut lv = Thrift::new();
+                lv.varint(((groups as u64) << 1) | 1);
+                let mut pre = ((lv.buf.len() + groups) as u32).to_le_bytes().to_vec();
+                pre.extend_from_slice(&lv.buf);
+                pre.extend_from_slice(def);
+                (name, T_BYTE_ARRAY, OPTIONAL, Some(CONV_UTF8), pre, body)
+            }
+        };
+        schema.push((name, ty, rep, conv));
+        if nrows == 0 {
+            continue;
+        }
+        let data_len = prefix.len() + body.len();
+        assert!(data_len < i32::MAX as usize, "page too large");
+        let mut h = Thrift::new();
+        h.i32(1, 0); // DATA_PAGE
+        h.i32(2, data_len as i32);
+        h.i32(3, data_len as i32);
+        h.struct_begin(5);
+        h.i32(1, nrows as i32);
+        h.i32(2, ENC_PLAIN);
+        h.i32(3, ENC_RLE);
+        h.i32(4, ENC_RLE);
+        h.struct_end();
+        h.buf.push(0);
+        let offset = pos + head.len();
+        head.extend_from_slice(&h.buf);
+        head.extend_from_slice(&prefix);
+        metas.push(ChunkMeta { ty, name: name.to_string(), num_values: nrows as i64, size: (h.buf.len() + data_len) as i64, offset: offset as i64 });
+        // flush the small pieces, then the body straight from its buffer
+        f.write_all(&head)?;
+        pos += head.len();
+        head.clear();
+        f.write_all(body)?;
+        pos += body.len();
+    }
+    head.extend_from_slice(&footer(&schema, nrows, &metas));
+    f.write_all(&head)
+}
+
