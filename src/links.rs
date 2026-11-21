@@ -58,7 +58,9 @@ impl LinkTable {
         if total_pairs == 0 {
             return Self::empty();
         }
-        let cap = (total_pairs * 5 / 2 + 16).next_power_of_two();
+        // at most 2 distinct IDs per pair, so the load factor stays below 1
+        // (typically ~0.55: ~1.3 IDs per pair)
+        let cap = (total_pairs * 2 + 16).next_power_of_two();
         // at most 2 new IDs per pair, plus partly used blocks
         let nd = 2 * total_pairs + (threads + 1) * DENSE_BLOCK as usize + 64;
         assert!(nd < u32::MAX as usize - DENSE_BLOCK as usize * 2, "too many links");
@@ -222,6 +224,36 @@ impl LinkTable {
             }
             i = (i + 1) & self.mask;
         }
+    }
+
+    /// `person_of` for a key whose hash `h` = keys::mix(k) is known:
+    /// Some(person key) if k is linked, None if it is not in the table.
+    #[inline(always)]
+    pub fn person_of_h(&self, k: u64, h: u64) -> Option<u64> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut i = h as usize & self.mask;
+        loop {
+            let s = &self.slots[i];
+            let kk = s[0].load(Ordering::Relaxed);
+            if kk == k {
+                return Some(s[1].load(Ordering::Relaxed));
+            }
+            if kk == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    pub fn prefetch_h(&self, h: u64) {
+        if self.slots.is_empty() {
+            return;
+        }
+        let i = h as usize & self.mask;
+        crate::prefetch(self.slots.as_ptr().wrapping_add(i) as *const u8);
     }
 
     #[inline(always)]

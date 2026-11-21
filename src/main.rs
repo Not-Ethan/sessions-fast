@@ -55,11 +55,15 @@ struct ERec {
 
 const OK_BIT: u32 = 1 << 31;
 const _: () = assert!(std::mem::size_of::<ERec>() == 28);
+const _: () = assert!(std::mem::size_of::<CRec>() == 32);
+const _: () = assert!(std::mem::size_of::<SRec>() == 16);
 
 /// A surviving event, routed by person.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct SRec {
+    /// keys::mix(person key) (a bijection): its top bits pick the partition,
+    /// its low bits index the per-partition map.
     person: u64,
     ts: u32,
     pay: u32,
@@ -69,10 +73,13 @@ struct SRec {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct CRec {
+    /// keys::mix(person key), as in SRec
     person: u64,
     ck: u64,
     ts: u32,
     camp: u32,
+    /// padding to 32 bytes (write-combining scatter)
+    _pad: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -92,9 +99,15 @@ struct URow {
     revenue: u64,
 }
 
+/// keys::mix of the person key of user key `user`, whose hash is
+/// `h` = keys::mix(user) (one table probe; no second hash when the user is
+/// its own person).
 #[inline(always)]
-fn part(k: u64, bits: u32) -> usize {
-    (keys::mix(k) >> (64 - bits)) as usize
+fn person_hash(lt: &LinkTable, user: u64, h: u64) -> u64 {
+    match lt.person_of_h(user, h) {
+        Some(p) if p != user => keys::mix(p),
+        _ => h,
+    }
 }
 
 // ---------------------------------------------------------------- context
@@ -486,12 +499,12 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
     // Person lookups go through a small ring so the link-table slot can be
     // prefetched a few clicks ahead.
     const RING: usize = 16;
-    let mut ring = [CRec { person: 0, ck: 0, ts: 0, camp: 0 }; RING];
+    let mut ring = [(CRec { person: 0, ck: 0, ts: 0, camp: 0, _pad: 0 }, 0u64); RING];
     let mut rh = 0usize;
     let mut rn = 0usize;
-    let emit = |c: &mut Parts<CRec>, mut r: CRec| {
-        r.person = lt.person_of(r.person);
-        c.push(part(r.person, ctx.ps_bits), r);
+    let emit = |c: &mut Parts<CRec>, (mut r, h): (CRec, u64)| {
+        r.person = person_hash(lt, r.person, h);
+        c.push((r.person >> (64 - ctx.ps_bits)) as usize, r);
     };
     scan::for_each_record_x::<4, _, AVX2>(b, task.start, task.end, #[inline(always)] |f| {
         if f[0].is_empty() || f[1].is_empty() {
@@ -508,10 +521,11 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
             return;
         }
         let user = if wide { unsafe { keys::key_of_wide(f[1]) } } else { keys::key_of(f[1]) };
-        lt.prefetch(user);
+        let h = keys::mix(user);
+        lt.prefetch_h(h);
         let ck = if wide { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) };
         // `person` holds the user key until the lookup in `emit`
-        let r = CRec { person: user, ck, ts: (t - cws) as u32, camp: camp as u32 };
+        let r = (CRec { person: user, ck, ts: (t - cws) as u32, camp: camp as u32, _pad: 0 }, h);
         if rn == RING {
             emit(c, ring[rh]);
             ring[rh] = r;
@@ -772,8 +786,8 @@ fn dedup(e: &[Parts<ERec>], lt: &LinkTable, ctx: &Ctx) -> Vec<Parts<SRec>> {
                     lt.prefetch(kept[k + AHEAD].0);
                 }
                 let (user, ts, pay) = kept[k];
-                let person = lt.person_of(user);
-                out.push(part(person, ctx.ps_bits), SRec { person, ts, pay });
+                let person = keys::mix(lt.person_of(user));
+                out.push((person >> (64 - ctx.ps_bits)) as usize, SRec { person, ts, pay });
             }
         }
         out
@@ -827,6 +841,8 @@ impl LocBits {
 struct Pending {
     eid: u64,
     user: u64,
+    /// keys::mix(user)
+    h: u64,
     ingest: u32,
     ts: u32,
     pay: u32,
@@ -853,8 +869,8 @@ struct BSink<'a> {
 impl BSink<'_> {
     #[inline(always)]
     fn emit(&mut self, p: Pending) {
-        let person = self.lt.person_of(p.user);
-        let q = part(person, self.ps_bits);
+        let person = person_hash(self.lt, p.user, p.h);
+        let q = (person >> (64 - self.ps_bits)) as usize;
         let i = self.s.len(q);
         self.s.push(q, SRec { person, ts: p.ts, pay: p.pay });
         let loc = if i < self.lb.imax {
@@ -882,8 +898,9 @@ impl EvSink for BSink<'_> {
         match valid {
             None => self.a.push((eid >> (64 - self.pe_bits)) as usize, ARec { eid, ingest, loc: LOC_NONE }),
             Some((user, ts, pay)) => {
-                self.lt.prefetch(user);
-                let p = Pending { eid, user, ingest, ts, pay };
+                let h = keys::mix(user);
+                self.lt.prefetch_h(h);
+                let p = Pending { eid, user, h, ingest, ts, pay };
                 if self.rn == BRING {
                     let old = self.ring[self.rh];
                     self.ring[self.rh] = p;
@@ -943,7 +960,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
             ps_bits: ctx.ps_bits,
             lb,
         };
-        let mut c: Parts<CRec> = Parts::new(ps, cap_c);
+        let mut c: Parts<CRec> = Parts::with_wc(ps, cap_c, true);
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= ntasks {
@@ -978,6 +995,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
         }
         sink.a.finish();
         sink.s.finish();
+        c.finish();
         BOut { a: sink.a, s: sink.s, c, overflow: sink.overflow }
     });
     (cell.into_inner().unwrap(), outs)
@@ -1137,7 +1155,7 @@ impl PMap {
         self.mask = cap - 1;
         for (k, v) in old_k.into_iter().zip(old_v) {
             if k != 0 {
-                let mut i = keys::mix(k) as usize & self.mask;
+                let mut i = k as usize & self.mask;
                 while self.keys[i] != 0 {
                     i = (i + 1) & self.mask;
                 }
@@ -1152,7 +1170,7 @@ impl PMap {
         if (self.len + 1) * 2 > self.keys.len() {
             self.grow();
         }
-        let mut i = keys::mix(k) as usize & self.mask;
+        let mut i = k as usize & self.mask;
         loop {
             let kk = self.keys[i];
             if kk == k {
@@ -1170,7 +1188,7 @@ impl PMap {
     }
     #[inline(always)]
     fn get(&self, k: u64) -> Option<u32> {
-        let mut i = keys::mix(k) as usize & self.mask;
+        let mut i = k as usize & self.mask;
         loop {
             let kk = self.keys[i];
             if kk == k {
@@ -1512,7 +1530,7 @@ fn write_user_daily(path: &Path, rows: &[URow], ctx: &Ctx) {
     let mut cends = Vec::with_capacity(n);
     let mut cvalid = Vec::with_capacity(n);
     for r in rows {
-        keys::decode_into(r.person, &mut ubytes);
+        keys::decode_into(keys::unmix(r.person), &mut ubytes);
         uends.push(ubytes.len() as u32);
         days.push(r.day);
         sess.push(r.sessions as i32);

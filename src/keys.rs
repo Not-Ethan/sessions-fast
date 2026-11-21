@@ -229,9 +229,35 @@ pub fn mix(k: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Inverse of `mix`.
+#[inline]
+pub fn unmix(h: u64) -> u64 {
+    let mut z = h;
+    z = z ^ (z >> 31) ^ (z >> 62);
+    z = z.wrapping_mul(0x319642b2d24d8ec3);
+    z = z ^ (z >> 27) ^ (z >> 54);
+    z = z.wrapping_mul(0x96de1b173f119089);
+    z ^ (z >> 30) ^ (z >> 60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmix_inverts_mix() {
+        let mut x: u64 = 0x0123_4567_89AB_CDEF;
+        for _ in 0..2_000_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            assert_eq!(unmix(mix(x)), x);
+            assert_eq!(mix(unmix(x)), x);
+        }
+        for v in [0u64, 1, u64::MAX, 1 << 63, 0xF, 0x10] {
+            assert_eq!(unmix(mix(v)), v);
+        }
+    }
 
     /// `pack_wide` agrees with `pack` on every string, whatever follows it.
     #[test]

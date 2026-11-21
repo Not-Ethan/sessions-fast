@@ -42,11 +42,13 @@ for seed in $SEEDS; do
     NCPU=1 SS_BENCH=scan,line,ev "$W/new-bin" $D $O/x 2>&1
     PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
     if [ -n "$PERF" ]; then
-      sudo env SS_BENCH=ev "$PERF" record -F 4999 -o /tmp/perf_ev.data "$W/prof-bin" $D $O/x 2>&1 | tail -1
-      sudo "$PERF" report -i /tmp/perf_ev.data --stdio --no-children --sort symbol 2>/dev/null | grep -E "^ +[0-9]" | head -12 | cut -c1-150
-      SYM=$(sudo "$PERF" report -i /tmp/perf_ev.data --stdio --no-children --sort symbol 2>/dev/null | grep -E "^ +[0-9]" | head -1 | sed 's/.*\] //' | sed 's/ *$//')
-      echo "--- annotate top symbol: $SYM"
-      sudo "$PERF" annotate -i /tmp/perf_ev.data --stdio -l "$SYM" 2>/dev/null | grep -E "^ +[0-9]+\.[0-9]+" | sort -rn | head -60
+      sudo env NCPU=1 SS_BENCH=line "$PERF" record -F 4999 -o /tmp/perf_line.data "$W/prof-bin" $D $O/x 2>&1 | tail -1
+      echo "--- annotate: event line stage, hottest instructions (percent of samples)"
+      sudo "$PERF" annotate -i /tmp/perf_line.data --stdio -l -s sessions::bench_task_avx2 2>/dev/null > /tmp/ann.txt
+      grep -E "^ +[0-9]+\.[0-9]+ +:" /tmp/ann.txt | sort -rn | head -70 | cut -c1-140
+      echo "--- annotate header"; head -70 /tmp/ann.txt | cut -c1-140
+      echo "--- annotate: source-line totals"
+      grep -E "^ +[0-9]+\.[0-9]+ +[a-z_]+\.rs:[0-9]+" /tmp/ann.txt | sort -rn | head -50 | cut -c1-140
     fi
   fi
   if has native; then

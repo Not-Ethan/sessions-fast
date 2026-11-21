@@ -2,7 +2,7 @@
 //! a fixed-capacity slice per partition, plus a heap overflow per partition for
 //! skewed partitions (e.g. one holding a whale person).
 //!
-//! Optional write combining (16-byte records only): each partition stages its
+//! Optional write combining (records of 8, 16 or 32 bytes): each partition stages its
 //! current 64-byte line in a small buffer and writes full lines with
 //! non-temporal stores, so scattering to hundreds of partitions does not pay
 //! a read-for-ownership miss per output line. `finish` must be called before
@@ -26,22 +26,24 @@ pub struct Parts<T: Copy> {
 unsafe impl<T: Copy + Send> Send for Parts<T> {}
 unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
 
-const WC_RECS: usize = 4; // 16-byte records per 64-byte line
-
 impl<T: Copy> Parts<T> {
+    /// records per 64-byte line (write combining)
+    const WC_RECS: usize = 64 / std::mem::size_of::<T>();
+
     pub fn new(nparts: usize, cap: usize) -> Self {
         Self::with_wc(nparts, cap, false)
     }
 
-    /// `wc` enables write combining (ignored unless T is 16 bytes).
+    /// `wc` enables write combining (ignored unless T is 8, 16 or 32 bytes).
     pub fn with_wc(nparts: usize, cap: usize, wc: bool) -> Self {
         // SS_CAPDIV (testing only) shrinks capacities to exercise the overflow path.
         let div = std::env::var("SS_CAPDIV").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
         let mut cap = (cap / div).clamp(1, u32::MAX as usize / 2);
-        let wc = wc && std::mem::size_of::<T>() == 16 && std::env::var("SS_NOWC").is_err();
+        let sz = std::mem::size_of::<T>();
+        let wc = wc && (sz == 8 || sz == 16 || sz == 32) && std::env::var("SS_NOWC").is_err();
         if wc {
             // whole lines per partition, so every partition starts 64-byte aligned
-            cap = cap.div_ceil(WC_RECS) * WC_RECS;
+            cap = cap.div_ceil(Self::WC_RECS) * Self::WC_RECS;
         }
         let bytes = nparts * cap * std::mem::size_of::<T>();
         let arena = crate::sys::alloc_arena(bytes) as *mut T;
@@ -58,11 +60,11 @@ impl<T: Copy> Parts<T> {
     pub fn push(&mut self, p: usize, v: T) {
         let l = self.lens[p] as usize;
         if !self.wc.is_empty() {
-            let k = l % WC_RECS;
+            let k = l % Self::WC_RECS;
             unsafe { (self.wc[p].0.as_mut_ptr() as *mut T).add(k).write(v) };
             self.lens[p] = l as u32 + 1;
-            if k == WC_RECS - 1 {
-                self.flush_line(p, l + 1 - WC_RECS);
+            if k == Self::WC_RECS - 1 {
+                self.flush_line(p, l + 1 - Self::WC_RECS);
             }
             return;
         }
@@ -75,16 +77,16 @@ impl<T: Copy> Parts<T> {
     }
 
     /// Writes the full staged line of partition p, whose first record has
-    /// index `first` (a multiple of WC_RECS).
+    /// index `first` (a multiple of Self::WC_RECS).
     #[inline(always)]
     fn flush_line(&mut self, p: usize, first: usize) {
         let src = &self.wc[p];
         if first < self.cap {
-            // cap is a multiple of WC_RECS, so the whole line fits
+            // cap is a multiple of Self::WC_RECS, so the whole line fits
             let dst = unsafe { self.arena.add(p * self.cap + first) } as *mut u8;
             stream_line(dst, src);
         } else {
-            let recs = unsafe { std::slice::from_raw_parts(src.0.as_ptr() as *const T, WC_RECS) };
+            let recs = unsafe { std::slice::from_raw_parts(src.0.as_ptr() as *const T, Self::WC_RECS) };
             self.over[p].get_mut().extend_from_slice(recs);
         }
     }
@@ -97,7 +99,7 @@ impl<T: Copy> Parts<T> {
         }
         for p in 0..self.lens.len() {
             let l = self.lens[p] as usize;
-            let k = l % WC_RECS;
+            let k = l % Self::WC_RECS;
             let first = l - k;
             for j in 0..k {
                 let v = unsafe { (self.wc[p].0.as_ptr() as *const T).add(j).read() };
