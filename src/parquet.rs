@@ -159,6 +159,11 @@ struct ChunkMeta {
 
 /// Writes one Parquet file with `nrows` rows.
 pub fn write_file(path: &Path, nrows: usize, cols: &[Column]) -> io::Result<()> {
+    std::fs::write(path, encode(nrows, cols))
+}
+
+/// The bytes of one Parquet file with `nrows` rows.
+pub fn encode(nrows: usize, cols: &[Column]) -> Vec<u8> {
     let mut est = 1024;
     for c in cols {
         est += match &c.data {
@@ -324,5 +329,5 @@ pub fn write_file(path: &Path, nrows: usize, cols: &[Column]) -> io::Result<()> 
     out.extend_from_slice(&m.buf);
     out.extend_from_slice(&(m.buf.len() as u32).to_le_bytes());
     out.extend_from_slice(b"PAR1");
-    std::fs::write(path, &out)
+    out
 }
