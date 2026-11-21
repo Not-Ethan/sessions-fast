@@ -864,12 +864,14 @@ struct BSink<'a> {
     pe_bits: u32,
     ps_bits: u32,
     lb: LocBits,
+    /// benchmark only: skip the person lookup (person = user)
+    nolookup: bool,
 }
 
 impl BSink<'_> {
     #[inline(always)]
     fn emit(&mut self, p: Pending) {
-        let person = person_hash(self.lt, p.user, p.h);
+        let person = if self.nolookup { p.h } else { person_hash(self.lt, p.user, p.h) };
         let q = (person >> (64 - self.ps_bits)) as usize;
         let i = self.s.len(q);
         self.s.push(q, SRec { person, ts: p.ts, pay: p.pay });
@@ -959,6 +961,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
             pe_bits: ctx.pe_bits,
             ps_bits: ctx.ps_bits,
             lb,
+            nolookup: false,
         };
         let mut c: Parts<CRec> = Parts::with_wc(ps, cap_c, true);
         loop {
@@ -2117,6 +2120,7 @@ fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
         pe_bits: ctx.pe_bits,
         ps_bits: ctx.ps_bits,
         lb,
+        nolookup: std::env::var("SS_BENCH_NOLOOKUP").is_ok(),
     };
     let mut reused = mk(&lt);
     let mut best = f64::MAX;
