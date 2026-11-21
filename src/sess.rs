@@ -160,6 +160,9 @@ struct St {
     mixed_e: Vec<SRec>,
     /// persons with at most this many clicks use `attribute_small`
     bf_max: usize,
+    /// SS_OLDATTR=1: choose brute force by click count only and sort every
+    /// other person's clicks unfiltered (as before)
+    old_attr: bool,
 
     /// per campaign: id of the last session it assisted (attribute_small)
     stamp: Vec<u32>,
@@ -236,6 +239,7 @@ impl St {
             cl: Buf::new(max_cl),
             mixed_e: Vec::new(),
             bf_max: crate::env_usize("SS_BF").unwrap_or(16),
+            old_attr: std::env::var("SS_OLDATTR").map_or(false, |v| v == "1"),
 
             stamp: vec![0; ctx.ncamp.max(1)],
             stamp_id: 0,
@@ -554,8 +558,25 @@ impl St {
                 }
             }
         }
-        let pc = &mut cs[..m];
-        let small = pc.len() <= self.bf_max;
+        let mut pc = &mut cs[..m];
+        // brute force for few clicks, or for one session (one pass over the
+        // clicks, no sort)
+        let small = pc.len() <= self.bf_max || (ns == 1 && !self.old_attr);
+        if !small && !self.old_attr {
+            // only clicks with first.start <= ts <= last.start + 7 days
+            // (offsets) can qualify for any session; the others change neither
+            // a credit nor an assist, so they need not be sorted
+            let (lo, hi) = (self.sess[0].start, self.sess[ns - 1].start as u64 + WEEK as u64);
+            let mut k = 0;
+            for j in 0..pc.len() {
+                let c = pc[j];
+                if c.ts >= lo && c.ts as u64 <= hi {
+                    pc[k] = c;
+                    k += 1;
+                }
+            }
+            pc = &mut pc[..k];
+        }
         if pc.len() > 1 && !small {
             pc.sort_unstable_by_key(|c| c.ts);
         }
