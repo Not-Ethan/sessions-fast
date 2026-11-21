@@ -39,7 +39,7 @@ for seed in $SEEDS; do
   echo "=== seed $seed: $(du -sh $D | cut -f1), $(ls $D/events | wc -l) event files"
   if has stages; then
     echo "--- single-thread stage costs (new binary, best of 3 passes)"
-    NCPU=1 SS_BENCH=scan,line,ev,push28,push16,push16wc "$W/new-bin" $D $O/x 2>&1
+    NCPU=1 SS_BENCH=scan,line,ev "$W/new-bin" $D $O/x 2>&1
     PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
     if [ -n "$PERF" ]; then
       sudo env SS_BENCH=ev "$PERF" record -F 4999 -o /tmp/perf_ev.data "$W/prof-bin" $D $O/x 2>&1 | tail -1
@@ -56,7 +56,6 @@ for seed in $SEEDS; do
         nat base "$W/base-bin" $D $n
         nat new "$W/new-bin" $D $n
         nat new-legacy "$W/new-bin" $D $n SS_LEGACY=1
-        nat new-nowc "$W/new-bin" $D $n SS_NOWC=1
       done
     done
   fi

@@ -329,23 +329,24 @@ fn link_worker(
     bar.wait();
     if t == 0 {
         let total: usize = pairs.iter().map(|m| m.lock().unwrap().len()).sum();
-        let _ = cell.set(LinkTable::with_pairs(total));
+        let _ = cell.set(LinkTable::with_pairs(total, pairs.len()));
     }
     bar.wait();
     let lt = cell.get().unwrap();
     {
         let v = pairs[t].lock().unwrap();
+        let mut alloc = links::DenseAlloc::new();
         const AHEAD: usize = 8;
         for k in 0..v.len() {
             if k + AHEAD < v.len() {
                 lt.prefetch(v[k + AHEAD].0);
                 lt.prefetch(v[k + AHEAD].1);
             }
-            lt.link(v[k].0, v[k].1);
+            lt.link(v[k].0, v[k].1, &mut alloc);
         }
     }
     bar.wait();
-    let nb = lt.finalize_blocks();
+    let nb = lt.root_blocks();
     loop {
         let b = f1.fetch_add(1, Ordering::Relaxed);
         if b >= nb {
@@ -354,6 +355,7 @@ fn link_worker(
         lt.finalize_roots(b);
     }
     bar.wait();
+    let nb = lt.val_blocks();
     loop {
         let b = f2.fetch_add(1, Ordering::Relaxed);
         if b >= nb {
