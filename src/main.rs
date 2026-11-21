@@ -692,7 +692,7 @@ fn click_task<const AVX2: bool, C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &
         cache.put(user, h, r.person);
         c.push_click((r.person >> (64 - ctx.ps_bits)) as usize, r);
     };
-    scan::for_each_record_x::<4, _, AVX2>(b, task.start, task.end, #[inline(always)] |f| {
+    let mut line = |f: &[&[u8]; 4]| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -730,7 +730,13 @@ fn click_task<const AVX2: bool, C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &
             ring[(rh + rn) % RING] = r;
             rn += 1;
         }
-    });
+    };
+    // the one-window click splitter (fastev.rs) unless SS_CLICKFAST=0
+    if fastev::CLICKS.load(Ordering::Relaxed) {
+        fastev::for_each_click::<AVX2, _>(b, task.start, task.end, safe_end, &mut line);
+    } else {
+        scan::for_each_record_x::<4, _, AVX2>(b, task.start, task.end, &mut line);
+    }
     for k in 0..rn {
         emit(c, cache, ring[(rh + k) % RING]);
     }
@@ -770,6 +776,17 @@ unsafe fn event_task_batched_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, e:
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn click_task_avx2<C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut C, safe_end: usize, cache: &mut PCache) {
     click_task::<true, C>(b, task, ctx, lt, c, safe_end, cache)
+}
+
+/// `click_task` with run-time SIMD dispatch (checks).
+fn click_task_any<C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut C, safe_end: usize, cache: &mut PCache) {
+    if ctx.avx2 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            return click_task_avx2(b, task, ctx, lt, c, safe_end, cache);
+        }
+    }
+    click_task::<false, C>(b, task, ctx, lt, c, safe_end, cache)
 }
 
 /// AVX2 + BMI1/2 available and not disabled with SS_NOAVX2.
@@ -2417,6 +2434,12 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     // event lines through the line-local fast splitter unless SS_FASTEV=0
     // (then the general scanner)
     fastev::ON.store(std::env::var("SS_FASTEV").map_or(true, |v| v != "0"), Ordering::Relaxed);
+    // click lines through the one-window splitter unless SS_CLICKFAST=0
+    fastev::CLICKS.store(std::env::var("SS_CLICKFAST").map_or(true, |v| v != "0"), Ordering::Relaxed);
+    if std::env::var("SS_CLICKCHECK").is_ok() {
+        fastev::click_check(&links_in, &clicks_in, &ctx);
+        std::process::exit(0);
+    }
     if std::env::var("SS_EVCHECK").is_ok() {
         fastev::check(&events_in, &ctx);
         std::process::exit(0);

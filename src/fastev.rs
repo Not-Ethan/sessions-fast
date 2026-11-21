@@ -35,8 +35,13 @@ use crate::scan;
 /// Use this path for event tasks (SS_FASTEV; see `main::run`).
 pub static ON: AtomicBool = AtomicBool::new(false);
 
-/// Lines handed to the general scanner by `slow_line` (statistics).
+/// Lines handed to the general scanner by `slow_end` (statistics).
 pub static SLOW: AtomicUsize = AtomicUsize::new(0);
+/// Click lines through the one-window splitter (`for_each_click`) unless
+/// SS_CLICKFAST=0 (see `main::run`).
+pub static CLICKS: AtomicBool = AtomicBool::new(false);
+/// Click lines handed to the general scanner (statistics).
+pub static CSLOW: AtomicUsize = AtomicUsize::new(0);
 
 /// Readable bytes needed from a line start for the fast path: window 1 (64),
 /// window 2 at most 65 bytes further (64), and 32 bytes from the start of
@@ -317,6 +322,154 @@ pub fn event_task_fast<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &
     );
 }
 
+// ---------------------------------------------------------------- click lines
+//
+// A click line `click_id,user_id,campaign_id,ts` is short (about 50 bytes),
+// so one 64-byte window from the line start normally holds the whole line:
+// its first four delimiters must be three commas and the line's newline,
+// with every field holding no quote or two, as its first and last byte
+// (`window`). Then the line has exactly 4 well-formed fields and the newline
+// found is its first one. Any other line, and the lines within MARGIN_C
+// bytes of the end of the buffer, go through the general scanner.
+
+/// Readable bytes needed from a click line start: the window (64) and 32
+/// bytes from any field start inside it (the WIDE decoders), with slack.
+const MARGIN_C: usize = 128;
+
+/// A click line cut from one window; meaningful only if `ok`.
+#[derive(Clone, Copy)]
+struct Cut4 {
+    ok: bool,
+    s: [usize; 4],
+    n: [usize; 4],
+    len: usize,
+}
+
+#[inline(always)]
+unsafe fn cut4<const AVX2: bool>(p: *const u8) -> Cut4 {
+    let (c, n, q) = masks64::<AVX2>(p);
+    let d = c | n;
+    // the fourth delimiter (lowest bit of d3) must be the newline
+    let d3 = blsr(blsr(blsr(d)));
+    let r = upto(d3);
+    let (b, cs, ce) = window(d, q, r);
+    let last = d3 & d3.wrapping_neg();
+    let nl = (n ^ last) & r;
+    let ok = (d3 != 0) & ((b | nl) == 0);
+    let mut s = [0usize; 4];
+    let mut ln = [0usize; 4];
+    let (mut cs, mut ce) = (cs, ce);
+    for j in 0..4 {
+        s[j] = tz(cs);
+        ln[j] = tz(ce).wrapping_sub(tz(cs));
+        cs = blsr(cs);
+        ce = blsr(ce);
+    }
+    Cut4 { ok, s, n: ln, len: tz(d3) + 1 }
+}
+
+/// The fields of a cut click line (`c.ok`).
+#[inline(always)]
+unsafe fn fields4<'a>(p: *const u8, c: &Cut4) -> [&'a [u8]; 4] {
+    let f = |j: usize| std::slice::from_raw_parts(p.add(c.s[j]), c.n[j]);
+    [f(0), f(1), f(2), f(3)]
+}
+
+/// The general scanner on click lines b[from..to) (out of line: the fallback
+/// for single lines, buffer tails and small buffers).
+#[cold]
+#[inline(never)]
+fn click_scan<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 4])>(b: &'a [u8], from: usize, to: usize, f: &mut F) {
+    scan::for_each_record_x::<4, _, AVX2>(b, from, to, |x| f(x));
+}
+
+/// Calls `f` with the unquoted fields of every well-formed 4-field line in
+/// `b[start..end)`, in order: the same lines and fields as
+/// `scan::for_each_record_x::<4, _, AVX2>(b, start, end, f)`. Lines cut by
+/// the fast path have 32 readable bytes after every field start inside `b`.
+/// `start` must be a line start and `end` a line start or `b.len()`;
+/// `safe_end` (>= the end of `b`) as for `for_each_line2`; the fast path
+/// never reads beyond `b`.
+#[inline(always)]
+pub fn for_each_click<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 4])>(b: &'a [u8], start: usize, end: usize, safe_end: usize, f: &mut F) {
+    assert!(start <= end && end <= b.len() && safe_end >= b.as_ptr() as usize + b.len());
+    if start >= end {
+        return;
+    }
+    if b.len() < MARGIN_C {
+        click_scan::<AVX2, F>(b, start, end, f);
+        return;
+    }
+    let lim = b.len() - MARGIN_C;
+    let base = b.as_ptr();
+    let mut off = start;
+    while off < end && off <= lim {
+        unsafe {
+            let p = base.add(off);
+            let c = cut4::<AVX2>(p);
+            if c.ok {
+                f(&fields4(p, &c));
+                off += c.len;
+            } else {
+                CSLOW.fetch_add(1, Ordering::Relaxed);
+                let e = scan::next_line_start(b, off);
+                click_scan::<AVX2, F>(b, off, e, f);
+                off = e;
+            }
+        }
+    }
+    if off < end {
+        click_scan::<AVX2, F>(b, off, end, f);
+    }
+}
+
+/// SS_CLICKCHECK: every click task through `main::click_task` with the
+/// general scanner and with the click splitter; the click records must be
+/// identical, in the same order. Exits nonzero on a difference.
+pub fn click_check(links_in: &super::Input, cl: &super::Input, ctx: &Ctx) {
+    use super::{CRec, CSink, PCache};
+    struct RecC(Vec<(usize, u64, u64, u32, u32)>);
+    impl CSink for RecC {
+        #[inline(always)]
+        fn push_click(&mut self, q: usize, r: CRec) {
+            self.0.push((q, r.person, r.ck, r.ts, r.camp));
+        }
+    }
+    let lb = super::LocBits::new(ctx.threads, ctx.ps_bits).unwrap();
+    let empty = super::Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
+    let (lt, _) = super::parse_b(links_in, &empty, &empty, ctx, lb, None);
+    let saved = CLICKS.load(Ordering::Relaxed);
+    let (mut lines, mut recs) = (0usize, 0usize);
+    for task in &cl.tasks {
+        let b = cl.maps[task.file as usize].bytes();
+        let safe_end = b.as_ptr() as usize + b.len();
+        let run = |fast: bool| {
+            CLICKS.store(fast, Ordering::Relaxed);
+            let mut r = RecC(Vec::new());
+            let mut cache = PCache::new();
+            super::click_task_any(b, *task, ctx, &lt, &mut r, safe_end, &mut cache);
+            r.0
+        };
+        let want = run(false);
+        let got = run(true);
+        lines += b[task.start..task.end].iter().filter(|&&c| c == b'\n').count();
+        recs += want.len();
+        if got != want {
+            eprintln!("clickcheck: MISMATCH file {} [{}, {}) ({} vs {} records)", task.file, task.start, task.end, got.len(), want.len());
+            std::process::exit(1);
+        }
+    }
+    CLICKS.store(saved, Ordering::Relaxed);
+    eprintln!(
+        "clickcheck: OK {} tasks, {} lines, {} click records identical (avx2={}); {} lines took the general path",
+        cl.tasks.len(),
+        lines,
+        recs,
+        ctx.avx2,
+        CSLOW.load(Ordering::Relaxed)
+    );
+}
+
 // ---------------------------------------------------------------- checking
 
 /// Records every copy handed to the sink.
@@ -560,6 +713,125 @@ mod tests {
             assert_eq!(got, want, "chunked round {}", round);
         }
         assert!(total > 100_000, "{}", total);
+    }
+
+    fn click_text(r: &mut impl FnMut() -> u64, lines: usize) -> Vec<u8> {
+        let mut t = Vec::new();
+        for _ in 0..lines {
+            let mode = r() % 40;
+            if mode == 0 {
+                t.push(b'\n');
+                continue;
+            }
+            let nf = match mode {
+                1 => 3,
+                2 => 5,
+                3 => 1 + (r() % 8) as usize,
+                _ => 4,
+            };
+            for j in 0..nf {
+                if j > 0 {
+                    t.push(b',');
+                }
+                let v: Vec<u8> = match (j, r() % 30) {
+                    (_, 0) => (0..r() % 30).map(|_| b"ab,\"\n\r 0Z-:T"[(r() % 12) as usize]).collect(),
+                    (_, 1) => Vec::new(),
+                    (_, 2) => (0..40 + r() % 40).map(|_| b"xyz019"[(r() % 6) as usize]).collect(),
+                    (0, _) | (1, _) => (0..1 + r() % 12).map(|_| b"kuabcdefghij0123456789"[(r() % 22) as usize]).collect(),
+                    (2, _) => format!("c_{}", r() % 2500).into_bytes(),
+                    _ => value(2, r),
+                };
+                let quoted = r() % 5 == 0;
+                if quoted {
+                    t.push(b'"');
+                }
+                t.extend_from_slice(&v);
+                if quoted && r() % 40 != 0 {
+                    t.push(b'"');
+                }
+                if r() % 200 == 0 {
+                    t.push(b'"');
+                }
+            }
+            if r() % 100 == 0 {
+                t.push(b'\r');
+            }
+            t.push(b'\n');
+        }
+        if r() % 3 == 0 {
+            t.pop();
+        }
+        t
+    }
+
+    fn click_rows<const AVX2: bool>(b: &[u8], start: usize, end: usize, fast: bool) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let mut push = |f: &[&[u8]; 4]| out.push(f.iter().map(|s| s.to_vec()).collect::<Vec<_>>());
+        let safe_end = b.as_ptr() as usize + b.len();
+        if fast {
+            for_each_click::<AVX2, _>(b, start, end, safe_end, &mut push);
+        } else {
+            scan::for_each_record_x::<4, _, AVX2>(b, start, end, push);
+        }
+        out
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    unsafe fn click_rows_avx2(b: &[u8], start: usize, end: usize) -> Vec<Vec<Vec<u8>>> {
+        click_rows::<true>(b, start, end, true)
+    }
+
+    /// The click splitter yields the general scanner's lines and fields, in
+    /// order: adversarial text, whole and in line-aligned chunks, both SIMD
+    /// paths where available, and every single-byte change of a click line.
+    #[test]
+    fn click_splitter_matches_scanner() {
+        let mut r = rng(0xC11C_C11C_0000_0001);
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("bmi2");
+        let mut total = 0usize;
+        for round in 0..600 {
+            let n = match round % 4 {
+                0 => (r() % 8) as usize,
+                1 => (r() % 200) as usize,
+                _ => 300 + (r() % 4000) as usize,
+            };
+            let t = click_text(&mut r, n);
+            let want = click_rows::<false>(&t, 0, t.len(), false);
+            total += want.len();
+            assert_eq!(click_rows::<false>(&t, 0, t.len(), true), want, "round {}", round);
+            #[cfg(target_arch = "x86_64")]
+            if avx2 {
+                assert_eq!(unsafe { click_rows_avx2(&t, 0, t.len()) }, want, "avx2 round {}", round);
+            }
+            let mut s0 = 0;
+            let mut got = Vec::new();
+            while s0 < t.len() {
+                let nominal = s0 + 1 + (r() % 3000) as usize;
+                let e = if nominal >= t.len() { t.len() } else { scan::next_line_start(&t, nominal - 1) };
+                got.extend(click_rows::<false>(&t, s0, e, true));
+                s0 = e;
+            }
+            assert_eq!(got, want, "chunked round {}", round);
+        }
+        assert!(total > 100_000, "{}", total);
+        let line = b"\"kc1ni90tn\",ucnon1osd,\"c_1190\",\"2027-12-06T10:41:30+05:30\"\n";
+        for pos in 0..line.len() {
+            for v in [b',', b'"', b'\n', b'\r', b'x', b' ', 0u8, 0xFF] {
+                let mut l = line.to_vec();
+                l[pos] = v;
+                let mut t = b"k1,u1,c_2,1829024243000\n".repeat(3);
+                t.extend_from_slice(&l);
+                t.extend_from_slice(&click_text(&mut r, 6));
+                if t.last() != Some(&b'\n') {
+                    t.push(b'\n');
+                }
+                t.extend_from_slice(&[b'z'; 200]);
+                t.push(b'\n');
+                assert_eq!(click_rows::<false>(&t, 0, t.len(), true), click_rows::<false>(&t, 0, t.len(), false), "pos {} byte {}", pos, v);
+            }
+        }
     }
 
     /// Every single-byte change of a well-formed line, at every position,
