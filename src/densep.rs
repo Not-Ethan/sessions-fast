@@ -242,6 +242,16 @@ struct DC {
     ts: u32,
     _p: u32,
     ck: u64,
+    _q: u64,
+}
+
+/// A click with its person, sorted by person.
+#[derive(Clone, Copy)]
+struct CP {
+    p: u32,
+    camp: u32,
+    ts: u32,
+    ck: u64,
 }
 
 /// A kept valid event in event-number order.
@@ -263,26 +273,14 @@ struct EvOut {
 pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &Path, marks: &mut super::Marks) -> Vec<Out2> {
     let threads = ctx.threads;
     let xm = Xmap::new();
-    // 1. links (the general code), then slot -> root slot
+    // 1. links (the general code), then slot -> root slot (stored + 1; 0 =
+    // the slot is its own person)
     let lb = super::LocBits::new(threads, ctx.ps_bits).unwrap();
     let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
     let (lt, _) = super::parse_b(links_in, &empty, &empty, ctx, lb, None);
     marks.mark("d.links");
     let xbase = d.xbase() as usize;
     let proot: &'static [AtomicU32] = arena(xbase);
-    {
-        let next = AtomicUsize::new(0);
-        const CH: usize = 1 << 20;
-        super::par(threads, |_| loop {
-            let c = next.fetch_add(1, Ordering::Relaxed);
-            if c * CH >= xbase {
-                break;
-            }
-            for i in c * CH..((c + 1) * CH).min(xbase) {
-                proot[i].store(i as u32, Ordering::Relaxed);
-            }
-        });
-    }
     let xroot: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
     link_roots(&lt, &d, &xm, proot, &xroot, threads);
     marks.mark("d.slots");
@@ -306,17 +304,21 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
         o
     });
     marks.mark("d.events");
-    // 3. clicks
+    // 3. clicks, bucketed by user slot >> 16 (exceptional slots: last bucket)
+    let nbc = (xbase >> 16) + 1;
+    let estc = cl.bytes / 44 + 1;
+    let capc = estc / (threads * nbc) * 5 / 4 + 64;
     let next = AtomicUsize::new(0);
-    let clo: Vec<Vec<DC>> = super::par(threads, |_| {
-        let mut v = Vec::new();
+    let clo: Vec<Parts<DC>> = super::par(threads, |_| {
+        let mut v: Parts<DC> = Parts::with_wc(nbc, capc, true);
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(&task) = cl.tasks.get(i) else { break };
             let b = cl.maps[task.file as usize].bytes();
             let safe_end = b.as_ptr() as usize + b.len();
-            cl_task_any(b, task, ctx, &d, &xm, &mut v, safe_end);
+            cl_task_any(b, task, ctx, &d, &xm, &mut v, nbc, safe_end);
         }
+        v.finish();
         v
     });
     marks.mark("d.clicks");
@@ -329,17 +331,29 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
         px[x as usize] = r;
     }
     let person = |us: u32| -> u32 {
-        let us = us as usize;
-        if us < xbase {
-            proot[us].load(Ordering::Relaxed)
+        let u = us as usize;
+        if u < xbase {
+            let v = proot[u].load(Ordering::Relaxed);
+            if v == 0 {
+                us
+            } else {
+                v - 1
+            }
         } else {
-            px[us - xbase]
+            px[u - xbase]
         }
     };
     // 5. placement: per bucket, smallest ingest wins; kept valid events in
-    // number order with their person
+    // number order with their person, into one arena (bucket regions sized
+    // by the bucket's copies)
+    let mut boff = vec![0usize; nb + 1];
+    for bi in 0..nb {
+        boff[bi + 1] = boff[bi] + evo.iter().map(|o| o.de.len(bi)).sum::<usize>();
+    }
+    let kept_all: &'static mut [KE] = arena_mut(boff[nb]);
+    let kptr = kept_all.as_mut_ptr() as usize;
+    let klen: Vec<AtomicUsize> = (0..nb).map(|_| AtomicUsize::new(0)).collect();
     let nextb = AtomicUsize::new(0);
-    let kept: Vec<Mutex<Vec<KE>>> = (0..nb).map(|_| Mutex::new(Vec::new())).collect();
     super::par(threads, |_| {
         let mut slot = vec![0u32; BSIZE];
         let mut g: Vec<DE> = Vec::new();
@@ -348,6 +362,9 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             let bi = nextb.fetch_add(1, Ordering::Relaxed);
             if bi >= nb {
                 break;
+            }
+            if boff[bi + 1] == boff[bi] {
+                continue;
             }
             g.truncate(0);
             gp.truncate(0);
@@ -359,9 +376,6 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                     gp.extend_from_slice(sl);
                 }
             }
-            if g.is_empty() {
-                continue;
-            }
             for (i, r) in g.iter().enumerate() {
                 let s = &mut slot[r.n as usize & (BSIZE - 1)];
                 // ties: equal-ingest copies are identical, keep the first
@@ -370,7 +384,9 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                 }
             }
             gp.sort_unstable_by_key(|r| ((r.n as u64) << 32) | r.ingest as u64);
-            let mut out = Vec::with_capacity(g.len());
+            // this bucket's region: boff[bi]..boff[bi + 1], written only here
+            let out = unsafe { std::slice::from_raw_parts_mut((kptr as *mut KE).add(boff[bi]), boff[bi + 1] - boff[bi]) };
+            let mut k = 0usize;
             for s in slot.iter_mut() {
                 if *s == 0 {
                     continue;
@@ -388,13 +404,17 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                 } else {
                     0
                 };
-                out.push(KE { p: person(r.us & !PFLAG), ts: r.ts & !VALID, pay });
+                out[k] = KE { p: person(r.us & !PFLAG), ts: r.ts & !VALID, pay };
+                k += 1;
             }
-            *kept[bi].lock().unwrap() = out;
+            klen[bi].store(k, Ordering::Relaxed);
         }
     });
+    let kept_all: &[KE] = kept_all;
+    let kept = |bi: usize| -> &[KE] { &kept_all[boff[bi]..boff[bi] + klen[bi].load(Ordering::Relaxed)] };
     marks.mark("d.place");
-    // 6. exceptional events: dedup among themselves; winners are gathered
+    // 6. exceptional events: dedup among themselves; winners join their
+    // persons' gathered events (sorted by person)
     let mut xbest: HashMap<u64, XE> = HashMap::new();
     for o in &evo {
         for x in &o.xe {
@@ -406,8 +426,10 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             }
         }
     }
-    let xwin: Vec<KE> = xbest.values().filter(|x| x.valid).map(|x| KE { p: person(x.us), ts: x.ts, pay: x.pay }).collect();
-    // 7. runs per person (a run cut by a bucket border counts twice)
+    let mut xwin: Vec<KE> = xbest.values().filter(|x| x.valid).map(|x| KE { p: person(x.us), ts: x.ts, pay: x.pay }).collect();
+    xwin.sort_unstable_by_key(|e| e.p);
+    // 7. runs per person (a run cut by a bucket border counts twice; a
+    // person with exceptional events counts at least twice)
     let runs: &'static [AtomicU32] = arena(np);
     {
         let nextb = AtomicUsize::new(0);
@@ -416,9 +438,8 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             if bi >= nb {
                 break;
             }
-            let k = kept[bi].lock().unwrap();
             let mut prev = u32::MAX;
-            for e in k.iter() {
+            for e in kept(bi) {
                 if e.p != prev {
                     runs[e.p as usize].fetch_add(1, Ordering::Relaxed);
                     prev = e.p;
@@ -429,62 +450,68 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     for e in &xwin {
         runs[e.p as usize].fetch_add(2, Ordering::Relaxed);
     }
-    // 8. clicks by person (counting sort)
-    let cstart: &'static [AtomicU32] = arena(np + 1);
-    let total_cl: usize = clo.iter().map(|v| v.len()).sum();
+    // 8. clicks by person: per click bucket, clicks whose person is a dense
+    // slot in the same bucket range stay there (sorted by person); all
+    // others are "foreign" (sorted by person)
+    let cbuck: Vec<Mutex<Vec<CP>>> = (0..nbc).map(|_| Mutex::new(Vec::new())).collect();
+    let foreign: Mutex<Vec<CP>> = Mutex::new(Vec::new());
     {
-        super::par(threads, |t| {
-            if let Some(v) = clo.get(t) {
-                for c in v {
-                    cstart[person(c.us) as usize + 1].fetch_add(1, Ordering::Relaxed);
+        let nextc = AtomicUsize::new(0);
+        super::par(threads, |_| {
+            let mut fl: Vec<CP> = Vec::new();
+            loop {
+                let ci = nextc.fetch_add(1, Ordering::Relaxed);
+                if ci >= nbc {
+                    break;
                 }
+                let mut v: Vec<CP> = Vec::new();
+                for o in &clo {
+                    for sl in o.get(ci) {
+                        for c in sl.iter() {
+                            let p = person(c.us);
+                            let cp = CP { p, camp: c.camp, ts: c.ts, ck: c.ck };
+                            if (p as usize) < xbase && (p as usize >> 16) == ci {
+                                v.push(cp);
+                            } else {
+                                fl.push(cp);
+                            }
+                        }
+                    }
+                }
+                v.sort_unstable_by_key(|c| c.p);
+                *cbuck[ci].lock().unwrap() = v;
             }
+            foreign.lock().unwrap().append(&mut fl);
         });
-        // threads beyond clo.len() (none: clo has one vector per thread)
-        let mut acc = 0u32;
-        for i in 0..=np {
-            acc += cstart[i].load(Ordering::Relaxed);
-            cstart[i].store(acc, Ordering::Relaxed);
-        }
     }
-    let cpos: &'static [AtomicU32] = arena(np);
-    for i in 0..np {
-        cpos[i].store(cstart[i].load(Ordering::Relaxed), Ordering::Relaxed);
-    }
-    let clicks: &'static mut [Cl] = arena_mut(total_cl);
-    let cptr = clicks.as_mut_ptr() as usize;
-    super::par(threads, |t| {
-        if let Some(v) = clo.get(t) {
-            for c in v {
-                let p = person(c.us) as usize;
-                let k = cpos[p].fetch_add(1, Ordering::Relaxed) as usize;
-                // each position is written once (distinct fetch_add results)
-                unsafe { (cptr as *mut Cl).add(k).write(Cl { person: 0, ck: c.ck, ts: c.ts, camp: c.camp }) };
-            }
-        }
-    });
-    let clicks: &[Cl] = clicks;
+    let cbuck: Vec<Vec<CP>> = cbuck.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let mut foreign = foreign.into_inner().unwrap();
+    foreign.sort_unstable_by_key(|c| c.p);
+    let range = |v: &[CP], p: u32| -> (usize, usize) { (v.partition_point(|c| c.p < p), v.partition_point(|c| c.p <= p)) };
     marks.mark("d.group");
-    // 9. persons: single-run persons from the buckets, then the gathered ones
+    // 9. persons: single-run persons from the buckets; the others from
+    // their run descriptors (sorted by person) plus exceptional winners
     let est_rows = est / threads / 4 + 4096;
     let nextb = AtomicUsize::new(0);
-    let gather: Mutex<Vec<KE>> = Mutex::new(xwin);
-    let groups: std::sync::OnceLock<Vec<(usize, usize)>> = std::sync::OnceLock::new();
-    let sorted: std::sync::OnceLock<Vec<KE>> = std::sync::OnceLock::new();
+    let multi: Mutex<Vec<(u32, u32, u32, u32)>> = Mutex::new(Vec::new());
+    let groups: std::sync::OnceLock<(Vec<(u32, u32, u32, u32)>, Vec<(usize, usize)>)> = std::sync::OnceLock::new();
     let bar = std::sync::Barrier::new(threads);
     let nextg = AtomicUsize::new(0);
     let outs = super::par(threads, |t| {
         let mut st = PersonSess::new(ctx, est_rows);
         let mut es: Vec<SRec> = Vec::new();
         let mut cs: Vec<Cl> = Vec::new();
-        let mut g: Vec<KE> = Vec::new();
-        let one = |p: u32, evs: &mut dyn Iterator<Item = KE>, st: &mut PersonSess, es: &mut Vec<SRec>, cs: &mut Vec<Cl>| {
-            let pm = pmix(p, &d, &xkeys);
-            es.clear();
-            es.extend(evs.map(|e| SRec { person: pm, ts: e.ts, pay: e.pay }));
+        let mut md: Vec<(u32, u32, u32, u32)> = Vec::new();
+        // the person's clicks, then the routine
+        let finish_person = |p: u32, pm: u64, st: &mut PersonSess, es: &mut Vec<SRec>, cs: &mut Vec<Cl>| {
             cs.clear();
-            let (a, b) = (cstart[p as usize].load(Ordering::Relaxed) as usize, cstart[p as usize + 1].load(Ordering::Relaxed) as usize);
-            cs.extend(clicks[a..b].iter().map(|c| Cl { person: pm, ..*c }));
+            if (p as usize) < xbase {
+                let v = &cbuck[p as usize >> 16];
+                let (a, b) = range(v, p);
+                cs.extend(v[a..b].iter().map(|c| Cl { person: pm, ck: c.ck, ts: c.ts, camp: c.camp }));
+            }
+            let (a, b) = range(&foreign, p);
+            cs.extend(foreign[a..b].iter().map(|c| Cl { person: pm, ck: c.ck, ts: c.ts, camp: c.camp }));
             st.person(pm, es, cs, ctx);
         };
         loop {
@@ -492,7 +519,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             if bi >= nb {
                 break;
             }
-            let k = kept[bi].lock().unwrap();
+            let k = kept(bi);
             let mut i = 0;
             while i < k.len() {
                 let p = k[i].p;
@@ -501,39 +528,55 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                     j += 1;
                 }
                 if runs[p as usize].load(Ordering::Relaxed) == 1 {
-                    one(p, &mut k[i..j].iter().copied(), &mut st, &mut es, &mut cs);
+                    let pm = pmix(p, &d, &xkeys);
+                    es.clear();
+                    es.extend(k[i..j].iter().map(|e| SRec { person: pm, ts: e.ts, pay: e.pay }));
+                    finish_person(p, pm, &mut st, &mut es, &mut cs);
                 } else {
-                    g.extend_from_slice(&k[i..j]);
+                    md.push((p, bi as u32, i as u32, j as u32));
                 }
                 i = j;
             }
         }
-        gather.lock().unwrap().append(&mut g);
+        multi.lock().unwrap().append(&mut md);
         bar.wait();
         if t == 0 {
-            let mut v = std::mem::take(&mut *gather.lock().unwrap());
-            v.sort_unstable_by_key(|e| e.p);
+            let mut v = std::mem::take(&mut *multi.lock().unwrap());
+            // persons that have only exceptional events still need a group
+            for e in &xwin {
+                v.push((e.p, u32::MAX, 0, 0));
+            }
+            v.sort_unstable();
+            v.dedup_by(|a, b| a.1 == u32::MAX && b.1 == u32::MAX && a.0 == b.0);
             let mut gr = Vec::new();
             let mut i = 0;
             while i < v.len() {
                 let mut j = i + 1;
-                while j < v.len() && v[j].p == v[i].p {
+                while j < v.len() && v[j].0 == v[i].0 {
                     j += 1;
                 }
                 gr.push((i, j));
                 i = j;
             }
-            let _ = groups.set(gr);
-            let _ = sorted.set(v);
+            let _ = groups.set((v, gr));
         }
         bar.wait();
         {
-            let gr = groups.get().unwrap();
-            let v = sorted.get().unwrap();
+            let (v, gr) = groups.get().unwrap();
             loop {
                 let gi = nextg.fetch_add(1, Ordering::Relaxed);
                 let Some(&(a, b)) = gr.get(gi) else { break };
-                one(v[a].p, &mut v[a..b].iter().copied(), &mut st, &mut es, &mut cs);
+                let p = v[a].0;
+                let pm = pmix(p, &d, &xkeys);
+                es.clear();
+                for &(_, bi, i, j) in &v[a..b] {
+                    if bi != u32::MAX {
+                        es.extend(kept(bi as usize)[i as usize..j as usize].iter().map(|e| SRec { person: pm, ts: e.ts, pay: e.pay }));
+                    }
+                }
+                let (xa, xb) = (xwin.partition_point(|e| e.p < p), xwin.partition_point(|e| e.p <= p));
+                es.extend(xwin[xa..xb].iter().map(|e| SRec { person: pm, ts: e.ts, pay: e.pay }));
+                finish_person(p, pm, &mut st, &mut es, &mut cs);
             }
         }
         st.finish(ud, t)
@@ -556,10 +599,13 @@ fn link_roots(lt: &LinkTable, d: &Dense, xm: &Xmap, proot: &[AtomicU32], xroot: 
                 break;
             }
             lt.entries(b, |k, pk| {
-                let s = user_slot(&keys::decode(k), d, xm);
-                let r = user_slot(&keys::decode(pk), d, xm);
+                let mut b1 = [0u8; 16];
+                let mut b2 = [0u8; 16];
+                let s = key_slot(k, &mut b1, d, xm);
+                let r = key_slot(pk, &mut b2, d, xm);
                 if s < xbase {
-                    proot[s as usize].store(r, Ordering::Relaxed);
+                    // + 1: 0 means "own person"
+                    proot[s as usize].store(r + 1, Ordering::Relaxed);
                 } else {
                     local.push((s - xbase, r));
                 }
@@ -567,6 +613,23 @@ fn link_roots(lt: &LinkTable, d: &Dense, xm: &Xmap, proot: &[AtomicU32], xroot: 
         }
         xroot.lock().unwrap().extend(local);
     });
+}
+
+/// keys.rs's 6-bit alphabet (packed keys).
+const ALPHABET: &[u8; 64] = b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+
+/// The user slot of the ID behind key `k` (as `user_slot` of its string).
+fn key_slot(k: u64, buf: &mut [u8; 16], d: &Dense, xm: &Xmap) -> u32 {
+    if keys::is_fallback(k) {
+        return user_slot(&keys::decode(k), d, xm);
+    }
+    // keys::decode_into for a packed key
+    let n = (k & 0xF) as usize;
+    let codes = k >> 4;
+    for (i, c) in buf.iter_mut().enumerate().take(10) {
+        *c = ALPHABET[((codes >> (6 * (9 - i))) & 63) as usize];
+    }
+    user_slot(&buf[..n], d, xm)
 }
 
 fn arena<T>(n: usize) -> &'static [T] {
@@ -673,23 +736,26 @@ fn ev_range(b: &[u8], from: usize, to: usize, ctx: &Ctx, d: &Dense, xm: &Xmap, o
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[inline(never)]
-unsafe fn cl_task_avx2(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut Vec<DC>, safe_end: usize) {
-    cl_task_x::<true>(b, task, ctx, d, xm, v, safe_end)
+#[allow(clippy::too_many_arguments)]
+unsafe fn cl_task_avx2(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut Parts<DC>, nbc: usize, safe_end: usize) {
+    cl_task_x::<true>(b, task, ctx, d, xm, v, nbc, safe_end)
 }
 
-fn cl_task_any(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut Vec<DC>, safe_end: usize) {
+#[allow(clippy::too_many_arguments)]
+fn cl_task_any(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut Parts<DC>, nbc: usize, safe_end: usize) {
     if ctx.avx2 {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            return cl_task_avx2(b, task, ctx, d, xm, v, safe_end);
+            return cl_task_avx2(b, task, ctx, d, xm, v, nbc, safe_end);
         }
     }
-    cl_task_x::<false>(b, task, ctx, d, xm, v, safe_end)
+    cl_task_x::<false>(b, task, ctx, d, xm, v, nbc, safe_end)
 }
 
 /// One click line: the same rules as main::click_task.
 #[inline(always)]
-fn cl_task_x<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut Vec<DC>, safe_end: usize) {
+#[allow(clippy::too_many_arguments)]
+fn cl_task_x<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut Parts<DC>, nbc: usize, safe_end: usize) {
     let we = ctx.we;
     let cws = ctx.ws - super::WEEK;
     let mut line = |f: &[&[u8]; 4]| {
@@ -707,7 +773,8 @@ fn cl_task_x<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &
         }
         let us = user_slot(f[1], d, xm);
         let ck = if wide { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) };
-        v.push(DC { us, camp: camp as u32, ts: (t - cws) as u32, _p: 0, ck });
+        let q = ((us >> 16) as usize).min(nbc - 1);
+        v.push(q, DC { us, camp: camp as u32, ts: (t - cws) as u32, _p: 0, ck, _q: 0 });
     };
     fastev::for_each_click::<AVX2, _>(b, task.start, task.end, safe_end, &mut line);
 }
