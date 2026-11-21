@@ -3201,7 +3201,8 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
                         ring: [Pending::default(); BRING],
                         rh: 0,
                         rn: 0,
-                        use_bulk: std::env::var("SS_BULK").is_ok(),
+                        // as in production: bulk lookup queue unless SS_RING
+                        use_bulk: std::env::var("SS_RING").is_err(),
                         bulk: [Pending::default(); BULK_CAP],
                         bn: 0,
                         tbase: ((ti as u64) << (lb.qbits + lb.ibits)) as u32,
