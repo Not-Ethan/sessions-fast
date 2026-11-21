@@ -1651,12 +1651,26 @@ fn main() {
             PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into())),
         )
     };
+    if std::env::var("SS_DIAG").is_ok() {
+        diag(&data_dir);
+    }
     let threads = env_usize("NCPU")
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .min(64);
     let verbose = std::env::var("SS_VERBOSE").is_ok();
+    let report = run(&data_dir, &out_dir, threads, verbose);
+    if verbose {
+        eprintln!("{}", report);
+    }
+    // Skip destructors (mmaps, big vectors): the OS reclaims everything.
+    std::process::exit(0);
+}
+
+/// The whole pipeline on one dataset. Returns the verbose report line.
+fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String {
     sys::NOHUGE.store(std::env::var("SS_NOHUGE").is_ok(), Ordering::Relaxed);
+    LINKS_US.store(0, Ordering::Relaxed);
     let mut marks = Marks::new(verbose);
 
     // manifest + lookups
@@ -1821,7 +1835,7 @@ fn main() {
 
     if verbose {
         let rows: usize = souts.iter().map(|s| s.nrows).sum();
-        eprintln!(
+        return format!(
             "sessions: {} | pipeline={} links={:.1}ms threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB",
             marks.report(),
             pipeline,
@@ -1835,8 +1849,135 @@ fn main() {
             sys::peak_rss_mb()
         );
     }
-    // Skip destructors (mmaps, big vectors): the OS reclaims everything.
-    std::process::exit(0);
+    String::new()
+}
+
+/// Diagnostic helper: writes `copies` independent copies of the dataset into
+/// `rep`: in copy k every user / event / click ID gets the suffix char
+/// 'A' + k (inside its quotes), so copies share no IDs.
+fn build_replica(data_dir: &Path, rep: &Path, copies: usize) {
+    let _ = std::fs::remove_dir_all(rep);
+    let mut jobs = Vec::new();
+    for (sub, idx) in [("events", &[0usize, 1][..]), ("clicks", &[0, 1][..]), ("links", &[0, 1][..])] {
+        std::fs::create_dir_all(rep.join(sub)).unwrap_or_else(|e| fail(&format!("diag mkdir: {}", e)));
+        for f in list_csv(&data_dir.join(sub)) {
+            for k in 0..copies {
+                jobs.push((f.clone(), rep.join(sub).join(format!("r{:02}_{}", k, f.file_name().unwrap().to_string_lossy())), idx, k));
+            }
+        }
+    }
+    for f in ["manifest.json", "products.csv", "campaigns.csv"] {
+        let _ = std::fs::copy(data_dir.join(f), rep.join(f));
+    }
+    let next = AtomicUsize::new(0);
+    par(8, |_| loop {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        let Some((src, dst, idx, k)) = jobs.get(i) else { break };
+        let text = read_file(src);
+        let suffix = b'A' + *k as u8;
+        let mut out = Vec::with_capacity(text.len() + text.len() / 20);
+        let mut first = true;
+        for line in text.split_inclusive(|&b| b == b'\n') {
+            if first {
+                out.extend_from_slice(line); // header
+                first = false;
+                continue;
+            }
+            let mut field = 0usize;
+            let mut start = 0usize;
+            for (j, &c) in line.iter().enumerate() {
+                if c == b',' || c == b'\n' || j + 1 == line.len() {
+                    let end = if c == b',' || c == b'\n' { j } else { j + 1 };
+                    out.extend_from_slice(&line[start..end]);
+                    if idx.contains(&field) && end > start {
+                        if line[end - 1] == b'"' && end - start >= 2 {
+                            out.pop();
+                            out.push(suffix);
+                            out.push(b'"');
+                        } else {
+                            out.push(suffix);
+                        }
+                    }
+                    if end == j {
+                        out.push(c);
+                    }
+                    field += 1;
+                    start = j + 1;
+                }
+            }
+        }
+        std::fs::write(dst, &out).unwrap_or_else(|e| fail(&format!("diag write: {}", e)));
+    });
+}
+
+/// SS_DIAG=1 (diagnostic submissions only): machine summary, then the
+/// pipeline under several configurations on the dataset and on a 20x
+/// replica of it built from symlinks in SCRATCH_DIR; exits with status 3 so
+/// the scorer reports stderr. Never used for a real run.
+fn diag(data_dir: &Path) -> ! {
+    let cpu = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let model = cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("?").to_string();
+    let flags = cpu.lines().find(|l| l.starts_with("flags")).unwrap_or("");
+    let has = |f: &str| flags.split_whitespace().any(|x| x == f);
+    eprintln!(
+        "diag: {} | ncpu={} avx2={} avx512bw={} bmi2={} thp={}",
+        model,
+        std::thread::available_parallelism().map_or(0, |n| n.get()),
+        has("avx2"),
+        has("avx512bw"),
+        has("bmi2"),
+        std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default().trim()
+    );
+    let scratch = PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into()));
+    let rep = scratch.join("rep20");
+    let t = Instant::now();
+    build_replica(data_dir, &rep, 20);
+    eprintln!("diag replica: {:.0}ms", t.elapsed().as_secs_f64() * 1e3);
+    let short = |r: &str| -> String {
+        let mut o = String::new();
+        for key in ["total=", "parse=", "dedup=", "sessions=", "write=", "links=", "pipeline=", "user_rows=", "peak_rss="] {
+            if let Some(i) = r.find(key) {
+                let rest = &r[i..];
+                let end = rest.find(|c: char| c == ' ' || c == '(').unwrap_or(rest.len());
+                o.push_str(&rest[..end]);
+                if let Some(j) = rest.find("(cpu ") {
+                    if j == end {
+                        let c = &rest[j + 5..];
+                        o.push_str(&format!("/c{}", &c[..c.find('/').unwrap_or(0)]));
+                    }
+                }
+                o.push(' ');
+            }
+        }
+        o
+    };
+    let configs: [(&str, &[(&str, &str)], usize, bool); 10] = [
+        ("dev-B8", &[], 8, false),
+        ("x20-B8", &[], 8, true),
+        ("x20-B8", &[], 8, true),
+        ("x20-L8", &[("SS_LEGACY", "1")], 8, true),
+        ("x20-B4", &[], 4, true),
+        ("x20-B6", &[], 6, true),
+        ("x20-B8-nowc", &[("SS_NOWC", "1")], 8, true),
+        ("x20-B8-tsw", &[("SS_TSW", "1")], 8, true),
+        ("x20-L8", &[("SS_LEGACY", "1")], 8, true),
+        ("x20-B8", &[], 8, true),
+    ];
+    for (i, (name, env, threads, x20)) in configs.iter().enumerate() {
+        for (k, v) in env.iter() {
+            std::env::set_var(k, v);
+        }
+        let out = scratch.join(format!("diag_out{}", i));
+        let _ = std::fs::remove_dir_all(&out);
+        let t = Instant::now();
+        let r = run(if *x20 { &rep } else { data_dir }, &out, *threads, true);
+        eprintln!("diag {:14} wall={:.0}ms {}", name, t.elapsed().as_secs_f64() * 1e3, short(&r));
+        for (k, _) in env.iter() {
+            std::env::remove_var(k);
+        }
+        sys::release_all();
+    }
+    std::process::exit(3)
 }
 
 /// Null sink for the stage benchmark.

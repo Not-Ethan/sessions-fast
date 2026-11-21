@@ -160,6 +160,17 @@ pub fn alloc_arena(bytes: usize) -> *mut u8 {
 pub static NOHUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ARENAS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
+/// Unmaps every arena (diagnostic mode, between runs: nothing may use them
+/// afterwards).
+pub fn release_all() {
+    let v = std::mem::take(&mut *ARENAS.lock().unwrap());
+    for (a, l) in v {
+        unsafe {
+            munmap(a as *mut c_void, l);
+        }
+    }
+}
+
 /// Every arena as (address, length).
 pub fn arenas() -> Vec<(usize, usize)> {
     ARENAS.lock().unwrap().clone()
