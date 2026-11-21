@@ -20,9 +20,9 @@ docker run --name "$NAME" \
   -v "$DATA":/data:ro -v "$OUT":/output -v "$SCR":/scratch \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
   -e NCPU="$NCPU" -e MEM_GB="${MEM%g}" -e SS_VERBOSE=1 "${ENVS[@]}" \
-  "$IMAGE" > /tmp/drun_out.txt 2> /tmp/drun_err.txt
+  "$IMAGE" > /tmp/a1_drun_out.txt 2> /tmp/a1_drun_err.txt
 RC=$?
-[ $RC -ne 0 ] && { echo "docker run failed rc=$RC"; tail -5 /tmp/drun_err.txt; }
+[ $RC -ne 0 ] && { echo "docker run failed rc=$RC"; tail -5 /tmp/a1_drun_err.txt; }
 T1=$(date +%s%N)
 INS=$(docker inspect -f '{{.State.StartedAt}} {{.State.FinishedAt}}' "$NAME")
 docker rm "$NAME" > /dev/null
@@ -38,7 +38,7 @@ def ns(s):
     return calendar.timegm((y, mo, d, h, mi, se)) * 10**9 + int(frac)
 a, b = ins.split()
 dock = (ns(b) - ns(a)) / 1e6
-err = open("/tmp/drun_err.txt").read()
+err = open("/tmp/a1_drun_err.txt").read()
 m = re.search(r"unix_start_ns=(\d+) unix_end_ns=(\d+)", err)
 tot = re.search(r"total=([\d.]+)ms", err)
 if m:

@@ -357,19 +357,41 @@ impl Marks {
 
 // ---------------------------------------------------------------- parsing
 
-/// Parses link lines of one chunk into (a, b) key pairs (self-links skipped).
-fn link_task(input: &Input, task: Task, v: &mut Vec<(u64, u64)>) {
+/// `link_task` with AVX2 masks when `AVX2`.
+#[inline(always)]
+fn link_task_x<const AVX2: bool>(input: &Input, task: Task, v: &mut Vec<(u64, u64)>) {
     let b = input.maps[task.file as usize].bytes();
-    scan::for_each_record::<2, _>(b, task.start, task.end, |f| {
+    let safe_end = b.as_ptr() as usize + b.len();
+    // a link line is at least 4 bytes ("a,b\n")
+    v.reserve((task.end - task.start) / 16 + 16);
+    scan::for_each_record_x::<2, _, AVX2>(b, task.start, task.end, #[inline(always)] |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let a = keys::key_of(f[0]);
-        let c = keys::key_of(f[1]);
+        let (a, c) = if f[1].as_ptr() as usize + 16 <= safe_end {
+            unsafe { (keys::key_of_wide(f[0]), keys::key_of_wide(f[1])) }
+        } else {
+            (keys::key_of(f[0]), keys::key_of(f[1]))
+        };
         if a != c {
             v.push((a, c));
         }
     });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn link_task_avx2(input: &Input, task: Task, v: &mut Vec<(u64, u64)>) {
+    link_task_x::<true>(input, task, v)
+}
+
+/// Parses link lines of one chunk into (a, b) key pairs (self-links skipped).
+fn link_task(input: &Input, task: Task, v: &mut Vec<(u64, u64)>) {
+    #[cfg(target_arch = "x86_64")]
+    if use_avx2() {
+        return unsafe { link_task_avx2(input, task, v) };
+    }
+    link_task_x::<false>(input, task, v)
 }
 
 /// The link work of one of `nl` link threads (thread `t`): parse links, build
@@ -394,24 +416,43 @@ fn link_worker(
     *pairs[t].lock().unwrap() = v;
     bar.wait();
     if t == 0 {
+        LINK_MARKS[0].store(sys::unix_ns(), Ordering::Relaxed);
+    }
+    if t == 0 {
         let total: usize = pairs.iter().map(|m| m.lock().unwrap().len()).sum();
         let _ = cell.set(LinkTable::with_pairs(total, pairs.len()));
     }
     bar.wait();
+    if t == 0 {
+        LINK_MARKS[1].store(sys::unix_ns(), Ordering::Relaxed);
+    }
     let lt = cell.get().unwrap();
     {
+        // insert both IDs of every link (slots prefetched ahead), then union
+        // by dense index (union-find entries prefetched ahead)
         let v = pairs[t].lock().unwrap();
         let mut alloc = links::DenseAlloc::new();
-        const AHEAD: usize = 8;
+        let mut dv: Vec<(u32, u32)> = Vec::with_capacity(v.len());
+        const AHEAD: usize = const_usize(option_env!("SS_LINKAHEAD"), 8);
         for k in 0..v.len() {
             if k + AHEAD < v.len() {
                 lt.prefetch(v[k + AHEAD].0);
                 lt.prefetch(v[k + AHEAD].1);
             }
-            lt.link(v[k].0, v[k].1, &mut alloc);
+            dv.push(lt.insert_pair(v[k].0, v[k].1, &mut alloc));
+        }
+        for k in 0..dv.len() {
+            if k + AHEAD < dv.len() {
+                lt.prefetch_dense(dv[k + AHEAD].0);
+                lt.prefetch_dense(dv[k + AHEAD].1);
+            }
+            lt.union_dense(dv[k].0, dv[k].1);
         }
     }
     bar.wait();
+    if t == 0 {
+        LINK_MARKS[2].store(sys::unix_ns(), Ordering::Relaxed);
+    }
     let nb = lt.root_blocks();
     loop {
         let b = f1.fetch_add(1, Ordering::Relaxed);
@@ -421,6 +462,9 @@ fn link_worker(
         lt.finalize_roots(b);
     }
     bar.wait();
+    if t == 0 {
+        LINK_MARKS[3].store(sys::unix_ns(), Ordering::Relaxed);
+    }
     let nb = lt.val_blocks();
     loop {
         let b = f2.fetch_add(1, Ordering::Relaxed);
@@ -430,6 +474,9 @@ fn link_worker(
         lt.finalize_vals(b);
     }
     bar.wait();
+    if t == 0 {
+        LINK_MARKS[4].store(sys::unix_ns(), Ordering::Relaxed);
+    }
 }
 
 #[inline(always)]
@@ -448,6 +495,20 @@ struct ParseOut {
 /// late, (user key, ts - window_start in ms, pay).
 trait EvSink {
     fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>);
+
+    /// The parsed copies of a batch (lines with `ing == i64::MIN` were
+    /// dropped and are skipped), in any order. Default: one `copy` each.
+    #[inline(always)]
+    fn copy_batch(&mut self, bt: &EvBatch, n: usize, ctx: &Ctx) {
+        for i in 0..n {
+            let ing = bt.ing[i];
+            if ing == i64::MIN {
+                continue;
+            }
+            let valid = if bt.ok[i] { Some((bt.user[i], (bt.ts[i] - ctx.ws) as u32, bt.pay[i])) } else { None };
+            self.copy(bt.eid[i], ingest_rel(ing, ctx.ws_s), valid);
+        }
+    }
 }
 
 /// Legacy pipeline: one ERec per copy, routed by event_id.
@@ -627,6 +688,12 @@ fn click_task<const AVX2: bool, C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn event_task_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, e: &mut S, safe_end: usize) {
     event_task::<true, S>(b, task, ctx, e, safe_end)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn event_task_batched_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, e: &mut S, safe_end: usize, bt: &mut EvBatch) {
+    event_task_batched::<true, S>(b, task, ctx, e, safe_end, bt, 7);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -952,6 +1019,116 @@ const fn const_usize(s: Option<&str>, default: usize) -> usize {
     }
 }
 
+
+/// Global event_id table (replaces the dedup record stream and the dedup
+/// phase when enabled). Open addressing over [key, value] slots in a huge-page
+/// arena; key = keys::mix(event_id key) (never 0), value = (ingest + 1) << 32
+/// | loc (0 = claimed, value not yet published).
+///
+/// Insert of a copy: if the slot is new, the copy becomes its value. If the
+/// event_id is present, the copy replaces the value iff its ingest is
+/// strictly smaller (CAS; the displaced copy is killed), else the copy is
+/// killed. So every copy but one is killed exactly once, and the survivor has
+/// the smallest ingest (ties: the first published; equal-ingest copies are
+/// identical). Kills are collected per thread and applied after the parse.
+/// If the table gets 3/4 full the run falls back to the legacy pipeline.
+/// Longest probe sequence accepted before the table counts as full.
+const PROBE_LIMIT: usize = 4096;
+
+struct EidTable {
+    slots: &'static [[AtomicU64; 2]],
+    mask: usize,
+    limit: usize,
+    count: AtomicUsize,
+    full: std::sync::atomic::AtomicBool,
+}
+
+impl EidTable {
+    fn new(expected: usize) -> EidTable {
+        let cap = (expected * 3 / 2 + 1024).next_power_of_two();
+        let p = sys::alloc_arena(cap * 16) as *const [AtomicU64; 2];
+        EidTable {
+            slots: unsafe { std::slice::from_raw_parts(p, cap) },
+            mask: cap - 1,
+            limit: cap / 4 * 3,
+            count: AtomicUsize::new(0),
+            full: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, eid: u64) {
+        prefetch(self.slots.as_ptr().wrapping_add(eid as usize & self.mask) as *const u8);
+    }
+
+    /// Inserts one copy; returns false if the table is (nearly) full, in
+    /// which case the caller falls back to the legacy pipeline. Every probe
+    /// sequence is bounded, so this terminates even on a full table.
+    #[inline(always)]
+    fn insert(&self, eid: u64, ingest: u32, loc: u32, kills: &mut Vec<u32>, fresh: &mut usize) -> bool {
+        let enc = ((ingest.min(u32::MAX - 1) as u64 + 1) << 32) | loc as u64;
+        let mut i = eid as usize & self.mask;
+        let mut probes = 0usize;
+        loop {
+            probes += 1;
+            if probes > PROBE_LIMIT.min(self.mask + 1) {
+                self.full.store(true, Ordering::Relaxed);
+                return false;
+            }
+            let s = unsafe { self.slots.get_unchecked(i) };
+            let k = s[0].load(Ordering::Acquire);
+            if k == 0 {
+                if *fresh >= 1024 {
+                    let total = self.count.fetch_add(*fresh, Ordering::Relaxed) + *fresh;
+                    *fresh = 0;
+                    if total > self.limit {
+                        self.full.store(true, Ordering::Relaxed);
+                    }
+                }
+                if self.full.load(Ordering::Relaxed) {
+                    return false;
+                }
+                match s[0].compare_exchange(0, eid, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        s[1].store(enc, Ordering::Release);
+                        *fresh += 1;
+                        return true;
+                    }
+                    Err(actual) if actual == eid => {}
+                    Err(_) => {
+                        i = (i + 1) & self.mask;
+                        continue;
+                    }
+                }
+            } else if k != eid {
+                i = (i + 1) & self.mask;
+                continue;
+            }
+            // a copy of this event_id is present
+            loop {
+                let v = s[1].load(Ordering::Acquire);
+                if v == 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                if (enc >> 32) < (v >> 32) {
+                    if s[1].compare_exchange(v, enc, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        if v as u32 != LOC_NONE {
+                            kills.push(v as u32);
+                        }
+                        return true;
+                    }
+                } else {
+                    if loc != LOC_NONE {
+                        kills.push(loc);
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+}
+
 /// One parse thread's pipeline-B output. Valid copies wait in a small ring
 /// so that the link-table slot of their user is prefetched before lookup.
 struct BSink<'a> {
@@ -968,12 +1145,32 @@ struct BSink<'a> {
     lb: LocBits,
     /// benchmark only: skip the person lookup (person = user)
     nolookup: bool,
+    /// benchmark only: no ring and no lookup
+    direct: bool,
     cache: PCache,
+    /// queue + bulk lookups (default; SS_RING=1 selects the ring instead)
+    use_bulk: bool,
+    bulk: [Pending; BULK_CAP],
+    bn: usize,
+    /// batched output for batched parsing (SS_BATCHOUT=0 disables)
+    batch_out: bool,
+    /// global event_id table mode (no dedup records); kills to apply later
+    gt: Option<&'a EidTable>,
+    kills: Vec<u32>,
+    fresh: usize,
 }
 
 impl BSink<'_> {
     #[inline(always)]
     fn emit(&mut self, p: Pending) {
+        if p.user == 0 {
+            // an invalid copy (table mode): it still takes part in dedup
+            let gt = self.gt.unwrap();
+            if !gt.insert(p.eid, p.ingest, LOC_NONE, &mut self.kills, &mut self.fresh) {
+                self.overflow = true;
+            }
+            return;
+        }
         let person = if self.nolookup { p.h } else { person_hash(self.lt, p.user, p.h) };
         self.cache.put(p.user, p.h, person);
         self.emit_hp(p, person);
@@ -992,7 +1189,13 @@ impl BSink<'_> {
             self.overflow = true;
             LOC_NONE
         };
-        self.a.push((p.eid >> (64 - self.pe_bits)) as usize, ARec { eid: p.eid, ingest: p.ingest, loc });
+        if let Some(gt) = self.gt {
+            if !gt.insert(p.eid, p.ingest, loc, &mut self.kills, &mut self.fresh) {
+                self.overflow = true;
+            }
+        } else {
+            self.a.push((p.eid >> (64 - self.pe_bits)) as usize, ARec { eid: p.eid, ingest: p.ingest, loc });
+        }
     }
 
     fn flush(&mut self) {
@@ -1002,22 +1205,128 @@ impl BSink<'_> {
             self.rn -= 1;
             self.emit(p);
         }
+        let n = self.bn;
+        for k in 0..n {
+            let p = self.bulk[k];
+            self.emit(p);
+        }
+        self.bn = 0;
+    }
+
+    /// Bulk mode: resolves and emits the oldest BULK_RUN queued copies (their
+    /// link-table slots were prefetched at least BULK_CAP - BULK_RUN copies
+    /// ago) and moves the rest to the front.
+    #[inline(never)]
+    fn bulk_run(&mut self) {
+        for k in 0..BULK_RUN {
+            let p = self.bulk[k];
+            self.emit(p);
+        }
+        self.bulk.copy_within(BULK_RUN..BULK_CAP, 0);
+        self.bn = BULK_CAP - BULK_RUN;
     }
 }
 
+/// Bulk queue: resolve BULK_RUN copies whenever BULK_CAP are queued (build-
+/// time overrides SS_BULKCAP / SS_BULKRUN for experiments).
+const BULK_CAP: usize = const_usize(option_env!("SS_BULKCAP"), 48);
+const BULK_RUN: usize = const_usize(option_env!("SS_BULKRUN"), 32);
+
 impl EvSink for BSink<'_> {
+    /// Batched output: hash users and prefetch their link-table slots for the
+    /// whole batch, resolve persons, then write the session records, then the
+    /// dedup records (one write-combining stream at a time). Same records as
+    /// `copy` per line; only the order within the batch differs.
+    #[inline(always)]
+    fn copy_batch(&mut self, bt: &EvBatch, n: usize, ctx: &Ctx) {
+        if !self.batch_out || self.gt.is_some() || self.nolookup || self.direct || self.cache.on {
+            for i in 0..n {
+                let ing = bt.ing[i];
+                if ing == i64::MIN {
+                    continue;
+                }
+                let valid = if bt.ok[i] { Some((bt.user[i], (bt.ts[i] - ctx.ws) as u32, bt.pay[i])) } else { None };
+                self.copy(bt.eid[i], ingest_rel(ing, ctx.ws_s), valid);
+            }
+            return;
+        }
+        let mut h = [0u64; EB];
+        for i in 0..n {
+            if bt.ok[i] {
+                h[i] = keys::mix(bt.user[i]);
+                self.lt.prefetch_h(h[i]);
+            }
+        }
+        let mut hp = [0u64; EB];
+        for i in 0..n {
+            if bt.ok[i] {
+                hp[i] = person_hash(self.lt, bt.user[i], h[i]);
+            }
+        }
+        let mut loc = [LOC_NONE; EB];
+        for i in 0..n {
+            if bt.ok[i] {
+                let person = hp[i];
+                let q = (person >> (64 - self.ps_bits)) as usize;
+                let k = self.s.len(q);
+                self.s.push(q, SRec { person, ts: (bt.ts[i] - ctx.ws) as u32, pay: bt.pay[i] });
+                loc[i] = if k < self.lb.imax {
+                    self.tbase | ((q as u32) << self.lb.ibits) | k as u32
+                } else {
+                    self.overflow = true;
+                    LOC_NONE
+                };
+            }
+        }
+        for i in 0..n {
+            let ing = bt.ing[i];
+            if ing == i64::MIN {
+                continue;
+            }
+            let eid = bt.eid[i];
+            self.a.push((eid >> (64 - self.pe_bits)) as usize, ARec { eid, ingest: ingest_rel(ing, ctx.ws_s), loc: loc[i] });
+        }
+    }
+
     #[inline(always)]
     fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>) {
         match valid {
-            None => self.a.push((eid >> (64 - self.pe_bits)) as usize, ARec { eid, ingest, loc: LOC_NONE }),
+            None => {
+                if let Some(gt) = self.gt {
+                    gt.prefetch(eid);
+                    self.bulk[self.bn] = Pending { eid, user: 0, h: 0, ingest, ts: 0, pay: 0 };
+                    self.bn += 1;
+                    if self.bn == BULK_CAP {
+                        self.bulk_run();
+                    }
+                } else {
+                    self.a.push((eid >> (64 - self.pe_bits)) as usize, ARec { eid, ingest, loc: LOC_NONE })
+                }
+            }
             Some((user, ts, pay)) => {
                 let h = keys::mix(user);
                 let p = Pending { eid, user, h, ingest, ts, pay };
+                if let Some(gt) = self.gt {
+                    gt.prefetch(eid);
+                }
                 if let Some(hp) = self.cache.get(user, h) {
                     self.emit_hp(p, hp);
                     return;
                 }
+                if self.direct {
+                    // benchmark only: no ring, no lookup
+                    self.emit_hp(p, h);
+                    return;
+                }
                 self.lt.prefetch_h(h);
+                if self.use_bulk {
+                    self.bulk[self.bn] = p;
+                    self.bn += 1;
+                    if self.bn == BULK_CAP {
+                        self.bulk_run();
+                    }
+                    return;
+                }
                 if self.rn == BRING {
                     let old = self.ring[self.rh];
                     self.ring[self.rh] = p;
@@ -1037,10 +1346,12 @@ struct BOut {
     s: Parts<SRec>,
     c: Parts<CRec>,
     overflow: bool,
+    /// table mode: locations of losing copies' session records
+    kills: Vec<u32>,
 }
 
 /// Pipeline B parse: links on all threads first, then events and clicks.
-fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> (LinkTable, Vec<BOut>) {
+fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt: Option<&EidTable>) -> (LinkTable, Vec<BOut>) {
     let pe = 1usize << ctx.pe_bits;
     let ps = 1usize << ctx.ps_bits;
     // Capacities with modest slack: huge pages zero the slack too, and a
@@ -1061,6 +1372,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
     let cell: std::sync::OnceLock<LinkTable> = std::sync::OnceLock::new();
     let (f1, f2) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let t0 = Instant::now();
+    LINK_T0.store(sys::unix_ns(), Ordering::Relaxed);
     let outs = par(ctx.threads, |t| {
         link_worker(t, links_in, &lnext, &pairs, &bar, &cell, &f1, &f2);
         if t == 0 {
@@ -1073,6 +1385,9 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
             ring: [Pending::default(); BRING],
             rh: 0,
             rn: 0,
+            use_bulk: std::env::var("SS_RING").is_err(),
+            bulk: [Pending::default(); BULK_CAP],
+            bn: 0,
             tbase: ((t as u64) << (lb.qbits + lb.ibits)) as u32,
             overflow: false,
             lt,
@@ -1080,9 +1395,20 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
             ps_bits: ctx.ps_bits,
             lb,
             nolookup: false,
+            direct: false,
             cache: PCache::new(),
+            gt,
+            kills: Vec::new(),
+            fresh: 0,
+            batch_out: std::env::var("SS_BATCHOUT").map_or(true, |v| v != "0"),
         };
+        // table mode: the bulk queue also carries invalid copies
+        if gt.is_some() {
+            sink.use_bulk = true;
+        }
         let mut c: Parts<CRec> = Parts::with_wc(ps, cap_c, true);
+        let batched = std::env::var("SS_BATCH").is_ok();
+        let mut evb = EvBatch::new();
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= ntasks {
@@ -1092,7 +1418,16 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
                 let task = ev.tasks[i];
                 let b = ev.maps[task.file as usize].bytes();
                 let safe_end = b.as_ptr() as usize + b.len();
-                if avx2 {
+                if batched {
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            event_task_batched_avx2(b, task, ctx, &mut sink, safe_end, &mut evb)
+                        }
+                    } else {
+                        event_task_batched::<false, _>(b, task, ctx, &mut sink, safe_end, &mut evb, 7);
+                    }
+                } else if avx2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
                         event_task_avx2(b, task, ctx, &mut sink, safe_end)
@@ -1126,13 +1461,47 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
         sink.a.finish();
         sink.s.finish();
         c.finish();
-        BOut { a: sink.a, s: sink.s, c, overflow: sink.overflow }
+        if let Some(gt) = gt {
+            gt.count.fetch_add(sink.fresh, Ordering::Relaxed);
+        }
+        BOut { a: sink.a, s: sink.s, c, overflow: sink.overflow, kills: std::mem::take(&mut sink.kills) }
     });
     (cell.into_inner().unwrap(), outs)
 }
 
 /// Wall time of the links step of `parse_b` (verbose report).
 static LINKS_US: AtomicU64 = AtomicU64::new(0);
+/// Thread 0's clock after each links barrier (parse, alloc, union, roots, vals).
+static LINK_MARKS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static LINK_T0: AtomicU64 = AtomicU64::new(0);
+
+/// "links[parse=.. alloc=.. union=.. roots=.. vals=..]" in ms (verbose).
+fn link_report() -> String {
+    let mut prev = LINK_T0.load(Ordering::Relaxed);
+    let mut o = String::from("links[");
+    for (k, n) in ["parse", "alloc", "union", "roots", "vals"].iter().enumerate() {
+        let t = LINK_MARKS[k].load(Ordering::Relaxed);
+        if t >= prev && prev > 0 {
+            o.push_str(&format!("{}={:.1} ", n, (t - prev) as f64 / 1e6));
+        }
+        prev = t;
+    }
+    o.push(']');
+    o
+}
+
+/// Table mode: marks every losing copy's session record dead (each thread's
+/// kill list in parallel; each record is killed at most once).
+fn apply_kills(sb: &[BOut], ctx: &Ctx, lb: LocBits) {
+    let next = AtomicUsize::new(0);
+    par(ctx.threads.min(sb.len()).max(1), |_| loop {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        let Some(o) = sb.get(i) else { break };
+        for &loc in &o.kills {
+            kill(loc, sb, lb);
+        }
+    });
+}
 
 /// Records per sub-bucket targeted by the in-cache split in `dedup_b`.
 const SUB_B: usize = 8 * 1024;
@@ -1178,12 +1547,17 @@ fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocB
     }
 }
 
+/// Threads for a phase: SS_<NAME>_THREADS overrides (experiments), else all.
+fn phase_threads(name: &str, ctx: &Ctx) -> usize {
+    env_usize(&format!("SS_{}_THREADS", name)).filter(|&n| n > 0).unwrap_or(ctx.threads).min(ctx.threads.max(1))
+}
+
 fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) {
     let pe = 1usize << ctx.pe_bits;
     let mut order: Vec<(usize, usize)> = (0..pe).map(|p| (sb.iter().map(|t| t.a.len(p)).sum::<usize>(), p)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
-    par(ctx.threads, |_| {
+    par(phase_threads("DEDUP", ctx), |_| {
         let mut table: Vec<ARec> = Vec::new();
         let mut scratch: Vec<ARec> = Vec::new();
         let mut counts: Vec<usize> = Vec::new();
@@ -1936,7 +2310,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let clicks_in = load_input(&data_dir.join("clicks"), chunk);
     marks.mark("mmap");
     let est_lines = events_in.bytes / 75 + 1;
-    let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 10));
+    let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 12));
     let ps_bits = env_usize("SS_PS_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 16384).clamp(2, 10));
 
     let first_day = ws.div_euclid(DAY);
@@ -1976,6 +2350,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         floor_bench(&events_in, &ctx);
         std::process::exit(0);
     }
+    if std::env::var("SS_PAIR").is_ok() {
+        pair_bench(&events_in, &links_in, &ctx);
+        std::process::exit(0);
+    }
     if let Ok(stage) = std::env::var("SS_BENCH") {
         for st in stage.split(',') {
             bench_stages(st, &events_in, &links_in, &ctx);
@@ -1990,17 +2368,30 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let lb = if std::env::var("SS_LEGACY").is_ok() { None } else { LocBits::new(threads, ps_bits) };
     let mut b_result = None;
     if let Some(lb) = lb {
-        let (lt, bouts) = parse_b(&links_in, &events_in, &clicks_in, &ctx, lb);
+        // global event_id table instead of dedup records (SS_GTABLE=1)
+        let gt = if std::env::var("SS_GTABLE").map_or(false, |v| v == "1") {
+            // SS_GTEXP (testing only) overrides the expected copy count
+            Some(EidTable::new(env_usize("SS_GTEXP").unwrap_or(events_in.bytes / 72 + 1)))
+        } else {
+            None
+        };
+        let (lt, bouts) = parse_b(&links_in, &events_in, &clicks_in, &ctx, lb, gt.as_ref());
         marks.mark("parse");
         if bouts.iter().any(|o| o.overflow) {
             pipeline = "B-overflow->legacy";
             std::mem::forget(bouts);
             std::mem::forget(lt);
         } else {
-            dedup_b(&bouts, &ctx, lb);
+            if gt.is_some() {
+                pipeline = "B-table";
+                apply_kills(&bouts, &ctx, lb);
+            } else {
+                dedup_b(&bouts, &ctx, lb);
+            }
             marks.mark("dedup");
             b_result = Some((lt, bouts));
         }
+        std::mem::forget(gt);
     } else {
         pipeline = "legacy";
     }
@@ -2074,10 +2465,11 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
 
     if verbose {
         return format!(
-            "sessions: {} | pipeline={} links={:.1}ms threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB {} | sub:{}",
+            "sessions: {} | pipeline={} links={:.1}ms {} threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB {} | sub:{}",
             marks.report(),
             pipeline,
             LINKS_US.load(Ordering::Relaxed) as f64 / 1e3,
+            link_report(),
             threads,
             ctx.avx2,
             pe_bits,
@@ -2400,6 +2792,409 @@ fn floor_bench(ev: &Input, ctx: &Ctx) {
 }
 
 
+// ---------------------------------------------------------------- batched event parsing
+//
+// The scanner appends each well-formed line's field offsets/lengths to a
+// block of EB lines (structure of arrays); each column is then decoded in its
+// own loop over the block (independent iterations), and the copies are handed
+// to the sink in a last loop. The per-column functions are exactly those of
+// `event_line`, so each copy's (eid, ingest, valid) is the same; only the
+// order of copies differs (lines near a buffer end take the per-line path at
+// once), and copy order cannot change results (dedup ties are between
+// identical copies; session records are grouped and sorted downstream).
+
+const EB: usize = 64;
+
+struct EvBatch {
+    n: usize,
+    off: [[u32; EB]; 7],
+    len: [[u32; EB]; 7],
+    ing: [i64; EB],
+    ts: [i64; EB],
+    eid: [u64; EB],
+    pay: [u32; EB],
+    user: [u64; EB],
+    ok: [bool; EB],
+}
+
+impl EvBatch {
+    fn new() -> Box<EvBatch> {
+        Box::new(EvBatch {
+            n: 0,
+            off: [[0; EB]; 7],
+            len: [[0; EB]; 7],
+            ing: [0; EB],
+            ts: [0; EB],
+            eid: [0; EB],
+            pay: [0; EB],
+            user: [0; EB],
+            ok: [false; EB],
+        })
+    }
+}
+
+/// Field j of batched line i.
+#[inline(always)]
+fn bfield<'a>(bt: &EvBatch, base: *const u8, j: usize, i: usize) -> &'a [u8] {
+    unsafe { std::slice::from_raw_parts(base.add(bt.off[j][i] as usize), bt.len[j][i] as usize) }
+}
+
+/// Decodes and emits the batched lines, column by column. `upto` < 7 stops
+/// after a stage (benchmark); 7 = everything.
+#[inline(always)]
+fn ev_batch_flush<S: EvSink>(bt: &mut EvBatch, base: *const u8, ctx: &Ctx, sink: &mut S, upto: u32) -> u64 {
+    let n = bt.n;
+    bt.n = 0;
+    let mut acc = 0u64;
+    let (ws, we) = (ctx.ws, ctx.we);
+    if upto >= 1 {
+        for i in 0..n {
+            bt.ing[i] = ctx.tsp.parse(bfield(bt, base, 3, i)).unwrap_or(i64::MIN);
+        }
+    }
+    if upto >= 2 {
+        for i in 0..n {
+            bt.eid[i] = keys::mix(unsafe { keys::key_of_wide(bfield(bt, base, 0, i)) });
+        }
+    }
+    if upto >= 3 {
+        for i in 0..n {
+            bt.ts[i] = ctx.tsp.parse(bfield(bt, base, 2, i)).unwrap_or(i64::MIN);
+        }
+    }
+    if upto >= 4 {
+        for i in 0..n {
+            let t = bt.ts[i];
+            let mut ok = (bt.len[1][i] != 0) & (bt.len[5][i] != 0) & (t != i64::MIN) & (t >= ws) & (t < we);
+            let mut pay = 0u32;
+            if ok {
+                match event_pay(bfield(bt, base, 4, i), bfield(bt, base, 6, i), bfield(bt, base, 5, i), ctx, true) {
+                    Some(p) => pay = p,
+                    None => ok = false,
+                }
+            }
+            // the late check (only meaningful when the copy is kept at all)
+            ok &= bt.ing[i] != i64::MIN && bt.ing[i] - t <= LATE;
+            bt.ok[i] = ok;
+            bt.pay[i] = pay;
+        }
+    }
+    if upto >= 5 {
+        for i in 0..n {
+            if bt.ok[i] {
+                bt.user[i] = unsafe { keys::key_of_wide(bfield(bt, base, 1, i)) };
+            }
+        }
+    }
+    if upto >= 6 {
+        sink.copy_batch(bt, n, ctx);
+    } else {
+        for i in 0..n {
+            acc = acc
+                .wrapping_add(bt.off[3][i] as u64)
+                .wrapping_add(bt.ing[i] as u64)
+                .wrapping_add(bt.eid[i])
+                .wrapping_add(bt.ts[i] as u64)
+                .wrapping_add(bt.pay[i] as u64 ^ bt.ok[i] as u64)
+                .wrapping_add(bt.user[i]);
+        }
+    }
+    acc
+}
+
+/// `event_task`, batched (see above). `upto` as in `ev_batch_flush`.
+#[inline(always)]
+fn event_task_batched<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize, bt: &mut EvBatch, upto: u32) -> u64 {
+    let base = b.as_ptr();
+    let mut acc = 0u64;
+    scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, #[inline(always)] |f| {
+        if f[0].is_empty() {
+            return;
+        }
+        if f[6].as_ptr() as usize + 32 > safe_end {
+            if upto >= 6 {
+                event_line_slow(f, ctx, sink);
+            }
+            return;
+        }
+        let i = bt.n;
+        for j in 0..7 {
+            bt.off[j][i] = (f[j].as_ptr() as usize - base as usize) as u32;
+            bt.len[j][i] = f[j].len() as u32;
+        }
+        bt.n = i + 1;
+        if bt.n == EB {
+            acc = acc.wrapping_add(ev_batch_flush(bt, base, ctx, sink, upto));
+        }
+    });
+    acc.wrapping_add(ev_batch_flush(bt, base, ctx, sink, upto))
+}
+
+// ---------------------------------------------------------------- hyperthread pairing feasibility
+//
+// SS_PAIR=1: is a split pipeline worth building, with one hyperthread of each
+// core decoding lines (split + decode + validate) and its sibling doing the
+// output side (user hash, link lookup, both scatters)? Workers run pinned
+// for a fixed time (SS_PAIR_MS, default 2000) and count the items they
+// finish. Decoders loop over the event tasks and store each decoded copy in
+// a small private ring (the producer side of a handoff); sinks loop over
+// copies decoded beforehand, through the production BSink.
+
+#[derive(Clone, Copy, Default)]
+struct Dec {
+    eid: u64,
+    user: u64,
+    ingest: u32,
+    ts: u32,
+    pay: u32,
+    ok: u32,
+}
+
+struct DecVec(Vec<Dec>);
+impl EvSink for DecVec {
+    #[inline(always)]
+    fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>) {
+        let d = match valid {
+            Some((user, ts, pay)) => Dec { eid, user, ingest, ts, pay, ok: 1 },
+            None => Dec { eid, ingest, ..Dec::default() },
+        };
+        self.0.push(d);
+    }
+}
+
+const PRING: usize = 512;
+struct RingOnly<'a> {
+    r: Box<[Dec; PRING]>,
+    i: usize,
+    /// progress published to a paced sink (every 64 copies)
+    prog: Option<&'a AtomicU64>,
+}
+impl EvSink for RingOnly<'_> {
+    #[inline(always)]
+    fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>) {
+        let d = match valid {
+            Some((user, ts, pay)) => Dec { eid, user, ingest, ts, pay, ok: 1 },
+            None => Dec { eid, ingest, ..Dec::default() },
+        };
+        unsafe { *self.r.get_unchecked_mut(self.i & (PRING - 1)) = d };
+        self.i += 1;
+        if self.i % 64 == 0 {
+            if let Some(p) = self.prog {
+                p.store(self.i as u64, Ordering::Release);
+            }
+        }
+    }
+}
+
+fn ev_task_any<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S) {
+    let end = b.as_ptr() as usize + b.len();
+    if ctx.avx2 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            event_task_avx2(b, task, ctx, sink, end)
+        }
+    } else {
+        event_task::<false, _>(b, task, ctx, sink, end)
+    }
+}
+
+fn pair_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
+    let ncpu = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let Some(pairs) = sys::sibling_pairs(ncpu) else {
+        eprintln!("pair: topology is not hyperthread pairs over {} CPUs; nothing to measure", ncpu);
+        return;
+    };
+    let ms = env_usize("SS_PAIR_MS").unwrap_or(2000) as u64;
+    eprintln!("pair: sibling pairs {:?}, {} ms per configuration", pairs, ms);
+    let lb = LocBits::new(ctx.threads, ctx.ps_bits).unwrap();
+    let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
+    let (lt, _) = parse_b(links_in, &empty, &empty, ctx, lb, None);
+    let task_lines: Vec<usize> = ev
+        .tasks
+        .iter()
+        .map(|t| ev.maps[t.file as usize].bytes()[t.start..t.end].iter().filter(|&&c| c == b'\n').count())
+        .collect();
+    let lines: usize = task_lines.iter().sum();
+    // decode everything once (all threads), for the sinks
+    let next = AtomicUsize::new(0);
+    let decs: Vec<Vec<Dec>> = par(ctx.threads, |_| {
+        let mut d = DecVec(Vec::new());
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&task) = ev.tasks.get(i) else { break };
+            ev_task_any(ev.maps[task.file as usize].bytes(), task, ctx, &mut d);
+        }
+        d.0
+    });
+    let all: Vec<Dec> = decs.into_iter().flatten().collect();
+    let copies = all.len();
+    eprintln!("pair: {} lines, {} copies decoded ({:.3} copies/line)", lines, copies, copies as f64 / lines as f64);
+    let np = pairs.len();
+    let pe = 1usize << ctx.pe_bits;
+    let ps = 1usize << ctx.ps_bits;
+
+    #[repr(align(128))]
+    struct Prog(AtomicU64);
+    let progs: Vec<Prog> = (0..np).map(|_| Prog(AtomicU64::new(0))).collect();
+    // role per worker: 0 = decode, 1 = sink, 2 = full (decode + sink),
+    // 3 = sink paced by the decoder on its sibling (same pair index)
+    let run = |name: &str, workers: &[(usize, u8)]| {
+        for p in &progs {
+            p.0.store(0, Ordering::Relaxed);
+        }
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let barrier = std::sync::Barrier::new(workers.len() + 1);
+        let res: Vec<(u8, u64, u64)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = workers
+                .iter()
+                .enumerate()
+                .map(|(wi, &(cpu, role))| {
+                    let (stop, barrier, lt, all, task_lines) = (&stop, &barrier, &lt, &all, &task_lines);
+                    let pi = pairs.iter().position(|p| p.0 == cpu || p.1 == cpu).unwrap_or(0);
+                    let prog = &progs[pi].0;
+                    sc.spawn(move || {
+                        sys::pin_to(cpu);
+                        let slice = &all[(wi * copies / workers.len())..((wi + 1) * copies / workers.len())];
+                        let per = (if role == 1 || role == 3 { slice.len() } else { copies / workers.len() }).max(1);
+                        let mut sink = BSink {
+                            a: Parts::with_wc(pe, per / pe * 5 / 4 + 64, true),
+                            s: Parts::with_wc(ps, per / ps * 5 / 4 + 64, true),
+                            ring: [Pending::default(); BRING],
+                            rh: 0,
+                            rn: 0,
+                            use_bulk: std::env::var("SS_RING").is_err(),
+                            bulk: [Pending::default(); BULK_CAP],
+                            bn: 0,
+                            tbase: ((wi as u64) << (lb.qbits + lb.ibits)) as u32,
+                            overflow: false,
+                            lt,
+                            pe_bits: ctx.pe_bits,
+                            ps_bits: ctx.ps_bits,
+                            lb,
+                            nolookup: false,
+                            direct: false,
+                            cache: PCache::new(),
+                            gt: None,
+                            kills: Vec::new(),
+                            fresh: 0,
+                            batch_out: false,
+                        };
+                        let mut ring = RingOnly { r: Box::new([Dec::default(); PRING]), i: 0, prog: Some(prog) };
+                        // warm up: one pass of the sink side faults its arenas in
+                        if role != 0 {
+                            for d in slice.iter().take(per) {
+                                sink.copy(d.eid, d.ingest, if d.ok != 0 { Some((d.user, d.ts, d.pay)) } else { None });
+                            }
+                            sink.flush();
+                            sink.a.reset();
+                            sink.s.reset();
+                        }
+                        barrier.wait();
+                        let c0 = sys::thread_cpu_ns();
+                        let mut items = 0u64;
+                        let mut since_reset = 0usize;
+                        let mut ti = wi * ev.tasks.len() / workers.len();
+                        let mut di = 0usize;
+                        while !stop.load(Ordering::Relaxed) {
+                            if role == 3 {
+                                // wait until the sibling decoder is 512 copies ahead
+                                while items + 512 > prog.load(Ordering::Acquire) {
+                                    if stop.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    std::hint::spin_loop();
+                                }
+                                let n = 512.min(slice.len() - di);
+                                for d in &slice[di..di + n] {
+                                    sink.copy(d.eid, d.ingest, if d.ok != 0 { Some((d.user, d.ts, d.pay)) } else { None });
+                                }
+                                di += n;
+                                items += n as u64;
+                                since_reset += n;
+                                if di == slice.len() {
+                                    di = 0;
+                                }
+                            } else if role == 1 {
+                                let n = 4096.min(slice.len() - di);
+                                for d in &slice[di..di + n] {
+                                    sink.copy(d.eid, d.ingest, if d.ok != 0 { Some((d.user, d.ts, d.pay)) } else { None });
+                                }
+                                di += n;
+                                items += n as u64;
+                                since_reset += n;
+                                if di == slice.len() {
+                                    di = 0;
+                                }
+                            } else {
+                                let task = ev.tasks[ti % ev.tasks.len()];
+                                let b = ev.maps[task.file as usize].bytes();
+                                if role == 0 {
+                                    ev_task_any(b, task, ctx, &mut ring);
+                                } else {
+                                    ev_task_any(b, task, ctx, &mut sink);
+                                    since_reset += task_lines[ti % ev.tasks.len()];
+                                }
+                                items += task_lines[ti % ev.tasks.len()] as u64;
+                                ti += 1;
+                            }
+                            if since_reset + 2 * 4096 > per {
+                                sink.flush();
+                                sink.a.reset();
+                                sink.s.reset();
+                                since_reset = 0;
+                            }
+                        }
+                        let cpu_ns = sys::thread_cpu_ns() - c0;
+                        std::hint::black_box(ring.i);
+                        (role, items, cpu_ns)
+                    })
+                })
+                .collect();
+            barrier.wait();
+            let t0 = Instant::now();
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            stop.store(true, Ordering::Relaxed);
+            let r = hs.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>();
+            let wall = t0.elapsed().as_secs_f64() * 1e9;
+            for role in 0..4u8 {
+                let (n, items, cpu) = r.iter().filter(|x| x.0 == role).fold((0, 0u64, 0u64), |a, x| (a.0 + 1, a.1 + x.1, a.2 + x.2));
+                if n == 0 {
+                    continue;
+                }
+                let rname = ["decode", "sink", "full", "paced"][role as usize];
+                // per item: thread time, and wall time per core (np cores)
+                eprintln!(
+                    "pair {:34} {:6} x{}: {:6.1} thread-ns/item, {:6.1} wall-ns/item/core ({} items)",
+                    name,
+                    rname,
+                    n,
+                    cpu as f64 / items as f64,
+                    wall * np as f64 / items as f64,
+                    items
+                );
+            }
+            r
+        });
+        std::hint::black_box(res);
+    };
+    let a: Vec<usize> = pairs.iter().map(|p| p.0).collect();
+    let b: Vec<usize> = pairs.iter().map(|p| p.1).collect();
+    let one = |cpus: &[usize], role: u8| cpus.iter().map(|&c| (c, role)).collect::<Vec<_>>();
+    let both = |r0: u8, r1: u8| {
+        let mut v = one(&a, r0);
+        v.extend(one(&b, r1));
+        v
+    };
+    run("decode, one HT per core", &one(&a, 0));
+    run("sink, one HT per core", &one(&b, 1));
+    run("decode + sink on siblings", &both(0, 1));
+    run("decode + PACED sink on siblings", &both(0, 3));
+    run("decode on both HTs", &both(0, 0));
+    run("sink on both HTs", &both(1, 1));
+    run("full, one HT per core", &one(&a, 2));
+    run("full on both HTs (today)", &both(2, 2));
+}
+
 // ---------------------------------------------------------------- parse decomposition
 // SS_DECOMP=1: cumulative event-parse stages, single thread and NCPU threads,
 // thread-time per event line (each stage includes everything before it).
@@ -2409,8 +3204,10 @@ fn decomp_task<const AVX2: bool>(stage: u32, b: &[u8], task: Task, ctx: &Ctx, si
     let mut acc = 0u64;
     let end = b.as_ptr() as usize + b.len();
     match stage {
-        // split only
-        0 => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| acc += f[3].len() as u64),
+        // split only (all seven fields consumed)
+        0 => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
+            acc = acc.wrapping_add(f.iter().fold(0u64, |a, x| a.wrapping_mul(31).wrapping_add(x.len() as u64 ^ x.as_ptr() as u64)))
+        }),
         // + event id, + user id, + ts, + ingest
         1..=4 => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
             if f[6].as_ptr() as usize + 32 > end || f[0].is_empty() || f[1].is_empty() {
@@ -2434,12 +3231,31 @@ fn decomp_task<const AVX2: bool>(stage: u32, b: &[u8], task: Task, ctx: &Ctx, si
             acc = ns.0;
         }
         // + record scatter (dedup + session records, no person lookup), + lookup
-        _ => {
+        6..=8 => {
             event_task::<AVX2, _>(b, task, ctx, sink, end);
             sink.flush();
         }
+        // batched: 9 split, 10 +ingest, 11 +eid, 12 +ts, 13 +valid/pay, 14 +user,
+        // 15 +scatter (no lookup), 16 +lookup
+        _ => {
+            let bt = BT.with(|c| c.as_ptr());
+            let bt = unsafe { &mut **bt };
+            let upto = stage - 9;
+            if upto >= 6 {
+                acc = event_task_batched::<AVX2, _>(b, task, ctx, sink, end, bt, 7);
+                sink.flush();
+            } else {
+                let mut ns = NullSink(0);
+                acc = event_task_batched::<AVX2, _>(b, task, ctx, &mut ns, end, bt, upto);
+                acc = acc.wrapping_add(ns.0);
+            }
+        }
     }
     acc
+}
+
+thread_local! {
+    static BT: std::cell::RefCell<Box<EvBatch>> = std::cell::RefCell::new(EvBatch::new());
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2456,13 +3272,37 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
     }
     let lb = LocBits::new(ctx.threads, ctx.ps_bits).unwrap();
     let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
-    let (lt, _) = parse_b(links_in, &empty, &empty, ctx, lb);
+    let (lt, _) = parse_b(links_in, &empty, &empty, ctx, lb, None);
     let keep = sys::arenas().len();
     let pe = 1usize << ctx.pe_bits;
     let ps = 1usize << ctx.ps_bits;
     let est = ev.bytes / 72 + 1;
-    let names = ["split", "+event_id", "+user_id", "+ts", "+ingest", "+type/product/price/valid", "+scatter(no lookup)", "+person lookup"];
-    for stage in 0..8u32 {
+    let names = [
+        "split",
+        "+event_id",
+        "+user_id",
+        "+ts",
+        "+ingest",
+        "+type/product/price/valid",
+        "+scatter(no lookup)",
+        "+person lookup",
+        "(stage 5)+scatter direct, no ring",
+        "B: split into SoA",
+        "B: +ingest column",
+        "B: +event_id column",
+        "B: +ts column",
+        "B: +type/product/price/valid",
+        "B: +user_id column",
+        "B: +scatter(no lookup)",
+        "B: +person lookup",
+    ];
+    let stages: Vec<u32> = std::env::var("SS_DECOMP_STAGES")
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_else(|| (0..17).collect());
+    let prefault = std::env::var("SS_DECOMP_PREFAULT").is_ok();
+    static PREF_NS: AtomicU64 = AtomicU64::new(0);
+    for stage in stages {
         for &nt in &[1usize, ctx.threads] {
             let mut best = (f64::MAX, 0f64);
             for _ in 0..3 {
@@ -2476,15 +3316,29 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
                         ring: [Pending::default(); BRING],
                         rh: 0,
                         rn: 0,
+                        use_bulk: std::env::var("SS_BULK").is_ok(),
+                        bulk: [Pending::default(); BULK_CAP],
+                        bn: 0,
                         tbase: ((ti as u64) << (lb.qbits + lb.ibits)) as u32,
                         overflow: false,
                         lt: &lt,
                         pe_bits: ctx.pe_bits,
                         ps_bits: ctx.ps_bits,
                         lb,
-                        nolookup: stage == 6,
+                        nolookup: stage == 6 || stage == 15,
+                        direct: stage == 8,
                         cache: PCache::new(),
+                        gt: None,
+                        kills: Vec::new(),
+                        fresh: 0,
+                        batch_out: std::env::var("SS_BATCHOUT").map_or(true, |v| v != "0"),
                     };
+                    if prefault {
+                        let t0 = sys::thread_cpu_ns();
+                        sink.a.prefault();
+                        sink.s.prefault();
+                        PREF_NS.fetch_add(sys::thread_cpu_ns() - t0, Ordering::Relaxed);
+                    }
                     let mut a = 0u64;
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -2506,7 +3360,7 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
                     a ^ sink.a.total() as u64
                 });
                 let wall = t.elapsed().as_secs_f64() * 1e3;
-                let cpu = PHASE_CPU_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+                let cpu = (PHASE_CPU_NS.swap(0, Ordering::Relaxed) as f64 - PREF_NS.swap(0, Ordering::Relaxed) as f64) / 1e6;
                 std::hint::black_box(accs);
                 sys::release_from(keep);
                 if wall < best.0 {
@@ -2645,7 +3499,7 @@ fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
     let lb = LocBits::new(1, ctx.ps_bits).unwrap();
     let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
     let t0 = Instant::now();
-    let (lt, _) = parse_b(links_in, &empty, &empty, ctx, lb);
+    let (lt, _) = parse_b(links_in, &empty, &empty, ctx, lb, None);
     let link_ms = t0.elapsed().as_secs_f64() * 1e3;
     let pe = 1usize << ctx.pe_bits;
     let ps = 1usize << ctx.ps_bits;
@@ -2656,6 +3510,9 @@ fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
         ring: [Pending::default(); BRING],
         rh: 0,
         rn: 0,
+        use_bulk: std::env::var("SS_BULK").is_ok(),
+        bulk: [Pending::default(); BULK_CAP],
+        bn: 0,
         tbase: 0,
         overflow: false,
         lt,
@@ -2663,7 +3520,12 @@ fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
         ps_bits: ctx.ps_bits,
         lb,
         nolookup: std::env::var("SS_BENCH_NOLOOKUP").is_ok(),
+        direct: false,
         cache: PCache::new(),
+        gt: None,
+        kills: Vec::new(),
+        fresh: 0,
+        batch_out: false,
     };
     let mut reused = mk(&lt);
     let mut best = f64::MAX;

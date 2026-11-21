@@ -64,7 +64,7 @@ pub fn click_decomp(cl: &Input, links_in: &Input, ctx: &Ctx) {
     }
     let lb = LocBits::new(ctx.threads, ctx.ps_bits).unwrap();
     let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
-    let (lt, _) = crate::parse_b(links_in, &empty, &empty, ctx, lb);
+    let (lt, _) = crate::parse_b(links_in, &empty, &empty, ctx, lb, None);
     let keep = sys::arenas().len();
     let ps = 1usize << ctx.ps_bits;
     let est = cl.bytes / 44 + 1;

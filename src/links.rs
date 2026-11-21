@@ -26,8 +26,8 @@ pub struct LinkTable {
     parent: &'static [AtomicU32],
     /// dense index -> key
     dkey: &'static [AtomicU64],
-    /// dense index -> root dense index (finalize scratch)
-    droot: &'static [AtomicU32],
+    /// dense index -> person key (the root's key; finalize scratch)
+    dpkey: &'static [AtomicU64],
     /// next free block of dense indices
     next_block: AtomicU32,
 }
@@ -54,7 +54,7 @@ impl DenseAlloc {
 
 impl LinkTable {
     pub fn empty() -> Self {
-        LinkTable { slots: &[], mask: 0, amask: !0, parent: &[], dkey: &[], droot: &[], next_block: AtomicU32::new(0) }
+        LinkTable { slots: &[], mask: 0, amask: !0, parent: &[], dkey: &[], dpkey: &[], next_block: AtomicU32::new(0) }
     }
 
     /// A table for `total_pairs` links built by up to `threads` threads.
@@ -75,7 +75,7 @@ impl LinkTable {
             amask: if std::env::var("SS_LINKALIGN").map_or(false, |v| v == "0") { !0 } else { !3 },
             parent: arena(nd),
             dkey: arena(nd),
-            droot: arena(nd),
+            dpkey: arena(nd),
             next_block: AtomicU32::new(0),
         }
     }
@@ -177,12 +177,35 @@ impl LinkTable {
 
     /// Joins two IDs. Safe to call from many threads at once.
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn link(&self, a: u64, b: u64, alloc: &mut DenseAlloc) {
         let da = self.insert(a, alloc);
         let db = self.insert(b, alloc);
         if da != db {
             self.union(da, db);
         }
+    }
+
+    /// Dense indices of both IDs of a link, inserting them if absent.
+    #[inline(always)]
+    pub fn insert_pair(&self, a: u64, b: u64, alloc: &mut DenseAlloc) -> (u32, u32) {
+        (self.insert(a, alloc), self.insert(b, alloc))
+    }
+
+    /// Joins two inserted IDs by dense index. Safe to call from many threads
+    /// at once, also while other threads are still inserting.
+    #[inline(always)]
+    pub fn union_dense(&self, da: u32, db: u32) {
+        if da != db {
+            self.union(da, db);
+        }
+    }
+
+    /// Prefetches the union-find entries of a dense index.
+    #[inline(always)]
+    pub fn prefetch_dense(&self, d: u32) {
+        crate::prefetch(self.parent.as_ptr().wrapping_add(d as usize) as *const u8);
+        crate::prefetch(self.dkey.as_ptr().wrapping_add(d as usize) as *const u8);
     }
 
     /// Number of blocks for `finalize_roots` (dense indices).
@@ -195,12 +218,14 @@ impl LinkTable {
         self.slots.len().div_ceil(FINALIZE_BLOCK)
     }
 
-    /// Finalize, step 1 (after all links): root of every dense index in
-    /// block `b`. Blocks may run on any threads, concurrently.
+    /// Finalize, step 1 (after all links): person key (key of the root) of
+    /// every dense index in block `b`. Blocks may run on any threads,
+    /// concurrently.
     pub fn finalize_roots(&self, b: usize) {
         let n = (self.next_block.load(Ordering::Acquire) as usize).min(self.parent.len());
         for d in b * FINALIZE_BLOCK..((b + 1) * FINALIZE_BLOCK).min(n) {
-            self.droot[d].store(self.find(d as u32), Ordering::Relaxed);
+            let r = self.find(d as u32) as usize;
+            self.dpkey[d].store(self.dkey[r].load(Ordering::Relaxed), Ordering::Relaxed);
         }
     }
 
@@ -211,8 +236,7 @@ impl LinkTable {
         for i in b * FINALIZE_BLOCK..((b + 1) * FINALIZE_BLOCK).min(n) {
             if self.slots[i][0].load(Ordering::Relaxed) != 0 {
                 let d = (self.slots[i][1].load(Ordering::Relaxed) - 1) as usize;
-                let r = self.droot[d].load(Ordering::Relaxed) as usize;
-                let pk = self.dkey[r].load(Ordering::Relaxed);
+                let pk = self.dpkey[d].load(Ordering::Relaxed);
                 self.slots[i][1].store(pk, Ordering::Relaxed);
             }
         }

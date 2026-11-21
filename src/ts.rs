@@ -191,6 +191,30 @@ pub struct TsParser {
     pfx_row: [usize; 4],
     /// experiment switch (SS_NOPFX): don't use the prefix table
     use_pfx: bool,
+    /// Exact-date slots for the days around the window, indexed by the two
+    /// day-of-month digits (`dslot`): a slot matches only when all ten bytes
+    /// `YYYY-MM-DD` equal its (valid) date, so a match needs no date checks.
+    /// Unused slots repeat a real entry. Days that are not cached, or that
+    /// lose a slot collision, take the paths below.
+    dc: [DSlot; 64],
+    /// SS_NODC disables the slots (experiments)
+    use_dc: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DSlot {
+    /// bytes 0..8 (`YYYY-MM-`) as a little-endian word
+    pfx: u64,
+    /// bytes 8..10 (`DD`)
+    tag: u16,
+    /// epoch ms of the day's midnight (UTC)
+    ms: i64,
+}
+
+/// Slot of a date from its day-of-month digits: distinct for "01".."31".
+#[inline(always)]
+fn dslot(d0: u8, d1: u8) -> usize {
+    (((d0 & 3) << 4) | (d1 & 15)) as usize
 }
 
 const DIGIT_LANES_W0: u64 = 0x00FF_FF00_FFFF_FFFF; // YYYY-MM-  lanes 0-3, 5-6
@@ -236,7 +260,41 @@ impl TsParser {
             pfx_row[k] = (mi * 32) as usize;
         }
         let use_pfx = np > 0 && std::env::var("SS_NOPFX").is_err();
-        TsParser { base_month: lo, nmonths, days, pfx, pfx_row, use_pfx }
+        // exact-date slots: the window's days, 2 before and 6 after (late
+        // ingests), at most 64 days
+        let mut dc = [DSlot::default(); 64];
+        let mut used = [false; 64];
+        let mut first: Option<DSlot> = None;
+        let dlo = from_ms.div_euclid(86_400_000) - 2;
+        let dhi = to_ms.div_euclid(86_400_000) + 6;
+        let mut day = dlo;
+        while day <= dhi && day < dlo + 64 {
+            let (y, m) = civil_year_month(day);
+            if (0..=9999).contains(&y) {
+                let dom = day - days_from_civil(y, m, 1) + 1;
+                let txt = format!("{:04}-{:02}-{:02}", y, m, dom);
+                let t = txt.as_bytes();
+                let e = DSlot {
+                    pfx: u64::from_le_bytes(t[..8].try_into().unwrap()),
+                    tag: u16::from_le_bytes([t[8], t[9]]),
+                    ms: day * 86_400_000,
+                };
+                let k = dslot(t[8], t[9]);
+                dc[k] = e;
+                used[k] = true;
+                first.get_or_insert(e);
+            }
+            day += 1;
+        }
+        let use_dc = first.is_some() && std::env::var("SS_NODC").is_err();
+        if let Some(e) = first {
+            for k in 0..64 {
+                if !used[k] {
+                    dc[k] = e;
+                }
+            }
+        }
+        TsParser { base_month: lo, nmonths, days, pfx, pfx_row, use_pfx, dc, use_dc }
     }
 
     /// Fields 0..19 of an F1/F2 form, `n` = 20 or 25 (already checked).
@@ -245,6 +303,22 @@ impl TsParser {
     #[inline(always)]
     fn civil(&self, b: &[u8]) -> Option<i64> {
         let w0 = load8(b, 0);
+        if self.use_dc {
+            let e = &self.dc[dslot(b[8], b[9])];
+            if e.pfx == w0 && e.tag == u16::from_le_bytes([b[8], b[9]]) {
+                // the date is valid and known; check `T` and `HH:MM:SS`
+                let w = load8(b, 11);
+                let bad = digits_bad8(w, 0xFFFF_00FF_FF00_FFFF)
+                    | ((w & 0x0000_FF00_00FF_0000) ^ 0x0000_3A00_003A_0000)
+                    | (b[10] != b'T') as u64;
+                let p = pairs(w);
+                let (h, mi, s) = (lane(p, 0), lane(p, 3), lane(p, 6));
+                if bad != 0 || h > 23 || mi > 59 || s > 59 {
+                    return None;
+                }
+                return Some(e.ms + ((h * 60 + mi) * 60 + s) as i64 * 1000);
+            }
+        }
         if self.use_pfx {
             let mut row = usize::MAX;
             for k in 0..4 {
@@ -562,6 +636,31 @@ mod tests {
         assert_eq!(parse_ts(b"9223372036854775808"), None);
     }
 
+
+    #[test]
+    fn date_slots_exact() {
+        let ws = parse_ts(b"2027-12-10T00:00:00Z").unwrap();
+        let p = TsParser::new(ws, ws + 20 * 86_400_000);
+        for junk in [&[0u8; 20][..], &[0u8; 25][..], b"0000-00-00T00:00:00Z", b"2027-12-00T00:00:00Z", b"2027-12-32T00:00:00Z",
+                     b"2027-12-1\x00T00:00:00Z", b"2027-12-15T00:00:00Z", b"2027-12-15X00:00:00Z", b"2027-12-15T0:000:00Z",
+                     b"2027-12-15T23:59:59Z", b"2027-12-15T24:00:00Z", b"2027-12-15T12:60:00Z", b"2027-12-15T12:00:60Z",
+                     b"2027-11-15T12:00:00Z", b"2028-01-05T12:00:00Z", b"2027-12-15T12:00:00+01:30", b"2027-12-15T12:00:00-23:59",
+                     b"2027-12-15T12:00:00+24:00", b"2027-12-15T1/:00:00Z", b"2027-12-15T12:0::00Z"] {
+            assert_eq!(p.parse(junk), parse_ts(junk), "{:?}", String::from_utf8_lossy(junk));
+        }
+        // every byte value at every position of a cached date
+        let base = *b"2027-12-15T12:34:56Z";
+        for at in 0..20 {
+            for v in 0..=255u8 {
+                let mut s = base;
+                s[at] = v;
+                assert_eq!(p.parse(&s), parse_ts(&s), "{:?}", String::from_utf8_lossy(&s));
+            }
+        }
+        // a window with no representable days: slots unused
+        let q = TsParser::new(i64::MIN / 4, i64::MIN / 4 + 1);
+        assert_eq!(q.parse(b"2027-12-15T12:34:56Z"), parse_ts(b"2027-12-15T12:34:56Z"));
+    }
 
     #[test]
     fn fast_matches_general() {
