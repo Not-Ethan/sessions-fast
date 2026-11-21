@@ -1051,6 +1051,7 @@ fn add(a: &mut Stats, b: Stats) {
 /// the interned user IDs) must be identical. Exits nonzero on a difference.
 pub fn check(what: &str, ev: &Input, cl: &Input, ctx: &Ctx) {
     let d = dense_or_exit(ev, ctx);
+    eprintln!("k3check: keys {:x},{:x} bound {} pmax {} bshift {}", d.ke, d.ku, d.bound, d.pmax, d.bshift);
     if what.contains("ev") {
         check_ev(ev, ctx, &d);
     }
