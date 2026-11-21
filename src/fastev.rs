@@ -29,13 +29,11 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::{event_line, event_line_slow, Ctx, EvSink, Task};
+use super::{event_line, Ctx, EvSink, Task};
 use crate::scan;
 
 /// Use this path for event tasks (SS_FASTEV; see `main::run`).
 pub static ON: AtomicBool = AtomicBool::new(false);
-/// Interleaved cursors per task, 1 or 2 (SS_FASTK).
-pub static CURSORS: AtomicUsize = AtomicUsize::new(1);
 
 /// Lines handed to the general scanner by `slow_line` (statistics).
 pub static SLOW: AtomicUsize = AtomicUsize::new(0);
@@ -236,28 +234,46 @@ unsafe fn fields<'a>(p: *const u8, c: &Cut) -> [&'a [u8]; 7] {
     [f(0), f(1), f(2), f(3), f(4), f(5), f(6)]
 }
 
-/// The general scanner on the single line at `*off`; advances `*off` past it.
+/// End of the line at `off` (the position after its newline, or the end of
+/// `b`): a line the fast path did not cut.
 #[cold]
 #[inline(never)]
-fn slow_line<'a, const AVX2: bool, FS: FnMut(&[&'a [u8]; 7])>(b: &'a [u8], off: &mut usize, fs: &mut FS) {
+fn slow_end(b: &[u8], off: usize) -> usize {
     SLOW.fetch_add(1, Ordering::Relaxed);
-    let e = scan::next_line_start(b, *off);
-    scan::for_each_record_x::<7, _, AVX2>(b, *off, e, |x| fs(x));
-    *off = e;
+    scan::next_line_start(b, off)
 }
 
-/// Lines from `off` while `off < end` and `off <= lim` (fast path, `ff`),
-/// the rest of [off, end) with the general scanner (`fs`).
+/// Every line of `b[start..end)`: lines cut by the fast path go to `ff` as
+/// their unquoted fields (then 32 bytes from the start of every field are
+/// inside `b`); every other part of the range goes to `fr(from, to)` as a
+/// line-aligned byte range for the general scanner (a single line the fast
+/// path did not cut, the lines within MARGIN of the end of `b`, or all of it
+/// for a small buffer). In order, and together exactly the lines and fields
+/// of `scan::for_each_record_x::<7, _, AVX2>(b, start, end, ..)`. `start`
+/// must be a line start and `end` a line start or `b.len()`; `safe_end` is
+/// the end address of readable memory (>= the end of `b`); the fast path
+/// never reads beyond `b`.
 #[inline(always)]
-fn run1<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FS: FnMut(&[&'a [u8]; 7])>(
+pub fn for_each_line2<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FR: FnMut(usize, usize)>(
     b: &'a [u8],
-    mut off: usize,
+    start: usize,
     end: usize,
-    lim: usize,
-    ff: &mut FF,
-    fs: &mut FS,
+    safe_end: usize,
+    mut ff: FF,
+    mut fr: FR,
 ) {
+    assert!(start <= end && end <= b.len() && safe_end >= b.as_ptr() as usize + b.len());
+    if start >= end {
+        return;
+    }
+    if b.len() < MARGIN {
+        fr(start, end);
+        return;
+    }
+    // last line start for the fast path
+    let lim = b.len() - MARGIN;
     let base = b.as_ptr();
+    let mut off = start;
     while off < end && off <= lim {
         unsafe {
             let p = base.add(off);
@@ -266,108 +282,22 @@ fn run1<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FS: FnMut(&[&'a [u8]; 7
                 ff(&fields(p, &c));
                 off += c.len;
             } else {
-                slow_line::<AVX2, FS>(b, &mut off, fs);
+                let e = slow_end(b, off);
+                fr(off, e);
+                off = e;
             }
         }
     }
     if off < end {
-        scan::for_each_record_x::<7, _, AVX2>(b, off, end, |x| fs(x));
+        fr(off, end);
     }
 }
 
-/// Two cursors over two line-aligned halves of [start, end), one line of
-/// each per step.
-#[inline(always)]
-fn run2<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FS: FnMut(&[&'a [u8]; 7])>(
-    b: &'a [u8],
-    start: usize,
-    end: usize,
-    lim: usize,
-    ff: &mut FF,
-    fs: &mut FS,
-) {
-    let base = b.as_ptr();
-    // a line start in (start, end]
-    let mid = scan::next_line_start(b, start + (end - start) / 2 - 1).min(end);
-    let (mut a, mut c) = (start, mid);
-    // a < mid <= c, so c <= lim covers both
-    while a < mid && c < end && c <= lim {
-        unsafe {
-            let (pa, pc) = (base.add(a), base.add(c));
-            let ca = cut::<AVX2>(pa);
-            let cc = cut::<AVX2>(pc);
-            if ca.ok & cc.ok {
-                ff(&fields(pa, &ca));
-                ff(&fields(pc, &cc));
-                a += ca.len;
-                c += cc.len;
-            } else {
-                if ca.ok {
-                    ff(&fields(pa, &ca));
-                    a += ca.len;
-                } else {
-                    slow_line::<AVX2, FS>(b, &mut a, fs);
-                }
-                if cc.ok {
-                    ff(&fields(pc, &cc));
-                    c += cc.len;
-                } else {
-                    slow_line::<AVX2, FS>(b, &mut c, fs);
-                }
-            }
-        }
-    }
-    run1::<AVX2, FF, FS>(b, a, mid, lim, ff, fs);
-    run1::<AVX2, FF, FS>(b, c, end, lim, ff, fs);
-}
-
-/// Every well-formed line of exactly 7 fields in `b[start..end)`, as its
-/// unquoted fields: the same lines and fields as
-/// `scan::for_each_record_x::<7, _, AVX2>(b, start, end, ..)`, in the same
-/// order with one cursor; with two (k = 2), the lines of two halves
-/// interleave (each half in order). Lines cut by the fast path go to `ff`
-/// (then 32 bytes from the start of every field are inside `b`), the others
-/// to `fs`. `start` must be a line start and `end` a line start or
-/// `b.len()`; `safe_end` is the end address of readable memory (>= the end
-/// of `b`); the fast path never reads beyond `b`.
-#[inline(always)]
-pub fn for_each_line2<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FS: FnMut(&[&'a [u8]; 7])>(
-    b: &'a [u8],
-    start: usize,
-    end: usize,
-    safe_end: usize,
-    k: usize,
-    mut ff: FF,
-    mut fs: FS,
-) {
-    assert!(start <= end && end <= b.len() && safe_end >= b.as_ptr() as usize + b.len());
-    // last line start for the fast path
-    let lim = b.len().wrapping_sub(MARGIN);
-    if b.len() < MARGIN || start >= end {
-        scan::for_each_record_x::<7, _, AVX2>(b, start, end, fs);
-        return;
-    }
-    const MINSUB: usize = 16 << 10;
-    if k >= 2 && end - start >= 2 * MINSUB {
-        run2::<AVX2, FF, FS>(b, start, end, lim, &mut ff, &mut fs)
-    } else {
-        run1::<AVX2, FF, FS>(b, start, end, lim, &mut ff, &mut fs)
-    }
-}
-
-/// `for_each_line2` with one callback for all lines.
-#[inline(always)]
-pub fn for_each_line<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 7])>(b: &'a [u8], start: usize, end: usize, safe_end: usize, k: usize, mut f: F) {
-    // the two callbacks are never active at the same time
-    let fp: *mut F = &mut f;
-    for_each_line2::<AVX2, _, _>(b, start, end, safe_end, k, #[inline(always)] |x| unsafe { (*fp)(x) }, |x| unsafe { (*fp)(x) });
-}
-
-/// `main::event_task` on the fast splitter (same copies; with two cursors
-/// in a different order).
+/// `main::event_task` on the fast splitter: the same copies in the same
+/// order. Lines the fast path does not cut go through the general path
+/// (`main::event_task_scan_ni`, one out-of-line instance per sink type).
 #[inline(always)]
 pub fn event_task_fast<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
-    let k = CURSORS.load(Ordering::Relaxed);
     // The callbacks are never active at the same time; both reach the sink
     // through this pointer.
     let sp: *mut S = sink;
@@ -376,7 +306,6 @@ pub fn event_task_fast<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &
         task.start,
         task.end,
         safe_end,
-        k,
         #[inline(always)]
         |f| {
             // fast-path line: 32 bytes from every field start are readable
@@ -384,16 +313,7 @@ pub fn event_task_fast<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &
                 event_line::<true, S, _>(f, f[0], ctx, unsafe { &mut *sp });
             }
         },
-        |f| {
-            if f[0].is_empty() {
-                return;
-            }
-            if f[6].as_ptr() as usize + 32 <= safe_end {
-                event_line::<true, S, _>(f, f[0], ctx, unsafe { &mut *sp });
-            } else {
-                event_line_slow(f, ctx, unsafe { &mut *sp });
-            }
-        },
+        |from, to| super::event_task_scan_ni::<AVX2, S>(b, Task { file: task.file, start: from, end: to }, ctx, unsafe { &mut *sp }, safe_end),
     );
 }
 
@@ -411,11 +331,13 @@ impl EvSink for RecSink {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[inline(never)]
 unsafe fn task_fast_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
     event_task_fast::<true, S>(b, task, ctx, sink, safe_end)
 }
 
 /// `event_task_fast` with run-time dispatch (as `main::event_task_avx2`).
+#[inline(never)]
 pub fn task_fast_any<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
     if ctx.avx2 {
         #[cfg(target_arch = "x86_64")]
@@ -427,10 +349,9 @@ pub fn task_fast_any<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, s
 }
 
 /// SS_EVCHECK: every event task through the general path and through this
-/// path with 1 and 2 cursors; the copies must be identical (same order with
-/// one cursor, same multiset otherwise). Exits nonzero on a difference.
+/// path; the copies must be identical, in the same order. Exits nonzero on
+/// a difference.
 pub fn check(ev: &super::Input, ctx: &Ctx) {
-    let saved = CURSORS.load(Ordering::Relaxed);
     let mut lines = 0usize;
     let mut copies = 0usize;
     for task in &ev.tasks {
@@ -440,33 +361,20 @@ pub fn check(ev: &super::Input, ctx: &Ctx) {
         super::event_task_scan_any(b, *task, ctx, &mut want, safe_end);
         lines += b[task.start..task.end].iter().filter(|&&c| c == b'\n').count();
         copies += want.0.len();
-        for k in 1..=2 {
-            CURSORS.store(k, Ordering::Relaxed);
-            let mut got = RecSink::default();
-            task_fast_any(b, *task, ctx, &mut got, safe_end);
-            let same = if k == 1 {
-                got.0 == want.0
-            } else {
-                let mut a = got.0.clone();
-                let mut w = want.0.clone();
-                a.sort_unstable();
-                w.sort_unstable();
-                a == w
-            };
-            if !same {
-                eprintln!("evcheck: MISMATCH file {} [{}, {}) cursors {} ({} vs {} copies)", task.file, task.start, task.end, k, got.0.len(), want.0.len());
-                std::process::exit(1);
-            }
+        let mut got = RecSink::default();
+        task_fast_any(b, *task, ctx, &mut got, safe_end);
+        if got.0 != want.0 {
+            eprintln!("evcheck: MISMATCH file {} [{}, {}) ({} vs {} copies)", task.file, task.start, task.end, got.0.len(), want.0.len());
+            std::process::exit(1);
         }
     }
-    CURSORS.store(saved, Ordering::Relaxed);
     eprintln!(
-        "evcheck: OK {} tasks, {} lines, {} copies identical (cursors 1-2, avx2={}); {} lines took the general path",
+        "evcheck: OK {} tasks, {} lines, {} copies identical (avx2={}); {} lines took the general path",
         ev.tasks.len(),
         lines,
         copies,
         ctx.avx2,
-        SLOW.load(Ordering::Relaxed) / 2
+        SLOW.load(Ordering::Relaxed)
     );
 }
 
@@ -592,28 +500,34 @@ mod tests {
         t
     }
 
-    fn rows(b: &[u8], start: usize, end: usize, fast: Option<usize>) -> Vec<Vec<Vec<u8>>> {
-        let mut out = Vec::new();
-        let push = |f: &[&[u8]; 7]| out.push(f.iter().map(|s| s.to_vec()).collect());
+    /// The lines of b[start..end) through `for_each_line2` (fast lines and
+    /// general-path ranges, in order).
+    fn fast_rows<const AVX2: bool>(b: &[u8], start: usize, end: usize) -> Vec<Vec<Vec<u8>>> {
+        let out = std::cell::RefCell::new(Vec::new());
         let safe_end = b.as_ptr() as usize + b.len();
-        match fast {
-            Some(k) => for_each_line::<false, _>(b, start, end, safe_end, k, push),
-            None => scan::for_each_record_x::<7, _, false>(b, start, end, push),
+        let push = |f: &[&[u8]; 7]| out.borrow_mut().push(f.iter().map(|s| s.to_vec()).collect::<Vec<_>>());
+        for_each_line2::<AVX2, _, _>(b, start, end, safe_end, push, |from, to| scan::for_each_record_x::<7, _, AVX2>(b, from, to, push));
+        out.into_inner()
+    }
+
+    /// The general scanner's lines (`fast` false) or the fast path's.
+    fn rows(b: &[u8], start: usize, end: usize, fast: bool) -> Vec<Vec<Vec<u8>>> {
+        if fast {
+            return fast_rows::<false>(b, start, end);
         }
+        let mut out = Vec::new();
+        scan::for_each_record_x::<7, _, false>(b, start, end, |f: &[&[u8]; 7]| out.push(f.iter().map(|s| s.to_vec()).collect()));
         out
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-    unsafe fn rows_avx2(b: &[u8], start: usize, end: usize, k: usize) -> Vec<Vec<Vec<u8>>> {
-        let mut out = Vec::new();
-        let safe_end = b.as_ptr() as usize + b.len();
-        for_each_line::<true, _>(b, start, end, safe_end, k, |f: &[&[u8]; 7]| out.push(f.iter().map(|s| s.to_vec()).collect()));
-        out
+    unsafe fn rows_avx2(b: &[u8], start: usize, end: usize) -> Vec<Vec<Vec<u8>>> {
+        fast_rows::<true>(b, start, end)
     }
 
-    /// Same lines and fields as the general scanner, whole buffers and
-    /// line-aligned chunks, 1-2 cursors, both SIMD paths where available.
+    /// Same lines and fields as the general scanner, in the same order, whole
+    /// buffers and line-aligned chunks, both SIMD paths where available.
     #[test]
     fn splitter_matches_scanner() {
         let mut r = rng(0xFA57_E7E7_0000_0001);
@@ -627,27 +541,12 @@ mod tests {
                 _ => 300 + (r() % 3000) as usize,
             };
             let t = text(&mut r, n);
-            let want = rows(&t, 0, t.len(), None);
+            let want = rows(&t, 0, t.len(), false);
             total += want.len();
-            assert_eq!(rows(&t, 0, t.len(), Some(1)), want, "round {}", round);
-            for k in 2..=2 {
-                let mut a = rows(&t, 0, t.len(), Some(k));
-                let mut w = want.clone();
-                a.sort();
-                w.sort();
-                assert_eq!(a, w, "round {} k {}", round, k);
-            }
+            assert_eq!(rows(&t, 0, t.len(), true), want, "round {}", round);
             #[cfg(target_arch = "x86_64")]
             if avx2 {
-                for k in 1..=2 {
-                    let mut a = unsafe { rows_avx2(&t, 0, t.len(), k) };
-                    let mut w = want.clone();
-                    if k > 1 {
-                        a.sort();
-                        w.sort();
-                    }
-                    assert_eq!(a, w, "avx2 round {} k {}", round, k);
-                }
+                assert_eq!(unsafe { rows_avx2(&t, 0, t.len()) }, want, "avx2 round {}", round);
             }
             // line-aligned chunks
             let mut s0 = 0;
@@ -655,7 +554,7 @@ mod tests {
             while s0 < t.len() {
                 let nominal = s0 + 1 + (r() % 5000) as usize;
                 let e = if nominal >= t.len() { t.len() } else { scan::next_line_start(&t, nominal - 1) };
-                got.extend(rows(&t, s0, e, Some(1)));
+                got.extend(rows(&t, s0, e, true));
                 s0 = e;
             }
             assert_eq!(got, want, "chunked round {}", round);
@@ -687,7 +586,7 @@ mod tests {
                 }
                 t.extend_from_slice(&[b'z'; 300]);
                 t.push(b'\n');
-                assert_eq!(rows(&t, 0, t.len(), Some(1)), rows(&t, 0, t.len(), None), "pos {} byte {}", pos, v);
+                assert_eq!(rows(&t, 0, t.len(), true), rows(&t, 0, t.len(), false), "pos {} byte {}", pos, v);
             }
         }
     }
