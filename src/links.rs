@@ -18,6 +18,10 @@ pub struct LinkTable {
     /// val = the person key.
     slots: &'static [[AtomicU64; 2]],
     mask: usize,
+    /// probe start mask: !3 starts every probe at a 64-byte group of 4 slots,
+    /// so one prefetched cache line usually covers the whole probe (insert
+    /// and lookup use the same start, so this is exact either way)
+    amask: usize,
     /// dense index -> parent dense index + 1 (0 = root)
     parent: &'static [AtomicU32],
     /// dense index -> key
@@ -50,7 +54,7 @@ impl DenseAlloc {
 
 impl LinkTable {
     pub fn empty() -> Self {
-        LinkTable { slots: &[], mask: 0, parent: &[], dkey: &[], droot: &[], next_block: AtomicU32::new(0) }
+        LinkTable { slots: &[], mask: 0, amask: !0, parent: &[], dkey: &[], droot: &[], next_block: AtomicU32::new(0) }
     }
 
     /// A table for `total_pairs` links built by up to `threads` threads.
@@ -60,13 +64,15 @@ impl LinkTable {
         }
         // at most 2 distinct IDs per pair, so the load factor stays below 1
         // (typically ~0.55: ~1.3 IDs per pair)
-        let cap = (total_pairs * 2 + 16).next_power_of_two();
+        let f = std::env::var("SS_LINKCAP").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).max(2);
+        let cap = (total_pairs * f + 16).next_power_of_two();
         // at most 2 new IDs per pair, plus partly used blocks
         let nd = 2 * total_pairs + (threads + 1) * DENSE_BLOCK as usize + 64;
         assert!(nd < u32::MAX as usize - DENSE_BLOCK as usize * 2, "too many links");
         LinkTable {
             slots: arena(cap),
             mask: cap - 1,
+            amask: if std::env::var("SS_LINKALIGN").map_or(false, |v| v == "0") { !0 } else { !3 },
             parent: arena(nd),
             dkey: arena(nd),
             droot: arena(nd),
@@ -87,10 +93,16 @@ impl LinkTable {
         d
     }
 
+    /// First probe slot for hash h.
+    #[inline(always)]
+    fn start(&self, h: u64) -> usize {
+        h as usize & self.mask & self.amask
+    }
+
     /// Dense index of key k, inserting it if absent.
     #[inline(always)]
     fn insert(&self, k: u64, a: &mut DenseAlloc) -> u32 {
-        let mut i = keys::mix(k) as usize & self.mask;
+        let mut i = self.start(keys::mix(k));
         loop {
             let cur = self.slots[i][0].load(Ordering::Acquire);
             if cur == 0 {
@@ -212,7 +224,7 @@ impl LinkTable {
         if self.slots.is_empty() {
             return k;
         }
-        let mut i = keys::mix(k) as usize & self.mask;
+        let mut i = self.start(keys::mix(k));
         loop {
             let s = &self.slots[i];
             let kk = s[0].load(Ordering::Relaxed);
@@ -233,7 +245,7 @@ impl LinkTable {
         if self.slots.is_empty() {
             return None;
         }
-        let mut i = h as usize & self.mask;
+        let mut i = self.start(h);
         loop {
             let s = &self.slots[i];
             let kk = s[0].load(Ordering::Relaxed);
@@ -252,7 +264,7 @@ impl LinkTable {
         if self.slots.is_empty() {
             return;
         }
-        let i = h as usize & self.mask;
+        let i = self.start(h);
         crate::prefetch(self.slots.as_ptr().wrapping_add(i) as *const u8);
     }
 
@@ -261,7 +273,7 @@ impl LinkTable {
         if self.slots.is_empty() {
             return;
         }
-        let i = keys::mix(k) as usize & self.mask;
+        let i = self.start(keys::mix(k));
         crate::prefetch(self.slots.as_ptr().wrapping_add(i) as *const u8);
     }
 }

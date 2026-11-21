@@ -72,22 +72,34 @@ impl<T: Copy> Parts<T> {
             unsafe { self.arena.add(p * self.cap + l).write(v) };
             self.lens[p] = l as u32 + 1;
         } else {
-            self.over[p].get_mut().push(v);
+            self.push_over(p, v);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_over(&mut self, p: usize, v: T) {
+        self.over[p].get_mut().push(v);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn line_over(&mut self, p: usize) {
+        let recs = unsafe { std::slice::from_raw_parts(self.wc[p].0.as_ptr() as *const T, Self::WC_RECS) };
+        let recs: Vec<T> = recs.to_vec();
+        self.over[p].get_mut().extend_from_slice(&recs);
     }
 
     /// Writes the full staged line of partition p, whose first record has
     /// index `first` (a multiple of Self::WC_RECS).
     #[inline(always)]
     fn flush_line(&mut self, p: usize, first: usize) {
-        let src = &self.wc[p];
         if first < self.cap {
             // cap is a multiple of Self::WC_RECS, so the whole line fits
             let dst = unsafe { self.arena.add(p * self.cap + first) } as *mut u8;
-            stream_line(dst, src);
+            stream_line(dst, &self.wc[p]);
         } else {
-            let recs = unsafe { std::slice::from_raw_parts(src.0.as_ptr() as *const T, Self::WC_RECS) };
-            self.over[p].get_mut().extend_from_slice(recs);
+            self.line_over(p);
         }
     }
 

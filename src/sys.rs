@@ -176,9 +176,24 @@ pub fn arenas() -> Vec<(usize, usize)> {
     ARENAS.lock().unwrap().clone()
 }
 
-/// Releases the pages of [addr, addr + len) (MADV_DONTNEED).
+/// Drops the mappings of the whole pages inside [from, to) of a read-only
+/// private file mapping (MADV_DONTNEED; a later access would simply map the
+/// file pages again).
+pub fn release_inner(from: usize, to: usize) {
+    let a = (from + 4095) & !4095;
+    let b = to & !4095;
+    if b > a {
+        unsafe {
+            madvise(a as *mut c_void, b - a, 4);
+        }
+    }
+}
+
+/// Releases the pages of [addr, addr + len) (MADV_DONTNEED; the start is
+/// rounded down to a page boundary).
 pub fn release(addr: usize, len: usize) {
+    let a = addr & !4095;
     unsafe {
-        madvise(addr as *mut c_void, len, 4);
+        madvise(a as *mut c_void, len + (addr - a), 4);
     }
 }

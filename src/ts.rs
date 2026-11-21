@@ -50,6 +50,13 @@ fn parse_civil(b: &[u8]) -> Option<i64> {
     Some((((days * 24 + h as i64) * 60 + mi as i64) * 60 + s as i64) * 1000)
 }
 
+/// `parse_ts` out of line: the rare fallback of the fast parsers.
+#[cold]
+#[inline(never)]
+pub fn parse_ts_cold(b: &[u8]) -> Option<i64> {
+    parse_ts(b)
+}
+
 /// Parses F1 / F2 / F3 into epoch milliseconds. `None` is a bad timestamp
 /// (including an F3 value too large for a signed 64-bit integer, which is
 /// outside every window anyway).
@@ -131,6 +138,14 @@ fn load8(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
+/// Nonzero iff some byte lane selected by `lanes` is not an ASCII digit.
+#[inline(always)]
+fn digits_bad8(w: u64, lanes: u64) -> u64 {
+    let hi = (w & 0xF0F0_F0F0_F0F0_F0F0) ^ 0x3030_3030_3030_3030;
+    let lo = ((w & 0x0F0F_0F0F_0F0F_0F0F) + 0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0;
+    (hi | lo) & lanes
+}
+
 /// True iff every byte lane selected by `lanes` (0xFF per lane) is an ASCII digit.
 #[inline(always)]
 fn digits_ok(w: u64, lanes: u64) -> bool {
@@ -169,6 +184,13 @@ pub struct TsParser {
     nmonths: i64,
     /// [month * 32 + day] -> epoch day, or i32::MIN for an impossible date.
     days: Vec<i32>,
+    /// `YYYY-MM-` of the first (up to) 4 cached months as little-endian
+    /// words, and their row offset (month * 32) in `days`. Unused entries
+    /// repeat entry 0, so a match is always meaningful.
+    pfx: [u64; 4],
+    pfx_row: [usize; 4],
+    /// experiment switch (SS_NOPFX): don't use the prefix table
+    use_pfx: bool,
 }
 
 const DIGIT_LANES_W0: u64 = 0x00FF_FF00_FFFF_FFFF; // YYYY-MM-  lanes 0-3, 5-6
@@ -203,13 +225,56 @@ impl TsParser {
                 days[(mi * 32 + d) as usize] = days_from_civil(y, m, d) as i32;
             }
         }
-        TsParser { base_month: lo, nmonths, days }
+        let mut pfx = [0u64; 4];
+        let mut pfx_row = [0usize; 4];
+        let np = nmonths.clamp(0, 4) as usize;
+        for k in 0..4 {
+            let mi = if k < np { k as i64 } else { 0 };
+            let ym = lo + mi;
+            let txt = format!("{:04}-{:02}-", ym / 12, ym % 12 + 1);
+            pfx[k] = u64::from_le_bytes(txt.as_bytes()[..8].try_into().unwrap());
+            pfx_row[k] = (mi * 32) as usize;
+        }
+        let use_pfx = np > 0 && std::env::var("SS_NOPFX").is_err();
+        TsParser { base_month: lo, nmonths, days, pfx, pfx_row, use_pfx }
     }
 
     /// Fields 0..19 of an F1/F2 form, `n` = 20 or 25 (already checked).
+    /// When the first 8 bytes are `YYYY-MM-` of a cached month (a byte-exact
+    /// match, so year and month are valid), only day and time are decoded.
     #[inline(always)]
     fn civil(&self, b: &[u8]) -> Option<i64> {
         let w0 = load8(b, 0);
+        if self.use_pfx {
+            let mut row = usize::MAX;
+            for k in 0..4 {
+                if w0 == self.pfx[k] {
+                    row = self.pfx_row[k];
+                }
+            }
+            if row != usize::MAX {
+                let w1 = load8(b, 8);
+                let w2 = load8(b, 12);
+                let bad = ((w1 & SEP_MASK_W1) ^ SEP_W1)
+                    | ((w2 & SEP_MASK_W2) ^ SEP_W2)
+                    | digits_bad8(w1, DIGIT_LANES_W1)
+                    | digits_bad8(w2, DIGIT_LANES_W2);
+                let p1 = pairs(w1);
+                let p2 = pairs(w2);
+                let d = lane(p1, 0);
+                let h = lane(p1, 3);
+                let mi = lane(p1, 6);
+                let s = lane(p2, 5);
+                if bad != 0 || d.wrapping_sub(1) >= 31 || h > 23 || mi > 59 || s > 59 {
+                    return None;
+                }
+                let v = self.days[row + d as usize];
+                if v == i32::MIN {
+                    return None;
+                }
+                return Some(((v as i64 * 24 + h as i64) * 60 + mi as i64) * 60_000 + s as i64 * 1000);
+            }
+        }
         let w1 = load8(b, 8);
         let w2 = load8(b, 12);
         if (w0 & SEP_MASK_W0) != SEP_W0 || (w1 & SEP_MASK_W1) != SEP_W1 || (w2 & SEP_MASK_W2) != SEP_W2 {
@@ -279,7 +344,7 @@ impl TsParser {
                 return Some(if sign == b'+' { base - off } else { base + off });
             }
         }
-        parse_ts(b)
+        parse_ts_cold(b)
     }
 }
 
@@ -372,6 +437,68 @@ impl TsParser {
         } else {
             f2
         };
+        if ok {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    /// `YYYY-MM-DDTHH:MM:SS` at p via the month-prefix table, without
+    /// branching on the outcome: (epoch ms, valid, prefix matched). When the
+    /// prefix did not match, the caller must use the general path.
+    #[inline(always)]
+    unsafe fn civil_pfx(&self, p: *const u8) -> (i64, bool, bool) {
+        let w0 = rd(p, 0);
+        let mut row = usize::MAX;
+        for k in 0..4 {
+            if w0 == self.pfx[k] {
+                row = self.pfx_row[k];
+            }
+        }
+        let w1 = rd(p, 8);
+        let w2 = rd(p, 12);
+        let bad = ((w1 & SEP_MASK_W1) ^ SEP_W1)
+            | ((w2 & SEP_MASK_W2) ^ SEP_W2)
+            | digits_bad(w1, DIGIT_LANES_W1)
+            | digits_bad(w2, DIGIT_LANES_W2);
+        let p1 = pairs(w1);
+        let p2 = pairs(w2);
+        let d = lane(p1, 0);
+        let h = lane(p1, 3);
+        let mi = lane(p1, 6);
+        let s = lane(p2, 5);
+        let matched = row != usize::MAX;
+        let shape = (bad == 0) & (d.wrapping_sub(1) < 31) & (h <= 23) & (mi <= 59) & (s <= 59);
+        let idx = if matched & shape { row + d as usize } else { 0 };
+        let v = *self.days.get_unchecked(idx);
+        let ok = matched & shape & (v != i32::MIN);
+        let ms = ((v as i64 * 24 + h as i64) * 60 + mi as i64) * 60_000 + s as i64 * 1000;
+        (ms, ok, matched)
+    }
+
+    /// Same result as `parse_ts(b)`. F1 and 13-digit F3 are decoded together
+    /// and selected by length (no branch between them); F2 and anything else
+    /// take the branchy path. 32 bytes from the start of `b` must be readable.
+    #[inline(always)]
+    pub unsafe fn parse_hyb(&self, b: &[u8]) -> Option<i64> {
+        let p = b.as_ptr();
+        let n = b.len();
+        let is_f1 = (n == 20) & (*p.add(19) == b'Z');
+        let is_f3 = n == 13;
+        if !(is_f1 | is_f3) || !self.use_pfx {
+            return self.parse(b);
+        }
+        let (civil, civil_ok, matched) = self.civil_pfx(p);
+        let wa = rd(p, 0);
+        let wb = rd(p, 5);
+        let f3_ok = (digits_bad(wa, !0) | digits_bad(wb, !0)) == 0;
+        let f3 = (parse8(wa) * 100_000 + parse8((wb & !0xFF_FFFF) | 0x30_3030)) as i64;
+        if is_f1 & !matched {
+            return self.parse(b); // F1 outside the prefix table: rare
+        }
+        let ok = if is_f3 { f3_ok } else { civil_ok };
+        let v = if is_f3 { f3 } else { civil };
         if ok {
             Some(v)
         } else {
@@ -550,6 +677,8 @@ mod tests {
             let field = &buf[..s.len()];
             let want = parse_ts(&s);
             assert_eq!(unsafe { p.parse_wide(field) }, want, "{:?}", String::from_utf8_lossy(&s));
+            assert_eq!(unsafe { p.parse_hyb(field) }, want, "{:?}", String::from_utf8_lossy(&s));
+            assert_eq!(p.parse(field), want, "{:?}", String::from_utf8_lossy(&s));
             assert_eq!(unsafe { p.parse_wide_f1(field) }, want, "{:?}", String::from_utf8_lossy(&s));
             count += want.is_some() as u64;
         }

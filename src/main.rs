@@ -99,6 +99,42 @@ struct URow {
     revenue: u64,
 }
 
+/// Per-thread direct-mapped cache user key -> keys::mix(person key) in front
+/// of the link table (activity is Zipf-like, so hot users hit). Entries hold
+/// the full user key, so a hit is exact; key 0 (never a user) marks empty.
+struct PCache {
+    slots: Vec<(u64, u64)>,
+    shift: u32,
+    on: bool,
+}
+
+impl PCache {
+    fn new() -> PCache {
+        let bits = env_usize("SS_PCACHE").unwrap_or(0).min(20) as u32;
+        PCache { slots: vec![(0, 0); 1 << bits.max(1)], shift: 64 - bits.max(1), on: bits > 0 }
+    }
+    /// The cached person hash of `user` (hash `h`), if present.
+    #[inline(always)]
+    fn get(&self, user: u64, h: u64) -> Option<u64> {
+        if !self.on {
+            return None;
+        }
+        let e = unsafe { self.slots.get_unchecked(((h << 20) >> self.shift) as usize) };
+        if e.0 == user {
+            Some(e.1)
+        } else {
+            None
+        }
+    }
+    #[inline(always)]
+    fn put(&mut self, user: u64, h: u64, hp: u64) {
+        if self.on {
+            let i = ((h << 20) >> self.shift) as usize;
+            unsafe { *self.slots.get_unchecked_mut(i) = (user, hp) };
+        }
+    }
+}
+
 /// keys::mix of the person key of user key `user`, whose hash is
 /// `h` = keys::mix(user) (one table probe; no second hash when the user is
 /// its own person).
@@ -116,6 +152,8 @@ struct Ctx {
     tsp: ts::TsParser,
     /// experiment (SS_TSW): branch-free timestamp parser on the hot path
     tsw: bool,
+    /// experiment (SS_TSH): F1/F3 decoded together, selected by length
+    tsh: bool,
     avx2: bool,
     ws: i64,
     we: i64,
@@ -454,7 +492,13 @@ fn event_line<const WIDE: bool, S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut
         if f[1].is_empty() || f[5].is_empty() {
             break 'v None;
         }
-        let t = if WIDE && ctx.tsw { unsafe { ctx.tsp.parse_wide(f[2]) } } else { ctx.tsp.parse(f[2]) };
+        let t = if WIDE && ctx.tsh {
+            unsafe { ctx.tsp.parse_hyb(f[2]) }
+        } else if WIDE && ctx.tsw {
+            unsafe { ctx.tsp.parse_wide(f[2]) }
+        } else {
+            ctx.tsp.parse(f[2])
+        };
         let Some(t) = t else { break 'v None };
         if t < ws || t >= we {
             break 'v None;
@@ -493,7 +537,7 @@ fn event_task<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink
 
 /// One chunk of clicks/: parse, validate, resolve the person, route by person.
 #[inline(always)]
-fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>, safe_end: usize) {
+fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>, safe_end: usize, cache: &mut PCache) {
     let we = ctx.we;
     let cws = ctx.ws - WEEK;
     // Person lookups go through a small ring so the link-table slot can be
@@ -502,8 +546,10 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
     let mut ring = [(CRec { person: 0, ck: 0, ts: 0, camp: 0, _pad: 0 }, 0u64); RING];
     let mut rh = 0usize;
     let mut rn = 0usize;
-    let emit = |c: &mut Parts<CRec>, (mut r, h): (CRec, u64)| {
-        r.person = person_hash(lt, r.person, h);
+    let emit = |c: &mut Parts<CRec>, cache: &mut PCache, (mut r, h): (CRec, u64)| {
+        let user = r.person;
+        r.person = person_hash(lt, user, h);
+        cache.put(user, h, r.person);
         c.push((r.person >> (64 - ctx.ps_bits)) as usize, r);
     };
     scan::for_each_record_x::<4, _, AVX2>(b, task.start, task.end, #[inline(always)] |f| {
@@ -511,7 +557,13 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
             return;
         }
         let wide = f[3].as_ptr() as usize + 32 <= safe_end;
-        let t = if wide && ctx.tsw { unsafe { ctx.tsp.parse_wide(f[3]) } } else { ctx.tsp.parse(f[3]) };
+        let t = if wide && ctx.tsh {
+            unsafe { ctx.tsp.parse_hyb(f[3]) }
+        } else if wide && ctx.tsw {
+            unsafe { ctx.tsp.parse_wide(f[3]) }
+        } else {
+            ctx.tsp.parse(f[3])
+        };
         let Some(t) = t else { return };
         if t < cws || t >= we {
             return;
@@ -522,12 +574,16 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
         }
         let user = if wide { unsafe { keys::key_of_wide(f[1]) } } else { keys::key_of(f[1]) };
         let h = keys::mix(user);
-        lt.prefetch_h(h);
         let ck = if wide { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) };
+        if let Some(hp) = cache.get(user, h) {
+            c.push((hp >> (64 - ctx.ps_bits)) as usize, CRec { person: hp, ck, ts: (t - cws) as u32, camp: camp as u32, _pad: 0 });
+            return;
+        }
+        lt.prefetch_h(h);
         // `person` holds the user key until the lookup in `emit`
         let r = (CRec { person: user, ck, ts: (t - cws) as u32, camp: camp as u32, _pad: 0 }, h);
         if rn == RING {
-            emit(c, ring[rh]);
+            emit(c, cache, ring[rh]);
             ring[rh] = r;
             rh = (rh + 1) % RING;
         } else {
@@ -536,7 +592,7 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
         }
     });
     for k in 0..rn {
-        emit(c, ring[(rh + k) % RING]);
+        emit(c, cache, ring[(rh + k) % RING]);
     }
 }
 
@@ -548,8 +604,8 @@ unsafe fn event_task_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, e: &mut S,
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn click_task_avx2(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>, safe_end: usize) {
-    click_task::<true>(b, task, ctx, lt, c, safe_end)
+unsafe fn click_task_avx2(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>, safe_end: usize, cache: &mut PCache) {
+    click_task::<true>(b, task, ctx, lt, c, safe_end, cache)
 }
 
 /// AVX2 + BMI1/2 available and not disabled with SS_NOAVX2.
@@ -595,6 +651,7 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
     let max_task = ev.tasks.iter().chain(cl.tasks.iter()).map(|t| t.end - t.start).max().unwrap_or(0);
     let outs = par(ctx.threads, |t| {
         let mut out = ParseOut { e: (Parts::new(pe, cap_e), ctx.pe_bits), c: Parts::new(ps, cap_c) };
+        let mut pcache = PCache::new();
         let mut rbuf: Vec<u8> = if use_read { vec![0u8; max_task + 64] } else { Vec::new() };
         if t < nl {
             link_worker(t, links_in, &lnext, &pairs, &bar, &cell, &f1, &f2);
@@ -644,10 +701,10 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
                 if avx2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        click_task_avx2(b, task, ctx, lt, &mut out.c, safe_end)
+                        click_task_avx2(b, task, ctx, lt, &mut out.c, safe_end, &mut pcache)
                     }
                 } else {
-                    click_task::<false>(b, task, ctx, lt, &mut out.c, safe_end)
+                    click_task::<false>(b, task, ctx, lt, &mut out.c, safe_end, &mut pcache)
                 }
             }
         }
@@ -848,7 +905,25 @@ struct Pending {
     pay: u32,
 }
 
-const BRING: usize = 16;
+/// Valid copies queued between the link-table prefetch and the lookup
+/// (build-time override SS_BRING, power of two).
+const BRING: usize = const_usize(option_env!("SS_BRING"), 16);
+
+const fn const_usize(s: Option<&str>, default: usize) -> usize {
+    match s {
+        None => default,
+        Some(s) => {
+            let b = s.as_bytes();
+            let mut v = 0usize;
+            let mut i = 0;
+            while i < b.len() {
+                v = v * 10 + (b[i] - b'0') as usize;
+                i += 1;
+            }
+            v
+        }
+    }
+}
 
 /// One parse thread's pipeline-B output. Valid copies wait in a small ring
 /// so that the link-table slot of their user is prefetched before lookup.
@@ -866,12 +941,21 @@ struct BSink<'a> {
     lb: LocBits,
     /// benchmark only: skip the person lookup (person = user)
     nolookup: bool,
+    cache: PCache,
 }
 
 impl BSink<'_> {
     #[inline(always)]
     fn emit(&mut self, p: Pending) {
         let person = if self.nolookup { p.h } else { person_hash(self.lt, p.user, p.h) };
+        self.cache.put(p.user, p.h, person);
+        self.emit_hp(p, person);
+    }
+
+    /// Writes the session record and the dedup record of a valid copy whose
+    /// person hash is known.
+    #[inline(always)]
+    fn emit_hp(&mut self, p: Pending, person: u64) {
         let q = (person >> (64 - self.ps_bits)) as usize;
         let i = self.s.len(q);
         self.s.push(q, SRec { person, ts: p.ts, pay: p.pay });
@@ -901,8 +985,12 @@ impl EvSink for BSink<'_> {
             None => self.a.push((eid >> (64 - self.pe_bits)) as usize, ARec { eid, ingest, loc: LOC_NONE }),
             Some((user, ts, pay)) => {
                 let h = keys::mix(user);
-                self.lt.prefetch_h(h);
                 let p = Pending { eid, user, h, ingest, ts, pay };
+                if let Some(hp) = self.cache.get(user, h) {
+                    self.emit_hp(p, hp);
+                    return;
+                }
+                self.lt.prefetch_h(h);
                 if self.rn == BRING {
                     let old = self.ring[self.rh];
                     self.ring[self.rh] = p;
@@ -928,11 +1016,14 @@ struct BOut {
 fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> (LinkTable, Vec<BOut>) {
     let pe = 1usize << ctx.pe_bits;
     let ps = 1usize << ctx.ps_bits;
-    let est_lines = ev.bytes / 70 + 1;
-    let cap_a = est_lines / (ctx.threads * pe) * 3 / 2 + 64;
-    let cap_s = est_lines / (ctx.threads * ps) * 3 / 2 + 64;
-    let est_clicks = cl.bytes / 45 + 1;
-    let cap_c = est_clicks / (ctx.threads * ps) * 3 / 2 + 64;
+    // Capacities with modest slack: huge pages zero the slack too, and a
+    // partition that fills up continues in its (exact) overflow vector.
+    let est_lines = ev.bytes / 72 + 1;
+    let cap_a = est_lines / (ctx.threads * pe) * 5 / 4 + 32;
+    let cap_s = est_lines / (ctx.threads * ps) * 5 / 4 + 32;
+    let est_clicks = cl.bytes / 44 + 1;
+    let cap_c = est_clicks / (ctx.threads * ps) * 5 / 4 + 32;
+    let release = std::env::var("SS_NORELEASE").is_err();
     let ntasks = ev.tasks.len() + cl.tasks.len();
     let next = AtomicUsize::new(0);
     let avx2 = ctx.avx2;
@@ -962,6 +1053,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
             ps_bits: ctx.ps_bits,
             lb,
             nolookup: false,
+            cache: PCache::new(),
         };
         let mut c: Parts<CRec> = Parts::with_wc(ps, cap_c, true);
         loop {
@@ -982,6 +1074,11 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
                     event_task::<false, _>(b, task, ctx, &mut sink, safe_end)
                 }
                 sink.flush();
+                if release {
+                    // the chunk is parsed: drop its page mappings now, in
+                    // parallel, instead of in the single-threaded exit
+                    sys::release_inner(b.as_ptr() as usize + task.start, b.as_ptr() as usize + task.end);
+                }
             } else {
                 let task = cl.tasks[i - ev.tasks.len()];
                 let b = cl.maps[task.file as usize].bytes();
@@ -989,10 +1086,13 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
                 if avx2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        click_task_avx2(b, task, ctx, lt, &mut c, safe_end)
+                        click_task_avx2(b, task, ctx, lt, &mut c, safe_end, &mut sink.cache)
                     }
                 } else {
-                    click_task::<false>(b, task, ctx, lt, &mut c, safe_end)
+                    click_task::<false>(b, task, ctx, lt, &mut c, safe_end, &mut sink.cache)
+                }
+                if release {
+                    sys::release_inner(b.as_ptr() as usize + task.start, b.as_ptr() as usize + task.end);
                 }
             }
         }
@@ -1734,7 +1834,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let clicks_in = load_input(&data_dir.join("clicks"), chunk);
     marks.mark("mmap");
     let est_lines = events_in.bytes / 75 + 1;
-    let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 8));
+    let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 10));
     let ps_bits = env_usize("SS_PS_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 16384).clamp(2, 10));
 
     let first_day = ws.div_euclid(DAY);
@@ -1742,6 +1842,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let ctx = Ctx {
         tsp: ts::TsParser::new(ws - 10 * DAY, we + 10 * DAY),
         tsw: std::env::var("SS_TSW").is_ok(),
+        tsh: std::env::var("SS_TSH").is_ok(),
         avx2: use_avx2(),
         ws,
         we,
@@ -1761,6 +1862,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         threads,
     };
     marks.mark("setup");
+    if std::env::var("SS_FLOOR").is_ok() {
+        floor_bench(&events_in, &ctx);
+        std::process::exit(0);
+    }
     if let Ok(stage) = std::env::var("SS_BENCH") {
         for st in stage.split(',') {
             bench_stages(st, &events_in, &links_in, &ctx);
@@ -1819,7 +1924,18 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         // the mmap lock shared) so that the kernel's single-threaded exit
         // teardown has less to free.
         let mut pieces = Vec::new();
-        for (a, l) in sys::arenas() {
+        let mut regions = sys::arenas();
+        if std::env::var("SS_FREE").map_or(false, |v| v != "arenas") {
+            for inp in [&links_in, &events_in, &clicks_in] {
+                for m in &inp.maps {
+                    let b = m.bytes();
+                    if !b.is_empty() {
+                        regions.push((b.as_ptr() as usize, b.len()));
+                    }
+                }
+            }
+        }
+        for (a, l) in regions {
             let mut o = 0;
             while o < l {
                 let n = (l - o).min(64 << 20);
@@ -1983,6 +2099,185 @@ fn diag(data_dir: &Path) -> ! {
     std::process::exit(3)
 }
 
+
+// ---------------------------------------------------------------- floor benchmarks
+// SS_FLOOR=1: lower bounds for field splitting over events/, single thread
+// and on NCPU threads (thread-time per line): stream (64-byte loads),
+// masks (comma/newline/quote masks + popcounts; AVX2 and AVX-512BW), and the
+// full split step (scan).
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn floor_stream(b: &[u8]) -> u64 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_si256();
+    let n = b.len() / 64 * 64;
+    let mut i = 0;
+    while i < n {
+        let x = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+        let y = _mm256_loadu_si256(b.as_ptr().add(i + 32) as *const __m256i);
+        acc = _mm256_add_epi64(acc, _mm256_add_epi64(x, y));
+        i += 64;
+    }
+    let mut o = [0u64; 4];
+    _mm256_storeu_si256(o.as_mut_ptr() as *mut __m256i, acc);
+    o[0] ^ o[1] ^ o[2] ^ o[3]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn floor_masks_avx2(b: &[u8]) -> u64 {
+    use std::arch::x86_64::*;
+    let vc = _mm256_set1_epi8(b',' as i8);
+    let vn = _mm256_set1_epi8(b'\n' as i8);
+    let vq = _mm256_set1_epi8(b'"' as i8);
+    let n = b.len() / 64 * 64;
+    let mut acc = 0u64;
+    let mut i = 0;
+    while i < n {
+        let x = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+        let y = _mm256_loadu_si256(b.as_ptr().add(i + 32) as *const __m256i);
+        let c = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, vc)) as u32 as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(y, vc)) as u32 as u64) << 32);
+        let l = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, vn)) as u32 as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(y, vn)) as u32 as u64) << 32);
+        let q = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, vq)) as u32 as u64) | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(y, vq)) as u32 as u64) << 32);
+        acc += (c.count_ones() + l.count_ones() + q.count_ones()) as u64;
+        i += 64;
+    }
+    acc
+}
+
+/// AVX-512BW masks via inline asm (the intrinsics are not stable in the
+/// pinned toolchain). Bench only; ends with vzeroupper.
+#[cfg(target_arch = "x86_64")]
+unsafe fn floor_masks_avx512(b: &[u8]) -> u64 {
+    let n = b.len() / 64;
+    if n == 0 {
+        return 0;
+    }
+    let acc: u64;
+    std::arch::asm!(
+        "mov {t:e}, 44",
+        "vpbroadcastb zmm1, {t:e}",
+        "mov {t:e}, 10",
+        "vpbroadcastb zmm2, {t:e}",
+        "mov {t:e}, 34",
+        "vpbroadcastb zmm3, {t:e}",
+        "xor {acc}, {acc}",
+        "2:",
+        "vmovdqu64 zmm0, [{p}]",
+        "vpcmpeqb k1, zmm0, zmm1",
+        "vpcmpeqb k2, zmm0, zmm2",
+        "vpcmpeqb k3, zmm0, zmm3",
+        "kmovq {t}, k1",
+        "popcnt {t}, {t}",
+        "add {acc}, {t}",
+        "kmovq {t}, k2",
+        "popcnt {t}, {t}",
+        "add {acc}, {t}",
+        "kmovq {t}, k3",
+        "popcnt {t}, {t}",
+        "add {acc}, {t}",
+        "add {p}, 64",
+        "dec {n}",
+        "jnz 2b",
+        "vzeroupper",
+        p = inout(reg) b.as_ptr() => _,
+        n = inout(reg) n => _,
+        t = out(reg) _,
+        acc = out(reg) acc,
+        out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
+        out("k1") _, out("k2") _, out("k3") _,
+        options(nostack, readonly),
+    );
+    acc
+}
+
+fn floor_one(stage: &str, b: &[u8], task: Task, ctx: &Ctx) -> u64 {
+    let s = &b[task.start..task.end];
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        match stage {
+            "stream" => return floor_stream(s),
+            "masks-avx2" => return floor_masks_avx2(s),
+            "masks-avx512" => return floor_masks_avx512(s),
+            "scan" => {
+                let mut acc = 0u64;
+                if ctx.avx2 {
+                    floor_scan_avx2(b, task, &mut acc);
+                } else {
+                    scan::for_each_record_x::<7, _, false>(b, task.start, task.end, |f| acc += f[3].len() as u64);
+                }
+                return acc;
+            }
+            _ => {}
+        }
+    }
+    let _ = (s, ctx, stage);
+    fail("unknown floor stage")
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn floor_scan_avx2(b: &[u8], task: Task, acc: &mut u64) {
+    scan::for_each_record_x::<7, _, true>(b, task.start, task.end, |f| *acc += f[3].len() as u64);
+}
+
+fn floor_bench(ev: &Input, ctx: &Ctx) {
+    // event lines (for per-line figures)
+    let mut lines = 0usize;
+    for t in &ev.tasks {
+        let b = ev.maps[t.file as usize].bytes();
+        lines += b[t.start..t.end].iter().filter(|&&c| c == b'\n').count();
+    }
+    let has512 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx512bw")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
+    for stage in ["stream", "masks-avx2", "masks-avx512", "scan"] {
+        if stage == "masks-avx512" && !has512 {
+            continue;
+        }
+        for &nt in &[1usize, ctx.threads] {
+            let mut best = (f64::MAX, 0f64);
+            for _ in 0..3 {
+                let next = AtomicUsize::new(0);
+                PHASE_CPU_NS.store(0, Ordering::Relaxed);
+                let t = Instant::now();
+                let accs = par(nt, |_| {
+                    let mut a = 0u64;
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&task) = ev.tasks.get(i) else { break };
+                        a = a.wrapping_add(floor_one(stage, ev.maps[task.file as usize].bytes(), task, ctx));
+                    }
+                    a
+                });
+                let wall = t.elapsed().as_secs_f64() * 1e3;
+                let cpu = PHASE_CPU_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+                std::hint::black_box(accs);
+                if wall < best.0 {
+                    best = (wall, cpu);
+                }
+            }
+            eprintln!(
+                "floor {:13} threads={} wall={:7.1}ms thread-time/line={:5.1}ns ({} lines, {} MB)",
+                stage,
+                nt,
+                best.0,
+                best.1 * 1e6 / lines as f64,
+                lines,
+                ev.bytes >> 20
+            );
+        }
+    }
+}
+
 /// Null sink for the stage benchmark.
 struct NullSink(u64);
 impl EvSink for NullSink {
@@ -2121,6 +2416,7 @@ fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
         ps_bits: ctx.ps_bits,
         lb,
         nolookup: std::env::var("SS_BENCH_NOLOOKUP").is_ok(),
+        cache: PCache::new(),
     };
     let mut reused = mk(&lt);
     let mut best = f64::MAX;
