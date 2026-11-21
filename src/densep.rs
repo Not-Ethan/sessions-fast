@@ -43,6 +43,9 @@ const BSHIFT: u32 = 16;
 const BSIZE: usize = 1 << BSHIFT;
 const VALID: u32 = 1 << 31;
 const PFLAG: u32 = 1 << 31;
+/// Single-run persons with at least this many kept events are processed
+/// with the gathered ones (first, largest first).
+const BIG_RUN: usize = 512;
 /// Winners per prefetch block in placement.
 const PF_BLOCK: usize = 16;
 
@@ -569,6 +572,10 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     let ckey: &'static mut [u32] = arena_mut(coff[nbc]);
     let kaddr = ckey.as_mut_ptr() as usize;
     let clen: Vec<AtomicUsize> = (0..nbc).map(|_| AtomicUsize::new(0)).collect();
+    // largest buckets first (whales make a few buckets heavy)
+    let mut corder: Vec<usize> = (0..nbc).filter(|&ci| coff[ci + 1] > coff[ci]).collect();
+    corder.sort_unstable_by_key(|&ci| std::cmp::Reverse(coff[ci + 1] - coff[ci]));
+    stat("d_click_bucket_max", corder.first().map_or(0, |&ci| coff[ci + 1] - coff[ci]));
     let foreign: Mutex<Vec<Cl>> = Mutex::new(Vec::new());
     {
         let nextc = AtomicUsize::new(0);
@@ -577,13 +584,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             let mut tmp: Vec<Cl> = Vec::new();
             let mut fl: Vec<Cl> = Vec::new();
             loop {
-                let ci = nextc.fetch_add(1, Ordering::Relaxed);
-                if ci >= nbc {
-                    break;
-                }
-                if coff[ci + 1] == coff[ci] {
-                    continue;
-                }
+                let Some(&ci) = corder.get(nextc.fetch_add(1, Ordering::Relaxed)) else { break };
                 tmp.clear();
                 for o in &clo {
                     for sl in o.get(ci) {
@@ -643,7 +644,9 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                     while j < k.len() && k[j].person == p {
                         j += 1;
                     }
-                    if runs[p as usize].load(Ordering::Relaxed) != 1 {
+                    // (big single-run persons are gathered too, so they start
+                    // first instead of holding up a bucket at the end)
+                    if runs[p as usize].load(Ordering::Relaxed) != 1 || j - i >= BIG_RUN {
                         md.push((p as u32, bi as u32, i as u32, j as u32));
                     }
                     i = j;
@@ -674,6 +677,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
         }
     }
     gr.sort_unstable_by(|a, b| b.cmp(a));
+    stat("d_group_max", gr.first().map_or(0, |g| g.0));
     stat("d_groups", gr.len());
     stat("d_group_runs", mv.len());
     stat("d_kept", boff.len().min(1) * (0..nb).map(|b| klen[b].load(Ordering::Relaxed)).sum::<usize>());
@@ -762,7 +766,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                 while j < k.len() && k[j].person == p {
                     j += 1;
                 }
-                if runs[p as usize].load(Ordering::Relaxed) == 1 {
+                if runs[p as usize].load(Ordering::Relaxed) == 1 && j - i < BIG_RUN {
                     finish_person(p as u32, &k[i..j], &mut st);
                 }
                 i = j;
