@@ -13,10 +13,8 @@
 //!
 //! A line takes this path only if, inside the bytes the two windows cover up
 //! to the newline, the first six delimiters are commas, the seventh is a
-//! newline, every quote is the first or the last byte of its field and the
-//! quote parity counted from the window start is 0 at every delimiter (the
-//! v2 scanner's rule, which is the dialect's: each field holds no quote or
-//! exactly two, as its first and last byte). Then the line has exactly 7
+//! newline, and every field holds no quote or exactly two, as its first and
+//! last byte (the dialect's rule; see `window`). Then the line has exactly 7
 //! well-formed fields, the newline found is the line's first one, and each
 //! field unquoted from its first byte is exactly the slice the scanner
 //! yields. Every other line (any other shape, a field too long for the
@@ -28,29 +26,24 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::{event_line, event_line_slow, Ctx, EvSink, Task};
-use crate::scan;
+use super::{event_line, event_line_slow, ingest_rel, Ctx, EvSink, Task, LATE};
+use crate::{keys, scan, ts};
 
 /// Use this path for event tasks (SS_FASTEV; see `main::run`).
 pub static ON: AtomicBool = AtomicBool::new(false);
-/// Interleaved cursors per task, 1..=4 (SS_FASTK).
+/// Interleaved cursors per task, 1 or 2 (SS_FASTK).
 pub static CURSORS: AtomicUsize = AtomicUsize::new(1);
+/// Decode fast-path lines with `event_fast` instead of `event_line`
+/// (SS_FASTDEC=1).
+pub static DEC: AtomicBool = AtomicBool::new(false);
+
+/// Lines handed to the general scanner by `slow_line` (statistics).
+pub static SLOW: AtomicUsize = AtomicUsize::new(0);
 
 /// Readable bytes needed from a line start for the fast path: window 1 (64),
 /// window 2 at most 65 bytes further (64), and 32 bytes from the start of
 /// any field (the WIDE decoders), with slack.
 const MARGIN: usize = 192;
-
-#[inline(always)]
-fn prefix_xor(mut x: u64) -> u64 {
-    x ^= x << 1;
-    x ^= x << 2;
-    x ^= x << 4;
-    x ^= x << 8;
-    x ^= x << 16;
-    x ^= x << 32;
-    x
-}
 
 // ---------------------------------------------------------------- masks
 
@@ -147,183 +140,457 @@ struct Cut {
     len: usize,
 }
 
-/// Quote bit of the field starting at window offset `s`.
+/// Lowest set bit of `x` and everything below it (all bits if `x == 0`).
 #[inline(always)]
-fn qbit(q: u64, s: usize) -> usize {
-    (q.wrapping_shr(s as u32) & 1) as usize
+fn upto(x: u64) -> u64 {
+    x ^ x.wrapping_sub(1)
+}
+
+#[inline(always)]
+fn blsr(x: u64) -> u64 {
+    x & x.wrapping_sub(1)
+}
+
+#[inline(always)]
+fn tz(x: u64) -> usize {
+    x.trailing_zeros() as usize
+}
+
+/// Field structure of one 64-byte window that starts at a field start,
+/// whose region `r` (bits [0, last used delimiter]) holds whole fields:
+/// (violation bits, content-start mask, content-end mask).
+///
+/// With `fs` the field starts and `qs` the quoted ones (a quote as first
+/// byte), adding `qs` to `!d` carries each start bit up to the delimiter that
+/// ends its field (fields are separated by delimiters, the zeros of `!d`), so
+/// `cl` = the last byte of every quoted field. The window's quotes in `r`
+/// must be exactly `qs | cl`, and `qs & cl` empty (a one-byte quoted field):
+/// every field holds no quote, or exactly two, as its first and last byte.
+/// Then field j (j-th field of the window) spans
+/// [j-th bit of `cs`, j-th bit of `ce`) unquoted: `cs` = starts, moved one
+/// byte right when quoted; `ce` = delimiters, moved one byte left when the
+/// field is quoted.
+#[inline(always)]
+fn window(d: u64, q: u64, r: u64) -> (u64, u64, u64) {
+    let fs = (d << 1) | 1;
+    let qs = q & fs & r;
+    let cl = ((!d).wrapping_add(qs) & d) >> 1;
+    let bad = ((q ^ (qs | cl)) | (qs & cl)) & r;
+    let cs = (fs & !q) | (qs << 1);
+    let ce = (d & !(cl << 1)) | cl;
+    (bad, cs, ce)
 }
 
 /// Cuts the line at `p` (a line start with MARGIN readable bytes).
 /// Branch-free; positions use wrapping arithmetic and are garbage unless ok.
 #[inline(always)]
 unsafe fn cut<const AVX2: bool>(p: *const u8) -> Cut {
-    // window 1: fields 0..=2
+    // window 1: fields 0..=2 (its region ends at the third delimiter)
     let (c1, n1, q1) = masks64::<AVX2>(p);
     let d1 = c1 | n1;
-    let e0 = d1.trailing_zeros() as usize;
-    let d1b = d1 & d1.wrapping_sub(1);
-    let e1 = d1b.trailing_zeros() as usize;
-    let d1c = d1b & d1b.wrapping_sub(1);
-    let e2 = d1c.trailing_zeros() as usize;
-    // bits [0, e2] (all bits if d1c == 0, which fails `ok` anyway)
-    let r1 = d1c ^ d1c.wrapping_sub(1);
-    // quotes only at field edges, parity 0 at every delimiter, no newline
-    let v1 = ((q1 & !((d1 << 1) | 1 | (d1 >> 1))) | (prefix_xor(q1) & d1) | n1) & r1;
-    // window 2: fields 3..=6, from the start of field 3
-    let w = e2 + 1; // <= 65 (e2 <= 64)
+    let d1c = blsr(blsr(d1));
+    let r1 = upto(d1c);
+    let (b1, cs1, ce1) = window(d1, q1, r1);
+    // window 2: fields 3..=6 from the start of field 3 (region: 4 delimiters)
+    let w = tz(d1c) + 1; // <= 65
     let (c2, n2, q2) = masks64::<AVX2>(p.add(w));
     let d2 = c2 | n2;
-    let g0 = d2.trailing_zeros() as usize;
-    let d2b = d2 & d2.wrapping_sub(1);
-    let g1 = d2b.trailing_zeros() as usize;
-    let d2c = d2b & d2b.wrapping_sub(1);
-    let g2 = d2c.trailing_zeros() as usize;
-    let d2d = d2c & d2c.wrapping_sub(1);
-    let g3 = d2d.trailing_zeros() as usize;
-    let r2 = d2d ^ d2d.wrapping_sub(1);
+    let d2d = blsr(blsr(blsr(d2)));
+    let r2 = upto(d2d);
+    let (b2, cs2, ce2) = window(d2, q2, r2);
+    // the first six delimiters are commas, the seventh is the newline
     let last = d2d & d2d.wrapping_neg();
-    // ... and the only newline is the fourth delimiter
-    let v2 = ((q2 & !((d2 << 1) | 1 | (d2 >> 1))) | (prefix_xor(q2) & d2) | (n2 ^ last)) & r2;
-    let ok = (d1c != 0) & (d2d != 0) & ((v1 | v2) == 0);
-    // field j spans [a, z) in its window; unquote from the first byte
-    let a1 = [0usize, e0.wrapping_add(1), e1.wrapping_add(1)];
-    let z1 = [e0, e1, e2];
-    let a2 = [0usize, g0.wrapping_add(1), g1.wrapping_add(1), g2.wrapping_add(1)];
-    let z2 = [g0, g1, g2, g3];
+    let nl = (n1 & r1) | ((n2 ^ last) & r2);
+    // The line end also from the newline masks of the 128 bytes at p, off
+    // the field chain: the next line start depends only on these loads. On
+    // a cut line both are its first newline (offset <= 128).
+    let (_, n1b, _) = masks64::<AVX2>(p.add(64));
+    let le = if n1 != 0 { tz(n1) } else { 64 + tz(n1b) };
+    let ok = (d1c != 0) & (d2d != 0) & ((b1 | b2 | nl) == 0) & (w + tz(d2d) == le);
     let mut s = [0usize; 7];
     let mut n = [0usize; 7];
+    let (mut cs, mut ce) = (cs1, ce1);
     for j in 0..3 {
-        let q = qbit(q1, a1[j]);
-        s[j] = a1[j] + q;
-        n[j] = z1[j].wrapping_sub(a1[j]).wrapping_sub(2 * q);
+        s[j] = tz(cs);
+        n[j] = tz(ce).wrapping_sub(tz(cs));
+        cs = blsr(cs);
+        ce = blsr(ce);
     }
-    for j in 0..4 {
-        let q = qbit(q2, a2[j]);
-        s[3 + j] = w + a2[j].wrapping_add(q);
-        n[3 + j] = z2[j].wrapping_sub(a2[j]).wrapping_sub(2 * q);
+    let (mut cs, mut ce) = (cs2, ce2);
+    for j in 3..7 {
+        s[j] = w + tz(cs);
+        n[j] = tz(ce).wrapping_sub(tz(cs));
+        cs = blsr(cs);
+        ce = blsr(ce);
     }
-    Cut { ok, s, n, len: w.wrapping_add(g3).wrapping_add(1) }
+    Cut { ok, s, n, len: le + 1 }
 }
 
 /// The fields of a cut line (`c.ok`).
 #[inline(always)]
 unsafe fn fields<'a>(p: *const u8, c: &Cut) -> [&'a [u8]; 7] {
-    std::array::from_fn(|j| std::slice::from_raw_parts(p.add(c.s[j]), c.n[j]))
+    let f = |j: usize| std::slice::from_raw_parts(p.add(c.s[j]), c.n[j]);
+    [f(0), f(1), f(2), f(3), f(4), f(5), f(6)]
 }
 
 /// The general scanner on the single line at `*off`; advances `*off` past it.
 #[cold]
 #[inline(never)]
-fn slow_line<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 7])>(b: &'a [u8], off: &mut usize, f: &mut F) {
+fn slow_line<'a, const AVX2: bool, FS: FnMut(&[&'a [u8]; 7])>(b: &'a [u8], off: &mut usize, fs: &mut FS) {
+    SLOW.fetch_add(1, Ordering::Relaxed);
     let e = scan::next_line_start(b, *off);
-    scan::for_each_record_x::<7, _, AVX2>(b, *off, e, |x| f(x));
+    scan::for_each_record_x::<7, _, AVX2>(b, *off, e, |x| fs(x));
     *off = e;
 }
 
-/// Lines from `off` while `off < end` and `off <= lim` (fast path), the
-/// rest of [off, end) with the general scanner.
+/// Lines from `off` while `off < end` and `off <= lim` (fast path, `ff`),
+/// the rest of [off, end) with the general scanner (`fs`).
 #[inline(always)]
-fn run1<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 7])>(b: &'a [u8], mut off: usize, end: usize, lim: usize, f: &mut F) {
+fn run1<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FS: FnMut(&[&'a [u8]; 7])>(
+    b: &'a [u8],
+    mut off: usize,
+    end: usize,
+    lim: usize,
+    ff: &mut FF,
+    fs: &mut FS,
+) {
     let base = b.as_ptr();
     while off < end && off <= lim {
         unsafe {
             let p = base.add(off);
             let c = cut::<AVX2>(p);
             if c.ok {
-                f(&fields(p, &c));
+                ff(&fields(p, &c));
                 off += c.len;
             } else {
-                slow_line::<AVX2, F>(b, &mut off, f);
+                slow_line::<AVX2, FS>(b, &mut off, fs);
             }
         }
     }
     if off < end {
-        scan::for_each_record_x::<7, _, AVX2>(b, off, end, |x| f(x));
+        scan::for_each_record_x::<7, _, AVX2>(b, off, end, |x| fs(x));
     }
 }
 
-/// K cursors over K line-aligned sub-ranges of [start, end), one line of
+/// Two cursors over two line-aligned halves of [start, end), one line of
 /// each per step.
 #[inline(always)]
-fn run_k<'a, const AVX2: bool, const K: usize, F: FnMut(&[&'a [u8]; 7])>(b: &'a [u8], start: usize, end: usize, lim: usize, f: &mut F) {
+fn run2<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FS: FnMut(&[&'a [u8]; 7])>(
+    b: &'a [u8],
+    start: usize,
+    end: usize,
+    lim: usize,
+    ff: &mut FF,
+    fs: &mut FS,
+) {
     let base = b.as_ptr();
-    let len = end - start;
-    let mut bnd = [end; K];
-    for (i, x) in bnd.iter_mut().enumerate().take(K - 1) {
-        // a line start in (start, end]
-        *x = scan::next_line_start(b, start + (i + 1) * (len / K) - 1).min(end);
-    }
-    let mut off = [start; K];
-    for i in 1..K {
-        off[i] = bnd[i - 1];
-    }
-    // off[i] < bnd[i] <= off[K-1] for i < K-1, so off[K-1] <= lim covers all
-    while (0..K).all(|i| off[i] < bnd[i]) && off[K - 1] <= lim {
+    // a line start in (start, end]
+    let mid = scan::next_line_start(b, start + (end - start) / 2 - 1).min(end);
+    let (mut a, mut c) = (start, mid);
+    // a < mid <= c, so c <= lim covers both
+    while a < mid && c < end && c <= lim {
         unsafe {
-            let p: [*const u8; K] = std::array::from_fn(|i| base.add(off[i]));
-            let c: [Cut; K] = std::array::from_fn(|i| cut::<AVX2>(p[i]));
-            if c.iter().all(|x| x.ok) {
-                for i in 0..K {
-                    f(&fields(p[i], &c[i]));
-                    off[i] += c[i].len;
-                }
+            let (pa, pc) = (base.add(a), base.add(c));
+            let ca = cut::<AVX2>(pa);
+            let cc = cut::<AVX2>(pc);
+            if ca.ok & cc.ok {
+                ff(&fields(pa, &ca));
+                ff(&fields(pc, &cc));
+                a += ca.len;
+                c += cc.len;
             } else {
-                for i in 0..K {
-                    if c[i].ok {
-                        f(&fields(p[i], &c[i]));
-                        off[i] += c[i].len;
-                    } else {
-                        slow_line::<AVX2, F>(b, &mut off[i], f);
-                    }
+                if ca.ok {
+                    ff(&fields(pa, &ca));
+                    a += ca.len;
+                } else {
+                    slow_line::<AVX2, FS>(b, &mut a, fs);
+                }
+                if cc.ok {
+                    ff(&fields(pc, &cc));
+                    c += cc.len;
+                } else {
+                    slow_line::<AVX2, FS>(b, &mut c, fs);
                 }
             }
         }
     }
-    for i in 0..K {
-        run1::<AVX2, F>(b, off[i], bnd[i], lim, f);
-    }
+    run1::<AVX2, FF, FS>(b, a, mid, lim, ff, fs);
+    run1::<AVX2, FF, FS>(b, c, end, lim, ff, fs);
 }
 
-/// Calls `f` with the unquoted fields of every well-formed line of exactly
-/// 7 fields in `b[start..end)`: the same lines and fields as
-/// `scan::for_each_record_x::<7, _, AVX2>(b, start, end, f)`, in the same
-/// order with one cursor; with K cursors, lines of different sub-ranges
-/// interleave (each sub-range in order). `start` must be a line start and
-/// `end` a line start or `b.len()`; `safe_end` is the end address of
-/// readable memory (>= the end of `b`).
+/// Every well-formed line of exactly 7 fields in `b[start..end)`, as its
+/// unquoted fields: the same lines and fields as
+/// `scan::for_each_record_x::<7, _, AVX2>(b, start, end, ..)`, in the same
+/// order with one cursor; with two (k = 2), the lines of two halves
+/// interleave (each half in order). Lines cut by the fast path go to `ff`
+/// (then 32 bytes from the start of every field are inside `b`), the others
+/// to `fs`. `start` must be a line start and `end` a line start or
+/// `b.len()`; `safe_end` is the end address of readable memory (>= the end
+/// of `b`); the fast path never reads beyond `b`.
 #[inline(always)]
-pub fn for_each_line<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 7])>(b: &'a [u8], start: usize, end: usize, safe_end: usize, k: usize, mut f: F) {
+pub fn for_each_line2<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FS: FnMut(&[&'a [u8]; 7])>(
+    b: &'a [u8],
+    start: usize,
+    end: usize,
+    safe_end: usize,
+    k: usize,
+    mut ff: FF,
+    mut fs: FS,
+) {
     assert!(start <= end && end <= b.len() && safe_end >= b.as_ptr() as usize + b.len());
-    // last line start for the fast path: never read beyond b
+    // last line start for the fast path
     let lim = b.len().wrapping_sub(MARGIN);
     if b.len() < MARGIN || start >= end {
-        scan::for_each_record_x::<7, _, AVX2>(b, start, end, f);
+        scan::for_each_record_x::<7, _, AVX2>(b, start, end, fs);
         return;
     }
     const MINSUB: usize = 16 << 10;
-    match k {
-        2 if end - start >= 2 * MINSUB => run_k::<AVX2, 2, F>(b, start, end, lim, &mut f),
-        3 if end - start >= 3 * MINSUB => run_k::<AVX2, 3, F>(b, start, end, lim, &mut f),
-        4 if end - start >= 4 * MINSUB => run_k::<AVX2, 4, F>(b, start, end, lim, &mut f),
-        _ => run1::<AVX2, F>(b, start, end, lim, &mut f),
+    if k >= 2 && end - start >= 2 * MINSUB {
+        run2::<AVX2, FF, FS>(b, start, end, lim, &mut ff, &mut fs)
+    } else {
+        run1::<AVX2, FF, FS>(b, start, end, lim, &mut ff, &mut fs)
     }
 }
 
-/// `main::event_task` on the fast splitter (same copies; with K > 1 cursors
+/// `for_each_line2` with one callback for all lines.
+#[inline(always)]
+pub fn for_each_line<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 7])>(b: &'a [u8], start: usize, end: usize, safe_end: usize, k: usize, mut f: F) {
+    // the two callbacks are never active at the same time
+    let fp: *mut F = &mut f;
+    for_each_line2::<AVX2, _, _>(b, start, end, safe_end, k, #[inline(always)] |x| unsafe { (*fp)(x) }, |x| unsafe { (*fp)(x) });
+}
+
+// ---------------------------------------------------------------- decoding
+
+/// One exact date: `YYYY-MM-` as a little-endian word, `DD` (2 bytes), and
+/// its midnight in epoch ms.
+#[derive(Clone, Copy, Default)]
+struct DSlot {
+    w0: u64,
+    dd: u64,
+    ms: i64,
+}
+
+/// Exact-date table for F1 timestamps: the days from 2 before the window to
+/// 6 after it (at most 64), in slots indexed by the day-of-month digits
+/// (`dslot`). A slot matches only if all ten bytes `YYYY-MM-DD` equal its
+/// date, which is valid by construction (and checked against
+/// `ts::days_from_civil`); unused slots repeat a real entry, so a match is
+/// always exact. Dates that are not in the table take `TsParser::parse`.
+pub struct Days {
+    key: (i64, i64),
+    on: bool,
+    slots: [DSlot; 64],
+}
+
+#[inline(always)]
+fn dslot(w1: u64) -> usize {
+    // (d0 & 3) << 4 | (d1 & 15): distinct for "01".."31"
+    (((w1 & 3) << 4) | ((w1 >> 8) & 15)) as usize
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + (m <= 2) as i64, m, d)
+}
+
+impl Days {
+    pub fn new(ws: i64, we: i64) -> Days {
+        let mut slots = [DSlot::default(); 64];
+        let mut used = [false; 64];
+        let mut first: Option<DSlot> = None;
+        let lo = ws.div_euclid(86_400_000) - 2;
+        let hi = we.div_euclid(86_400_000) + 6;
+        let mut day = lo;
+        while day <= hi && day < lo + 64 {
+            let (y, m, d) = civil_from_days(day);
+            if (0..=9999).contains(&y) && ts::days_from_civil(y, m, d) == day {
+                let txt = format!("{:04}-{:02}-{:02}", y, m, d);
+                let t = txt.as_bytes();
+                let w0 = u64::from_le_bytes(t[..8].try_into().unwrap());
+                let w1 = u16::from_le_bytes([t[8], t[9]]) as u64;
+                let e = DSlot { w0, dd: w1, ms: day * 86_400_000 };
+                let k = dslot(w1);
+                slots[k] = e;
+                used[k] = true;
+                first.get_or_insert(e);
+            }
+            day += 1;
+        }
+        if let Some(e) = first {
+            for k in 0..64 {
+                if !used[k] {
+                    slots[k] = e;
+                }
+            }
+        }
+        Days { key: (ws, we), on: first.is_some(), slots }
+    }
+}
+
+thread_local! {
+    static DAYS: std::cell::RefCell<Option<Box<Days>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Bytes `at..at + 8` of `p` as a little-endian u64.
+#[inline(always)]
+unsafe fn rd(p: *const u8, at: usize) -> u64 {
+    u64::from_le(std::ptr::read_unaligned(p.add(at) as *const u64))
+}
+
+/// Nonzero iff some byte lane selected by `lanes` is not an ASCII digit.
+#[inline(always)]
+fn digits_bad(w: u64, lanes: u64) -> u64 {
+    let hi = (w & 0xF0F0_F0F0_F0F0_F0F0) ^ 0x3030_3030_3030_3030;
+    let lo = ((w & 0x0F0F_0F0F_0F0F_0F0F) + 0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0;
+    (hi | lo) & lanes
+}
+
+/// An F1 timestamp `YYYY-MM-DDTHH:MM:SSZ` (20 bytes at `b`, the `Z`
+/// already checked) through the date table: None if the date is not in the
+/// table; else Some(parse_ts result), which is Some(ms) iff `T`, the colons,
+/// the six time digits and h <= 23, m <= 59, s <= 59 are right.
+#[inline(always)]
+unsafe fn f1(days: &Days, b: *const u8) -> Option<Option<i64>> {
+    let w0 = rd(b, 0); // YYYY-MM-
+    let w1 = rd(b, 8); // DDTHH:MM
+    let e = days.slots.get_unchecked(dslot(w1));
+    let hit = days.on & (e.w0 == w0) & (e.dd == (w1 & 0xFFFF));
+    let w = rd(b, 11); // HH:MM:SS
+    let bad = digits_bad(w, 0xFFFF_00FF_FF00_FFFF) | ((w & 0x0000_FF00_00FF_0000) ^ 0x0000_3A00_003A_0000) | (((w1 >> 16) & 0xFF) ^ b'T' as u64);
+    // lane i = 10 * digit_i + digit_{i+1}: h in lane 0, m in lane 3, s in 6
+    let v = w & 0x0F0F_0F0F_0F0F_0F0F;
+    let pr = v.wrapping_mul(10).wrapping_add(v >> 8);
+    // lane + (128 - limit) has its top bit set iff the value is over the limit
+    // (values <= 99 when the digits are good: no carry between lanes)
+    let over = pr.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080;
+    let tod = (pr & 0xFF) * 3600 + ((pr >> 24) & 0xFF) * 60 + ((pr >> 48) & 0xFF);
+    if !hit {
+        return None;
+    }
+    Some(if (bad | over) == 0 { Some(e.ms + tod as i64 * 1000) } else { None })
+}
+
+/// `ctx.tsp.parse(b)` (= `ts::parse_ts`), F1 through the date table. 32
+/// bytes from the start of `b` must be readable.
+#[inline(always)]
+fn ts_fast(ctx: &Ctx, days: &Days, b: &[u8]) -> Option<i64> {
+    if b.len() == 20 && b[19] == b'Z' {
+        if let Some(v) = unsafe { f1(days, b.as_ptr()) } {
+            return v;
+        }
+    }
+    ctx.tsp.parse(b)
+}
+
+/// `event_line::<true>` for a fast-path line (f[0] non-empty, 32 readable
+/// bytes from every field start), with `ts_fast` for both timestamps. Same
+/// steps, same order, same results.
+#[inline(always)]
+fn event_fast<S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, days: &Days, sink: &mut S) {
+    let (ws, we) = (ctx.ws, ctx.we);
+    let Some(ing) = ts_fast(ctx, days, f[3]) else { return };
+    let eid = keys::mix(unsafe { keys::key_of_wide(f[0]) });
+    let ingest = ingest_rel(ing, ctx.ws_s);
+    let valid = 'v: {
+        if f[1].is_empty() || f[5].is_empty() {
+            break 'v None;
+        }
+        let Some(t) = ts_fast(ctx, days, f[2]) else { break 'v None };
+        if t < ws || t >= we {
+            break 'v None;
+        }
+        let Some(pay) = super::event_pay(f[4], || f[6], f[5], ctx, true) else { break 'v None };
+        if ing - t > LATE {
+            break 'v None;
+        }
+        let user = unsafe { keys::key_of_wide(f[1]) };
+        Some((user, (t - ws) as u32, pay))
+    };
+    sink.copy(eid, ingest, valid);
+}
+
+/// `main::event_task` on the fast splitter (same copies; with two cursors
 /// in a different order).
 #[inline(always)]
 pub fn event_task_fast<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
     let k = CURSORS.load(Ordering::Relaxed);
-    for_each_line::<AVX2, _>(b, task.start, task.end, safe_end, k, #[inline(always)] |f| {
-        if f[0].is_empty() {
-            return;
+    if DEC.load(Ordering::Relaxed) {
+        return event_task_dec::<AVX2, S>(b, task, ctx, sink, safe_end, k);
+    }
+    // The callbacks are never active at the same time; both reach the sink
+    // through this pointer.
+    let sp: *mut S = sink;
+    for_each_line2::<AVX2, _, _>(
+        b,
+        task.start,
+        task.end,
+        safe_end,
+        k,
+        #[inline(always)]
+        |f| {
+            // fast-path line: 32 bytes from every field start are readable
+            if !f[0].is_empty() {
+                event_line::<true, S, _>(f, f[0], ctx, unsafe { &mut *sp });
+            }
+        },
+        |f| {
+            if f[0].is_empty() {
+                return;
+            }
+            if f[6].as_ptr() as usize + 32 <= safe_end {
+                event_line::<true, S, _>(f, f[0], ctx, unsafe { &mut *sp });
+            } else {
+                event_line_slow(f, ctx, unsafe { &mut *sp });
+            }
+        },
+    );
+}
+
+/// `event_task_fast` with `event_fast` for the fast-path lines.
+#[inline(always)]
+fn event_task_dec<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize, k: usize) {
+    let days: *const Days = DAYS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.as_ref().map_or(true, |d| d.key != (ctx.ws, ctx.we)) {
+            *c = Some(Box::new(Days::new(ctx.ws, ctx.we)));
         }
-        if f[6].as_ptr() as usize + 32 <= safe_end {
-            event_line::<true, S, _>(f, f[0], ctx, sink);
-        } else {
-            event_line_slow(f, ctx, sink);
-        }
+        &**c.as_ref().unwrap() as *const Days
     });
+    // the box lives in this thread's slot until a later task with another
+    // window replaces it; this task is done with it by then
+    let days = unsafe { &*days };
+    let sp: *mut S = sink;
+    for_each_line2::<AVX2, _, _>(
+        b,
+        task.start,
+        task.end,
+        safe_end,
+        k,
+        #[inline(always)]
+        |f| {
+            if !f[0].is_empty() {
+                event_fast(f, ctx, days, unsafe { &mut *sp });
+            }
+        },
+        |f| {
+            if f[0].is_empty() {
+                return;
+            }
+            if f[6].as_ptr() as usize + 32 <= safe_end {
+                event_line::<true, S, _>(f, f[0], ctx, unsafe { &mut *sp });
+            } else {
+                event_line_slow(f, ctx, unsafe { &mut *sp });
+            }
+        },
+    );
 }
 
 // ---------------------------------------------------------------- checking
@@ -356,10 +623,11 @@ pub fn task_fast_any<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, s
 }
 
 /// SS_EVCHECK: every event task through the general path and through this
-/// path with 1..=4 cursors; the copies must be identical (same order with
+/// path with 1 and 2 cursors; the copies must be identical (same order with
 /// one cursor, same multiset otherwise). Exits nonzero on a difference.
 pub fn check(ev: &super::Input, ctx: &Ctx) {
     let saved = CURSORS.load(Ordering::Relaxed);
+    let saved_dec = DEC.load(Ordering::Relaxed);
     let mut lines = 0usize;
     let mut copies = 0usize;
     for task in &ev.tasks {
@@ -369,8 +637,9 @@ pub fn check(ev: &super::Input, ctx: &Ctx) {
         super::event_task_scan_any(b, *task, ctx, &mut want, safe_end);
         lines += b[task.start..task.end].iter().filter(|&&c| c == b'\n').count();
         copies += want.0.len();
-        for k in 1..=4 {
+        for (k, dec) in [(1, false), (2, false), (1, true), (2, true)] {
             CURSORS.store(k, Ordering::Relaxed);
+            DEC.store(dec, Ordering::Relaxed);
             let mut got = RecSink::default();
             task_fast_any(b, *task, ctx, &mut got, safe_end);
             let same = if k == 1 {
@@ -383,13 +652,21 @@ pub fn check(ev: &super::Input, ctx: &Ctx) {
                 a == w
             };
             if !same {
-                eprintln!("evcheck: MISMATCH file {} [{}, {}) cursors {} ({} vs {} copies)", task.file, task.start, task.end, k, got.0.len(), want.0.len());
+                eprintln!("evcheck: MISMATCH file {} [{}, {}) cursors {} dec {} ({} vs {} copies)", task.file, task.start, task.end, k, dec, got.0.len(), want.0.len());
                 std::process::exit(1);
             }
         }
     }
     CURSORS.store(saved, Ordering::Relaxed);
-    eprintln!("evcheck: OK {} tasks, {} lines, {} copies identical (cursors 1-4, avx2={})", ev.tasks.len(), lines, copies, ctx.avx2);
+    DEC.store(saved_dec, Ordering::Relaxed);
+    eprintln!(
+        "evcheck: OK {} tasks, {} lines, {} copies identical (cursors 1-2, event_line and event_fast, avx2={}); {} lines took the general path",
+        ev.tasks.len(),
+        lines,
+        copies,
+        ctx.avx2,
+        SLOW.load(Ordering::Relaxed) / 4
+    );
 }
 
 #[cfg(test)]
@@ -535,7 +812,7 @@ mod tests {
     }
 
     /// Same lines and fields as the general scanner, whole buffers and
-    /// line-aligned chunks, 1-4 cursors, both SIMD paths where available.
+    /// line-aligned chunks, 1-2 cursors, both SIMD paths where available.
     #[test]
     fn splitter_matches_scanner() {
         let mut r = rng(0xFA57_E7E7_0000_0001);
@@ -552,7 +829,7 @@ mod tests {
             let want = rows(&t, 0, t.len(), None);
             total += want.len();
             assert_eq!(rows(&t, 0, t.len(), Some(1)), want, "round {}", round);
-            for k in 2..=4 {
+            for k in 2..=2 {
                 let mut a = rows(&t, 0, t.len(), Some(k));
                 let mut w = want.clone();
                 a.sort();
@@ -561,7 +838,7 @@ mod tests {
             }
             #[cfg(target_arch = "x86_64")]
             if avx2 {
-                for k in 1..=4 {
+                for k in 1..=2 {
                     let mut a = unsafe { rows_avx2(&t, 0, t.len(), k) };
                     let mut w = want.clone();
                     if k > 1 {
@@ -583,6 +860,66 @@ mod tests {
             assert_eq!(got, want, "chunked round {}", round);
         }
         assert!(total > 100_000, "{}", total);
+    }
+
+    /// The date table + SWAR time decoder agrees with `ts::parse_ts` on F1
+    /// shapes around several windows: every byte value at every position of
+    /// valid timestamps, random mutations, all dates of the table range.
+    #[test]
+    fn f1_matches_parse_ts() {
+        let mut r = rng(0xF1F1);
+        let mut hits = 0u64;
+        for wi in 0..40 {
+            // windows from 2025 to 2028 (Feb 29 2028 included), up to 24 days
+            let ws = ts::parse_ts(b"2025-01-01T00:00:00Z").unwrap() + ((r() % (4 * 366)) as i64) * 86_400_000;
+            let ws = if wi == 0 { ts::parse_ts(b"2028-02-20T00:00:00Z").unwrap() } else { ws };
+            let we = ws + (1 + (r() % 24) as i64) * 86_400_000;
+            let days = Days::new(ws, we);
+            let check = |s: &[u8], hits: &mut u64| {
+                let mut buf = s.to_vec();
+                buf.extend_from_slice(&[b'9'; 40]);
+                let b = &buf[..20];
+                if b[19] != b'Z' {
+                    return; // f1's precondition (ts_fast checks it)
+                }
+                let want = ts::parse_ts(b);
+                let got = unsafe { f1(&days, b.as_ptr()) };
+                if let Some(v) = got {
+                    *hits += 1;
+                    assert_eq!(v, want, "{:?}", String::from_utf8_lossy(b));
+                }
+            };
+            for day in (ws / 86_400_000 - 5)..(we / 86_400_000 + 9) {
+                let (y, m, d) = civil_from_days(day);
+                let sod = (r() % 86_400) as i64;
+                let base = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, sod / 3600, sod / 60 % 60, sod % 60).into_bytes();
+                check(&base, &mut hits);
+                for at in 0..20 {
+                    for v in [b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'9', b':', b'-', b'T', b'/', b' ', 0, 0xFF, b'Z', b'"'] {
+                        let mut t = base.clone();
+                        t[at] = v;
+                        check(&t, &mut hits);
+                    }
+                }
+                for (h, mi, s) in [(23, 59, 59), (24, 0, 0), (0, 60, 0), (0, 0, 60), (19, 0, 0), (29, 0, 0), (99, 99, 99), (0, 0, 0)] {
+                    let t = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, h, mi, s).into_bytes();
+                    check(&t, &mut hits);
+                }
+            }
+            for _ in 0..20_000 {
+                let mut t = format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                    2024 + r() % 6, r() % 14, r() % 33, r() % 26, r() % 62, r() % 62
+                )
+                .into_bytes();
+                if r() % 2 == 0 {
+                    let at = (r() % 20) as usize;
+                    t[at] = (r() & 0xFF) as u8;
+                }
+                check(&t, &mut hits);
+            }
+        }
+        assert!(hits > 100_000, "{}", hits);
     }
 
     /// Every single-byte change of a well-formed line, at every position,
