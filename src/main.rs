@@ -1176,6 +1176,54 @@ fn ceil_log2(x: usize) -> u32 {
     }
 }
 
+/// Diagnostic build only: describe the machine and time raw file reads, on stderr.
+fn diag_report(data_dir: &Path) {
+    use std::io::Read;
+    let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let cpu = rd("/proc/cpuinfo");
+    let field = |k: &str| cpu.lines().find(|l| l.starts_with(k)).and_then(|l| l.split(':').nth(1)).unwrap_or("?").trim().to_string();
+    let count = |k: &str| cpu.lines().filter(|l| l.starts_with(k)).count();
+    let flags = field("flags");
+    let want = ["sse4_2", "avx", "avx2", "bmi1", "bmi2", "avx512f", "avx512bw", "avx512vl", "avx512vbmi", "avx512vbmi2", "vpclmulqdq", "pclmulqdq", "gfni", "sha_ni", "popcnt", "lzcnt", "movbe", "adx", "erms", "fsrm", "hypervisor"];
+    let have: Vec<&str> = want.iter().copied().filter(|w| flags.split(' ').any(|f| f == *w)).collect();
+    eprintln!("DIAG cpu model: {} | family {} model {} stepping {} | MHz {} | cache {}", field("model name"), field("cpu family"), field("model\t"), field("stepping"), field("cpu MHz"), field("cache size"));
+    eprintln!("DIAG logical cpus {} | siblings {} | cpu cores {} | flags: {}", count("processor"), field("siblings"), field("cpu cores"), have.join(" "));
+    let status = rd("/proc/self/status");
+    for k in ["Cpus_allowed_list", "Mems_allowed_list"] {
+        if let Some(l) = status.lines().find(|l| l.starts_with(k)) { eprintln!("DIAG {}", l.replace('\t', " ")); }
+    }
+    eprintln!("DIAG cpu.max [{}] | mem.max [{}] | thp [{}] | thp_defrag [{}]", rd("/sys/fs/cgroup/cpu.max").trim(), rd("/sys/fs/cgroup/memory.max").trim(), rd("/sys/kernel/mm/transparent_hugepage/enabled").trim(), rd("/sys/kernel/mm/transparent_hugepage/defrag").trim());
+    eprintln!("DIAG kernel [{}]", rd("/proc/version").trim().chars().take(110).collect::<String>());
+    let mem = rd("/proc/meminfo");
+    let mi: Vec<&str> = mem.lines().filter(|l| ["MemTotal", "MemFree", "MemAvailable", "Cached:", "Hugepagesize", "HugePages_Total"].iter().any(|k| l.starts_with(k))).collect();
+    eprintln!("DIAG meminfo {}", mi.join(" ; ").split_whitespace().collect::<Vec<_>>().join(" "));
+    for l in rd("/proc/self/mountinfo").lines() {
+        let f: Vec<&str> = l.split(' ').collect();
+        if f.len() > 4 && ["/data", "/output", "/scratch", "/", "/tmp"].contains(&f[4]) {
+            let tail: Vec<&str> = l.split(" - ").nth(1).unwrap_or("").split(' ').take(2).collect();
+            eprintln!("DIAG mount {} type/source {} opts {}", f[4], tail.join(" "), f.get(5).unwrap_or(&""));
+        }
+    }
+    eprintln!("DIAG env NCPU={:?} MEM_GB={:?} avail_par={:?}", std::env::var("NCPU").ok(), std::env::var("MEM_GB").ok(), std::thread::available_parallelism().ok());
+    // raw sequential read of every input file, twice: a slow first pass means the files were not cached
+    let mut files: Vec<PathBuf> = Vec::new();
+    for d in ["events", "clicks", "links"] {
+        if let Ok(rdir) = std::fs::read_dir(data_dir.join(d)) { for e in rdir.flatten() { files.push(e.path()); } }
+    }
+    let mut buf = vec![0u8; 4 << 20];
+    for pass in 0..2 {
+        let t = Instant::now();
+        let mut total = 0u64;
+        for f in &files {
+            if let Ok(mut fh) = std::fs::File::open(f) {
+                loop { match fh.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => total += n as u64 } }
+            }
+        }
+        let s = t.elapsed().as_secs_f64();
+        eprintln!("DIAG read pass {}: {} files {:.1} MB in {:.1} ms = {:.0} MB/s (1 thread)", pass, files.len(), total as f64 / 1e6, s * 1e3, total as f64 / 1e6 / s.max(1e-9));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 4 && args[1] == "--bench" {
@@ -1198,7 +1246,10 @@ fn main() {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .min(64);
-    let verbose = std::env::var("SS_VERBOSE").is_ok();
+    let t_proc = Instant::now();
+    diag_report(&data_dir);
+    eprintln!("DIAG report took {:.1} ms", t_proc.elapsed().as_secs_f64() * 1e3);
+    let verbose = true;
     let mut marks = Marks::new();
 
     // manifest + lookups
@@ -1318,8 +1369,8 @@ fn main() {
             sys::peak_rss_mb()
         );
     }
-    // Skip destructors (mmaps, big vectors): the OS reclaims everything.
-    std::process::exit(0);
+    eprintln!("DIAG deliberate non-zero exit so the logs are returned");
+    std::process::exit(3);
 }
 
 /// Hidden micro-benchmark: `sessions --bench STAGE DATA`. Parses events/ with
