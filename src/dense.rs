@@ -146,6 +146,140 @@ struct DRec {
 
 const BSHIFT: u32 = 16;
 
+/// Measurement-only 16-byte record: number, ingest, ts, and 32 bits of
+/// payload (stand-in for a person slot; pay would go to a side stream).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct DRec16 {
+    n: u32,
+    ingest: u32,
+    ts: u32,
+    aux: u32,
+}
+
+/// SS_DENSEBENCH=16: parse into 16-byte records, lean placement (gather the
+/// bucket, u32 index slots), no person lookups.
+pub fn bench16(ev: &Input, ctx: &Ctx, ke: u64, bound: u64) {
+    let est = ev.bytes / 70 + 1;
+    let nb = (bound >> BSHIFT) as usize + 1;
+    let threads = ctx.threads;
+    let cap = est / (threads * nb) * 5 / 4 + 64;
+    let keep = crate::sys::arenas().len();
+    for round in 0..3 {
+        let next = AtomicUsize::new(0);
+        let tp = Instant::now();
+        let parts: Vec<Parts<DRec16>> = super::par(threads, |_| {
+            let mut p: Parts<DRec16> = Parts::with_wc(nb, cap, true);
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&task) = ev.tasks.get(i) else { break };
+                let b = ev.maps[task.file as usize].bytes();
+                let safe_end = b.as_ptr() as usize + b.len();
+                task16_any(b, task, ctx, ke, bound, &mut p, safe_end);
+            }
+            p.finish();
+            p
+        });
+        let t_parse = tp.elapsed().as_secs_f64() * 1e3;
+        let tq = Instant::now();
+        let nextb = AtomicUsize::new(0);
+        let kept = AtomicUsize::new(0);
+        super::par(threads, |_| {
+            let mut slot = vec![0u32; 1 << BSHIFT];
+            let mut gat: Vec<DRec16> = Vec::new();
+            let mut k = 0usize;
+            loop {
+                let bi = nextb.fetch_add(1, Ordering::Relaxed);
+                if bi >= nb {
+                    break;
+                }
+                gat.truncate(0);
+                for p in parts.iter() {
+                    for sl in p.get(bi) {
+                        gat.extend_from_slice(sl);
+                    }
+                }
+                for (i, r) in gat.iter().enumerate() {
+                    let s = &mut slot[(r.n as usize) & ((1 << BSHIFT) - 1)];
+                    if *s == 0 || r.ingest < gat[*s as usize - 1].ingest {
+                        *s = i as u32 + 1;
+                    }
+                }
+                for s in slot.iter_mut() {
+                    if *s != 0 {
+                        k += 1;
+                        *s = 0;
+                    }
+                }
+            }
+            kept.fetch_add(k, Ordering::Relaxed);
+        });
+        let t_place = tq.elapsed().as_secs_f64() * 1e3;
+        eprintln!("dense16 round {}: parse events {:.1} ms | placement+dedup {:.1} ms | kept {}", round, t_parse, t_place, kept.load(Ordering::Relaxed));
+        std::mem::forget(parts);
+        crate::sys::release_from(keep);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[inline(never)]
+unsafe fn task16_avx2(b: &[u8], task: Task, ctx: &Ctx, ke: u64, bound: u64, p: &mut Parts<DRec16>, safe_end: usize) {
+    task16_x::<true>(b, task, ctx, ke, bound, p, safe_end)
+}
+
+fn task16_any(b: &[u8], task: Task, ctx: &Ctx, ke: u64, bound: u64, p: &mut Parts<DRec16>, safe_end: usize) {
+    if ctx.avx2 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            return task16_avx2(b, task, ctx, ke, bound, p, safe_end);
+        }
+    }
+    task16_x::<false>(b, task, ctx, ke, bound, p, safe_end)
+}
+
+#[inline(always)]
+fn task16_x<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, ke: u64, bound: u64, p: &mut Parts<DRec16>, safe_end: usize) {
+    let pp: *mut Parts<DRec16> = p;
+    let line = |f: &[&[u8]; 7]| {
+        if f[0].is_empty() {
+            return;
+        }
+        let (ws, we) = (ctx.ws, ctx.we);
+        let Some(ing) = ctx.tsp.parse(f[3]) else { return };
+        let n = match decode36(f[0], b'e') {
+            Some(v) => unscramble(v, ke),
+            None => u64::MAX,
+        };
+        if n >= bound {
+            return;
+        }
+        let ingest = ingest_rel(ing, ctx.ws_s);
+        let mut r = DRec16 { n: n as u32, ingest, ts: 0, aux: 0 };
+        'v: {
+            if f[1].is_empty() || f[5].is_empty() {
+                break 'v;
+            }
+            let Some(t) = ctx.tsp.parse(f[2]) else { break 'v };
+            if t < ws || t >= we {
+                break 'v;
+            }
+            let Some(pay) = super::event_pay(f[4], || f[6], f[5], ctx, true) else { break 'v };
+            if ing - t > LATE {
+                break 'v;
+            }
+            let u = unsafe { keys::key_of_wide(f[1]) };
+            r.ts = (t - ws) as u32 | (1 << 31);
+            r.aux = (u as u32) ^ pay;
+        }
+        unsafe { (*pp).push((n >> BSHIFT) as usize, r) };
+    };
+    let lp = &line;
+    crate::fastev::for_each_line2::<AVX2, _, _>(b, task.start, task.end, safe_end, |f| lp(f), |from, to| {
+        scan::for_each_record_x::<7, _, AVX2>(b, from, to, |f| lp(f));
+    });
+}
+
 /// Sample canonical (event, user) values from the first lines of the files.
 fn sample(ev: &Input) -> (Vec<u64>, Vec<u64>) {
     let (mut e, mut u) = (Vec::new(), Vec::new());
@@ -182,6 +316,9 @@ pub fn bench(links_in: &Input, ev: &Input, ctx: &Ctx) {
     let t_ukey = t1.elapsed().as_secs_f64() * 1e3;
     eprintln!("dense: event key {:?} in {:.1} ms, user key {:?} in {:.1} ms (bound {}, samples {}/{})", ke.map(|k| format!("{:x}", k)), t_key, ku.map(|k| format!("{:x}", k)), t_ukey, bound, es.len(), us.len());
     let Some(ke) = ke else { return };
+    if std::env::var("SS_DENSEBENCH").map_or(false, |v| v == "16") {
+        return bench16(ev, ctx, ke, bound);
+    }
     let lb = super::LocBits::new(ctx.threads, ctx.ps_bits).unwrap();
     let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
     let tl = Instant::now();
