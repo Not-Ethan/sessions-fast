@@ -341,6 +341,7 @@ pub(crate) struct EvOut {
 /// threads' campaign accumulators. `d` from `decide`.
 pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &Path, marks: &mut super::Marks) -> Vec<Out2> {
     let threads = ctx.threads;
+    let release = std::env::var("SS_NORELEASE").is_err();
     let xm = Xmap::new();
     // 1. links (the general code), then slot -> root slot (stored + 1; 0 =
     // the slot is its own person)
@@ -371,6 +372,11 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             let b = ev.maps[task.file as usize].bytes();
             let safe_end = b.as_ptr() as usize + b.len();
             ev_task_any(b, task, ctx, &d, &xm, &mut o, safe_end);
+            if release {
+                // parsed: drop the chunk's page mappings now, in parallel,
+                // instead of in the single-threaded exit (as main.rs)
+                crate::sys::release_inner(b.as_ptr() as usize + task.start, b.as_ptr() as usize + task.end);
+            }
         }
         o.de.finish();
         o.dp.finish();
@@ -392,6 +398,9 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             let b = cl.maps[task.file as usize].bytes();
             let safe_end = b.as_ptr() as usize + b.len();
             cl_task_any(b, task, ctx, &d, &xm, &mut v, nbc, safe_end);
+            if release {
+                crate::sys::release_inner(b.as_ptr() as usize + task.start, b.as_ptr() as usize + task.end);
+            }
         }
         v.finish();
         v
@@ -796,6 +805,24 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     let est_rows = est / threads / 4 + 4096;
     let nextb = AtomicUsize::new(0);
     let nextg = AtomicUsize::new(0);
+    // Arenas that exist now (link table, parse outputs, kept events, clicks,
+    // root and run tables) are dead after the persons loop: released in
+    // parallel pieces then (as sess::sessions2) instead of in the exit.
+    // Arenas allocated from here on (output buffers) are not in the list.
+    let keepmem = std::env::var("SS_KEEPMEM").is_ok();
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    if !keepmem {
+        for (a, l) in crate::sys::arenas() {
+            let mut o = 0;
+            while o < l {
+                let n = (l - o).min(32 << 20);
+                pieces.push((a + o, n));
+                o += n;
+            }
+        }
+    }
+    let bar = std::sync::Barrier::new(threads);
+    let next_piece = AtomicUsize::new(0);
     let outs = super::par(threads, |t| {
         let mut st = PersonSess::new(ctx, est_rows);
         let mut es: Vec<SRec> = Vec::new();
@@ -880,6 +907,14 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                     finish_person(p as u32, &k[i..j], &mut st, false);
                 }
                 i = j;
+            }
+        }
+        if !keepmem {
+            bar.wait();
+            loop {
+                let i = next_piece.fetch_add(1, Ordering::Relaxed);
+                let Some(&(a, l)) = pieces.get(i) else { break };
+                crate::sys::release(a, l);
             }
         }
         st.finish(ud, t)

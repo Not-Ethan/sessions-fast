@@ -11,6 +11,8 @@ mod dense;
 mod densep;
 mod fastev;
 mod k3;
+#[cfg(test)]
+mod k3test;
 mod sess;
 mod scan;
 mod sys;
@@ -2512,8 +2514,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         dense::bench(&links_in, &events_in, &ctx);
         std::process::exit(0);
     }
-    // k3 kernels in the dense pipeline (SS_K3=1); SS_K3CHECK / SS_K3BENCH
-    k3::ON.store(std::env::var("SS_K3").map_or(false, |v| v == "1"), Ordering::Relaxed);
+    // k3 kernels in the dense pipeline (default on, AVX2 path only; SS_K3=0
+    // = densep's own kernels); SS_K3CHECK / SS_K3BENCH
+    k3::ON.store(std::env::var("SS_K3").map_or(true, |v| v != "0"), Ordering::Relaxed);
     if let Ok(what) = std::env::var("SS_K3CHECK") {
         k3::check(&what, &events_in, &clicks_in, &ctx);
         std::process::exit(0);

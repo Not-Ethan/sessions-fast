@@ -34,7 +34,9 @@ use super::{Ctx, DAY, LATE, WEEK};
 use crate::dense::{M1, M2, MASK};
 use crate::scan;
 
-/// SS_K3: the dense pipeline uses these kernels (densep.rs hooks).
+/// The dense pipeline uses these kernels (densep.rs hooks); on unless
+/// SS_K3=0 (set in main::run; false here so that tests and checks start
+/// from densep's own kernels).
 pub static ON: AtomicBool = AtomicBool::new(false);
 
 const M1I: u64 = crate::dense::M1I;
