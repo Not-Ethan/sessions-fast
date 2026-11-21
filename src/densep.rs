@@ -86,6 +86,18 @@ fn base36(out: &mut Vec<u8>, mut v: u64) {
     out.extend_from_slice(&buf[at..]);
 }
 
+/// Diagnostics for SS_VERBOSE: "key=value" pairs.
+static STATS: Mutex<String> = Mutex::new(String::new());
+
+fn stat(k: &str, v: impl std::fmt::Display) {
+    let mut s = STATS.lock().unwrap();
+    s.push_str(&format!("{}={} ", k, v));
+}
+
+pub fn stats() -> String {
+    STATS.lock().unwrap().clone()
+}
+
 /// Decides between the dense and the general pipeline before any heavy
 /// work: None = general.
 pub fn decide(ev: &Input, ctx: &Ctx) -> Option<Dense> {
@@ -138,6 +150,9 @@ pub fn decide(ev: &Input, ctx: &Ctx) -> Option<Dense> {
     if !force && (lines < 64 || bad * 20 > lines) {
         return None;
     }
+    stat("d_bound", bound);
+    stat("d_pmax", pmax);
+    stat("d_sample_lines", lines);
     Some(Dense { ke, ku, bound, pmax })
 }
 
@@ -330,6 +345,11 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     marks.mark("d.clicks");
     // 4. exceptional slots' roots, the person table
     let xkeys = xm.key_table();
+    stat("d_xslots", xkeys.len());
+    stat("d_xevents", evo.iter().map(|o| o.xe.len()).sum::<usize>());
+    stat("d_copies", evo.iter().map(|o| (0..nb).map(|b| o.de.len(b)).sum::<usize>()).sum::<usize>());
+    stat("d_clicks", clo.iter().map(|o| (0..nbc).map(|b| o.len(b)).sum::<usize>()).sum::<usize>());
+    stat("d_nb", nb);
     let nx = xkeys.len();
     let np = xbase + nx;
     let mut px: Vec<u32> = (0..nx as u32).map(|i| d.xbase() + i).collect();
@@ -492,11 +512,13 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     // then per bucket a counting sort by person & 0xFFFF; clicks are kept as
     // Cl with person = the person slot
     let nbp = (np >> 16) + 1;
+    let nforeign = AtomicUsize::new(0);
     let cl2: Vec<Parts<Cl>> = {
         let nextc = AtomicUsize::new(0);
         let capb = estc / (threads * nbp) * 5 / 4 + 64;
         super::par(threads, |_| {
             let mut out: Parts<Cl> = Parts::with_wc(nbp, capb, false);
+            let mut nfor = 0usize;
             loop {
                 let ci = nextc.fetch_add(1, Ordering::Relaxed);
                 if ci >= nbc {
@@ -506,15 +528,19 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                     for sl in o.get(ci) {
                         for c in sl.iter() {
                             let p = person(c.us);
+                            nfor += ((p >> 16) as usize != ci) as usize;
                             out.push((p >> 16) as usize, Cl { person: p as u64, ck: c.ck, ts: c.ts, camp: c.camp });
                         }
                     }
                 }
             }
+            nforeign.fetch_add(nfor, Ordering::Relaxed);
             out
         })
     };
     marks.mark("d.group1");
+    stat("d_foreign_clicks", nforeign.load(Ordering::Relaxed));
+    stat("d_multi_persons_xwin", xwin.len());
     let mut coff = vec![0usize; nbp + 1];
     for pb in 0..nbp {
         coff[pb + 1] = coff[pb] + cl2.iter().map(|o| o.len(pb)).sum::<usize>();
@@ -621,6 +647,9 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
         }
     }
     gr.sort_unstable_by(|a, b| b.cmp(a));
+    stat("d_groups", gr.len());
+    stat("d_group_runs", mv.len());
+    stat("d_kept", boff.len().min(1) * (0..nb).map(|b| klen[b].load(Ordering::Relaxed)).sum::<usize>());
     marks.mark("d.runs");
     // 10. persons: the gathered ones first (largest first), then every
     // single-run person from the buckets
