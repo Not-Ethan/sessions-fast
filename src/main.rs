@@ -581,10 +581,6 @@ fn event_line<'a, const WIDE: bool, S: EvSink, F: scan::Fields<'a>>(f: &F, f0: &
             unsafe { ctx.tsp.parse_hyb(f2) }
         } else if WIDE && ctx.tsw {
             unsafe { ctx.tsp.parse_wide(f2) }
-        } else if WIDE {
-            // the event time's form is unpredictable line to line: F1/F3
-            // selected without a branch (32 readable bytes from the field)
-            unsafe { ctx.tsp.parse_sel(f2) }
         } else {
             ctx.tsp.parse(f2)
         };
