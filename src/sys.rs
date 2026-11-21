@@ -110,6 +110,19 @@ pub fn rusage() -> (f64, f64, i64, i64, i64, i64) {
     (ms(ru[0], ru[1]), ms(ru[2], ru[3]), ru[8], ru[9], ru[16], ru[17])
 }
 
+/// "anon=..MB thp=..MB" from /proc/self/smaps_rollup (Linux; empty elsewhere).
+pub fn anon_summary() -> String {
+    let Ok(t) = std::fs::read_to_string("/proc/self/smaps_rollup") else { return String::new() };
+    let kb = |key: &str| -> u64 {
+        t.lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    format!("anon={}MB thp={}MB file_rss={}MB", kb("Anonymous:") >> 10, kb("AnonHugePages:") >> 10, (kb("Rss:").saturating_sub(kb("Anonymous:"))) >> 10)
+}
+
 /// Peak resident set size of the process, in MB.
 pub fn peak_rss_mb() -> u64 {
     let mut ru = [0i64; 18];
@@ -167,6 +180,20 @@ pub fn release_all() {
     for (a, l) in v {
         unsafe {
             munmap(a as *mut c_void, l);
+        }
+    }
+}
+
+/// Unmaps the arenas allocated after the first `keep` (benchmarks).
+pub fn release_from(keep: usize) {
+    let mut g = ARENAS.lock().unwrap();
+    if g.len() > keep {
+        let tail: Vec<(usize, usize)> = g.drain(keep..).collect();
+        drop(g);
+        for (a, l) in tail {
+            unsafe {
+                munmap(a as *mut c_void, l);
+            }
         }
     }
 }

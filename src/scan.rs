@@ -133,10 +133,183 @@ pub fn for_each_record<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u
     for_each_record_x::<N, F, false>(buf, start, end, f)
 }
 
+/// Experiment switch (SS_SCAN1): use the previous scanner.
+pub static USE_V1: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// `for_each_record`, with AVX2 masks when `AVX2` (the caller must run with
 /// AVX2 enabled, e.g. inside a `#[target_feature(enable = "avx2")]` function).
 #[inline(always)]
 pub fn for_each_record_x<'a, const N: usize, F: FnMut(&[&'a [u8]; N]), const AVX2: bool>(
+    buf: &'a [u8],
+    start: usize,
+    end: usize,
+    f: F,
+) {
+    if USE_V1.load(std::sync::atomic::Ordering::Relaxed) {
+        for_each_record_x_v1::<N, F, AVX2>(buf, start, end, f)
+    } else {
+        for_each_record_x_v2::<N, F, AVX2>(buf, start, end, f)
+    }
+}
+
+/// Inclusive prefix XOR of the bits of x (bit i = parity of bits 0..=i).
+#[inline(always)]
+fn prefix_xor(mut x: u64) -> u64 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x
+}
+
+/// Scanner, version 2: delimiters and newlines are flattened as in v1, but
+/// quote validity is decided per 64-byte block with masks instead of per
+/// field. A line is well-formed iff it has N fields, every quote in it is
+/// the first or the last byte of a field, and every field holds an even
+/// number of quotes (equivalently: the quote parity counted from the line
+/// start is 0 at every delimiter). This is the same rule as v1's "a quoted
+/// field is >= 2 bytes and ends with a quote, and the line holds exactly 2
+/// quotes per quoted field": under either rule each field holds 0 quotes or
+/// exactly 2, at its first and last byte. Blocks get a violation mask; lines
+/// touching no violation (almost all) need no per-field quote check, and a
+/// field is unquoted by `start += q; end -= q` from its first byte.
+#[inline(always)]
+pub fn for_each_record_x_v2<'a, const N: usize, F: FnMut(&[&'a [u8]; N]), const AVX2: bool>(
+    buf: &'a [u8],
+    start: usize,
+    end: usize,
+    mut f: F,
+) {
+    assert!(end <= buf.len() && end - start < (u32::MAX as usize) - 8192);
+    const WBLK: usize = 64;
+    const WIN: usize = WBLK * 64;
+    let r = &buf[start..];
+    let rlen = end - start;
+    let mut dl = [0u32; WIN + 96];
+    let mut nlp = [0u32; WIN + 16];
+    let mut dmask = [0u64; WBLK];
+    let mut nmask = [0u64; WBLK];
+    let mut qmask = [0u64; WBLK];
+    let mut vmask = [0u64; WBLK];
+    let mut carry = 0usize;
+    let mut ls: usize = 0; // current line start (relative)
+    // block-to-block state
+    let mut d_prev = 1u64; // delimiter at the position before the block (start: a line start)
+    let mut par = 0u64; // quote parity since the last newline, before the block
+    let mut v_open = false; // the unfinished line at the window start had a violation
+    let mut w = 0usize;
+    while w < rlen {
+        let wend = (w + WIN).min(rlen);
+        let nblk = (wend - w).div_ceil(64);
+        let mut nd = carry;
+        let mut nn = 0usize;
+        for b in 0..nblk {
+            let p = w + 64 * b;
+            let (cm, nl, qm) = masks::<AVX2>(buf, start + p, start + wend);
+            dmask[b] = cm | nl;
+            nmask[b] = nl;
+            qmask[b] = qm;
+            flatten8(&mut dl, &mut nd, cm | nl, p as u32);
+            flatten4(&mut nlp, &mut nn, nl, p as u32);
+        }
+        // delimiter at the first byte after the window (end of the task: none;
+        // a quote there is handled by the final-line path)
+        let d_next = if wend < rlen { matches!(r[wend], b',' | b'\n') as u64 } else { 0 };
+        let mut any_v = 0u64;
+        for b in 0..nblk {
+            let d = dmask[b];
+            let q = qmask[b];
+            let fs = (d << 1) | d_prev; // first byte of a field
+            let dn = if b + 1 < nblk { dmask[b + 1] & 1 } else { d_next };
+            let fl = (d >> 1) | (dn << 63); // last byte of a field
+            let outside = q & !(fs | fl);
+            let mut px = prefix_xor(q) ^ 0u64.wrapping_sub(par);
+            let mut nm = nmask[b];
+            while nm != 0 {
+                let j = nm.trailing_zeros();
+                let pj = (px >> j) & 1;
+                let above = if j == 63 { 0 } else { !0u64 << (j + 1) };
+                px ^= 0u64.wrapping_sub(pj) & above;
+                nm &= nm - 1;
+            }
+            let v = outside | (px & d);
+            vmask[b] = v;
+            any_v |= v;
+            par = if (nmask[b] >> 63) & 1 == 1 { 0 } else { px >> 63 };
+            d_prev = d >> 63;
+        }
+        let mut k = 0usize;
+        for &le in &nlp[..nn] {
+            let le = le as usize;
+            if k + N <= nd && dl[k + N - 1] as usize == le {
+                let bad = (ls < w && v_open) || (any_v != 0 && has_v(&vmask, w, ls.max(w), le + 1));
+                if !bad {
+                    line_v2::<N, F>(r, ls, &dl[k..k + N], &mut f);
+                }
+                k += N;
+            } else {
+                while dl[k] as usize != le {
+                    k += 1;
+                }
+                k += 1;
+            }
+            ls = le + 1;
+        }
+        // the unfinished line (from ls) carries any violation into the next window
+        v_open = (ls < w && v_open) || (any_v != 0 && ls < wend && has_v(&vmask, w, ls.max(w), wend));
+        let keep = (nd - k).min(N + 1);
+        dl.copy_within(k..k + keep, 0);
+        carry = keep;
+        w = wend;
+    }
+    if rlen > 0 && end == buf.len() && buf[end - 1] != b'\n' && carry + 1 == N {
+        // final line without '\n': its N-1 commas are carried; the end closes it
+        let qline = r[ls..rlen].iter().filter(|&&c| c == b'"').count() as u64;
+        line_safe::<N, F>(r, rlen, ls, &dl[..N - 1], qline, &mut f);
+    }
+}
+
+/// Any violation bit at positions [from, to) (relative to the scan start),
+/// for a window starting at w.
+#[cold]
+#[inline(never)]
+fn has_v(vmask: &[u64], w: usize, from: usize, to: usize) -> bool {
+    let mut pos = from;
+    while pos < to {
+        let off = pos - w;
+        let b = off >> 6;
+        let lo = off & 63;
+        let hi = (to - w - 64 * b).min(64);
+        let m = if hi - lo == 64 { !0u64 } else { ((1u64 << (hi - lo)) - 1) << lo };
+        if vmask[b] & m != 0 {
+            return true;
+        }
+        pos = w + 64 * (b + 1);
+    }
+    false
+}
+
+/// One well-formed line (quote rule already checked by masks): unquote each
+/// field from its first byte.
+#[inline(always)]
+fn line_v2<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(r: &'a [u8], ls: usize, d: &[u32], f: &mut F) {
+    let mut fs: [&'a [u8]; N] = [&[]; N];
+    let mut s = ls;
+    let p = r.as_ptr();
+    for j in 0..N {
+        let e = d[j] as usize;
+        let q = (unsafe { *p.add(s) } == b'"') as usize;
+        fs[j] = unsafe { std::slice::from_raw_parts(p.add(s + q), e - s - 2 * q) };
+        s = e + 1;
+    }
+    f(&fs);
+}
+
+/// Scanner, version 1 (per-field quote checks).
+#[inline(always)]
+pub fn for_each_record_x_v1<'a, const N: usize, F: FnMut(&[&'a [u8]; N]), const AVX2: bool>(
     buf: &'a [u8],
     start: usize,
     end: usize,
@@ -452,6 +625,127 @@ mod tests {
                 s0 = e;
             }
             assert_eq!(got, want);
+        }
+    }
+
+    fn collect_x<const N: usize, const V2: bool>(t: &[u8], s0: usize, e: usize, out: &mut Vec<Vec<Vec<u8>>>) {
+        let push = |f: &[&[u8]; N]| out.push(f.iter().map(|s| s.to_vec()).collect());
+        if V2 {
+            for_each_record_x_v2::<N, _, false>(t, s0, e, push)
+        } else {
+            for_each_record_x_v1::<N, _, false>(t, s0, e, push)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    unsafe fn collect_avx2<const N: usize>(t: &[u8], s0: usize, e: usize, out: &mut Vec<Vec<Vec<u8>>>) {
+        for_each_record_x_v2::<N, _, true>(t, s0, e, |f: &[&[u8]; N]| out.push(f.iter().map(|s| s.to_vec()).collect()))
+    }
+
+    /// v2 agrees with v1 and with the naive splitter on adversarial quote /
+    /// newline / comma soup, whole and split into random line-aligned chunks,
+    /// with windows crossed by long lines; scalar and (if present) AVX2 masks.
+    #[test]
+    fn v2_matches_v1_and_naive() {
+        let mut x: u64 = 0x5CA9_0000_0000_0001;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("bmi2");
+        for round in 0..40000u64 {
+            let mut t = Vec::new();
+            let mode = round % 5;
+            let lines = 1 + next() % 120;
+            for _ in 0..lines {
+                if mode == 4 && next() % 20 == 0 {
+                    // long line crossing windows
+                    let n = (next() % 9000) as usize;
+                    for _ in 0..n {
+                        t.push(b"z,\"a"[(next() % 4) as usize]);
+                    }
+                } else {
+                    let nf = 1 + next() % 5;
+                    for j in 0..nf {
+                        if j > 0 {
+                            t.push(b',');
+                        }
+                        let fl = (next() % 12) as usize;
+                        let quoted = next() % 3 == 0;
+                        if quoted {
+                            t.push(b'"');
+                        }
+                        for _ in 0..fl {
+                            let c = match mode {
+                                0 => b"ab\"1 "[(next() % 5) as usize],
+                                1 => b"xy"[(next() % 2) as usize],
+                                _ => b"q\"\"r,"[(next() % 5) as usize],
+                            };
+                            t.push(c);
+                        }
+                        if quoted && next() % 7 != 0 {
+                            t.push(b'"');
+                        }
+                    }
+                }
+                if next() % 13 != 0 || mode != 3 {
+                    t.push(b'\n');
+                }
+            }
+            if next() % 3 == 0 {
+                t.pop();
+            }
+            for nfields in [2usize, 3, 4] {
+                let want = match nfields {
+                    2 => naive::<2>(&t),
+                    3 => naive::<3>(&t),
+                    _ => naive::<4>(&t),
+                };
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                match nfields {
+                    2 => {
+                        collect_x::<2, true>(&t, 0, t.len(), &mut a);
+                        collect_x::<2, false>(&t, 0, t.len(), &mut b);
+                    }
+                    3 => {
+                        collect_x::<3, true>(&t, 0, t.len(), &mut a);
+                        collect_x::<3, false>(&t, 0, t.len(), &mut b);
+                    }
+                    _ => {
+                        collect_x::<4, true>(&t, 0, t.len(), &mut a);
+                        collect_x::<4, false>(&t, 0, t.len(), &mut b);
+                    }
+                }
+                assert_eq!(a, want, "v2 vs naive N={} {:?}", nfields, String::from_utf8_lossy(&t));
+                assert_eq!(b, want, "v1 vs naive N={}", nfields);
+                #[cfg(target_arch = "x86_64")]
+                if avx2 {
+                    let mut c = Vec::new();
+                    unsafe {
+                        match nfields {
+                            2 => collect_avx2::<2>(&t, 0, t.len(), &mut c),
+                            3 => collect_avx2::<3>(&t, 0, t.len(), &mut c),
+                            _ => collect_avx2::<4>(&t, 0, t.len(), &mut c),
+                        }
+                    }
+                    assert_eq!(c, want, "v2 avx2 vs naive N={}", nfields);
+                }
+            }
+            // chunked
+            let want = naive::<3>(&t);
+            let mut got = Vec::new();
+            let mut s0 = 0;
+            while s0 < t.len() {
+                let nominal = s0 + 1 + (next() % 3000) as usize;
+                let e = if nominal >= t.len() { t.len() } else { next_line_start(&t, nominal - 1) };
+                collect_x::<3, true>(&t, s0, e, &mut got);
+                s0 = e;
+            }
+            assert_eq!(got, want, "v2 chunked");
         }
     }
 

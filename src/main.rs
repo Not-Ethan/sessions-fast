@@ -1773,6 +1773,7 @@ fn main() {
 /// The whole pipeline on one dataset. Returns the verbose report line.
 fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String {
     sys::NOHUGE.store(std::env::var("SS_NOHUGE").is_ok(), Ordering::Relaxed);
+    scan::USE_V1.store(std::env::var("SS_SCAN1").is_ok(), Ordering::Relaxed);
     LINKS_US.store(0, Ordering::Relaxed);
     let mut marks = Marks::new(verbose);
 
@@ -1862,6 +1863,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         threads,
     };
     marks.mark("setup");
+    if std::env::var("SS_DECOMP").is_ok() {
+        decomp_bench(&events_in, &links_in, &ctx);
+        std::process::exit(0);
+    }
     if std::env::var("SS_FLOOR").is_ok() {
         floor_bench(&events_in, &ctx);
         std::process::exit(0);
@@ -1955,7 +1960,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     if verbose {
         let rows: usize = souts.iter().map(|s| s.nrows).sum();
         return format!(
-            "sessions: {} | pipeline={} links={:.1}ms threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB",
+            "sessions: {} | pipeline={} links={:.1}ms threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB {}",
             marks.report(),
             pipeline,
             LINKS_US.load(Ordering::Relaxed) as f64 / 1e3,
@@ -1965,7 +1970,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
             ps_bits,
             rows,
             keys::any_fallback(),
-            sys::peak_rss_mb()
+            sys::peak_rss_mb(),
+            sys::anon_summary()
         );
     }
     String::new()
@@ -2276,6 +2282,132 @@ fn floor_bench(ev: &Input, ctx: &Ctx) {
             );
         }
     }
+}
+
+
+// ---------------------------------------------------------------- parse decomposition
+// SS_DECOMP=1: cumulative event-parse stages, single thread and NCPU threads,
+// thread-time per event line (each stage includes everything before it).
+
+#[inline(always)]
+fn decomp_task<const AVX2: bool>(stage: u32, b: &[u8], task: Task, ctx: &Ctx, sink: &mut BSink) -> u64 {
+    let mut acc = 0u64;
+    let end = b.as_ptr() as usize + b.len();
+    match stage {
+        // split only
+        0 => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| acc += f[3].len() as u64),
+        // + event id, + user id, + ts, + ingest
+        1..=4 => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
+            if f[6].as_ptr() as usize + 32 > end || f[0].is_empty() || f[1].is_empty() {
+                return;
+            }
+            acc = acc.wrapping_add(keys::mix(unsafe { keys::key_of_wide(f[0]) }));
+            if stage >= 2 {
+                acc = acc.wrapping_add(unsafe { keys::key_of_wide(f[1]) });
+            }
+            if stage >= 3 {
+                acc = acc.wrapping_add(ctx.tsp.parse(f[2]).unwrap_or(0) as u64);
+            }
+            if stage >= 4 {
+                acc = acc.wrapping_add(ctx.tsp.parse(f[3]).unwrap_or(0) as u64);
+            }
+        }),
+        // + type / product / price / validation (full line logic, null sink)
+        5 => {
+            let mut ns = NullSink(0);
+            event_task::<AVX2, _>(b, task, ctx, &mut ns, end);
+            acc = ns.0;
+        }
+        // + record scatter (dedup + session records, no person lookup), + lookup
+        _ => {
+            event_task::<AVX2, _>(b, task, ctx, sink, end);
+            sink.flush();
+        }
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn decomp_task_avx2(stage: u32, b: &[u8], task: Task, ctx: &Ctx, sink: &mut BSink) -> u64 {
+    decomp_task::<true>(stage, b, task, ctx, sink)
+}
+
+fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
+    let mut lines = 0usize;
+    for t in &ev.tasks {
+        let b = ev.maps[t.file as usize].bytes();
+        lines += b[t.start..t.end].iter().filter(|&&c| c == b'\n').count();
+    }
+    let lb = LocBits::new(ctx.threads, ctx.ps_bits).unwrap();
+    let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
+    let (lt, _) = parse_b(links_in, &empty, &empty, ctx, lb);
+    let keep = sys::arenas().len();
+    let pe = 1usize << ctx.pe_bits;
+    let ps = 1usize << ctx.ps_bits;
+    let est = ev.bytes / 72 + 1;
+    let names = ["split", "+event_id", "+user_id", "+ts", "+ingest", "+type/product/price/valid", "+scatter(no lookup)", "+person lookup"];
+    for stage in 0..8u32 {
+        for &nt in &[1usize, ctx.threads] {
+            let mut best = (f64::MAX, 0f64);
+            for _ in 0..3 {
+                let next = AtomicUsize::new(0);
+                PHASE_CPU_NS.store(0, Ordering::Relaxed);
+                let t = Instant::now();
+                let accs = par(nt, |ti| {
+                    let mut sink = BSink {
+                        a: Parts::with_wc(pe, est / (nt * pe) * 5 / 4 + 32, true),
+                        s: Parts::with_wc(ps, est / (nt * ps) * 5 / 4 + 32, true),
+                        ring: [Pending::default(); BRING],
+                        rh: 0,
+                        rn: 0,
+                        tbase: ((ti as u64) << (lb.qbits + lb.ibits)) as u32,
+                        overflow: false,
+                        lt: &lt,
+                        pe_bits: ctx.pe_bits,
+                        ps_bits: ctx.ps_bits,
+                        lb,
+                        nolookup: stage == 6,
+                        cache: PCache::new(),
+                    };
+                    let mut a = 0u64;
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&task) = ev.tasks.get(i) else { break };
+                        let b = ev.maps[task.file as usize].bytes();
+                        a = a.wrapping_add(if ctx.avx2 {
+                            #[cfg(target_arch = "x86_64")]
+                            unsafe {
+                                decomp_task_avx2(stage, b, task, ctx, &mut sink)
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            0
+                        } else {
+                            decomp_task::<false>(stage, b, task, ctx, &mut sink)
+                        });
+                    }
+                    sink.a.finish();
+                    sink.s.finish();
+                    a ^ sink.a.total() as u64
+                });
+                let wall = t.elapsed().as_secs_f64() * 1e3;
+                let cpu = PHASE_CPU_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+                std::hint::black_box(accs);
+                sys::release_from(keep);
+                if wall < best.0 {
+                    best = (wall, cpu);
+                }
+            }
+            eprintln!(
+                "decomp {:28} threads={} wall={:7.1}ms thread-time/line={:6.1}ns",
+                names[stage as usize],
+                nt,
+                best.0,
+                best.1 * 1e6 / lines as f64
+            );
+        }
+    }
+    eprintln!("decomp: {} event lines, {} MB", lines, ev.bytes >> 20);
 }
 
 /// Null sink for the stage benchmark.
