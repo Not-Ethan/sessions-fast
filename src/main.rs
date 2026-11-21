@@ -418,7 +418,7 @@ fn link_worker(
         let v = pairs[t].lock().unwrap();
         let mut alloc = links::DenseAlloc::new();
         let mut dv: Vec<(u32, u32)> = Vec::with_capacity(v.len());
-        const AHEAD: usize = 8;
+        const AHEAD: usize = const_usize(option_env!("SS_LINKAHEAD"), 8);
         for k in 0..v.len() {
             if k + AHEAD < v.len() {
                 lt.prefetch(v[k + AHEAD].0);
@@ -1178,8 +1178,10 @@ impl BSink<'_> {
     }
 }
 
-const BULK_CAP: usize = 48;
-const BULK_RUN: usize = 32;
+/// Bulk queue: resolve BULK_RUN copies whenever BULK_CAP are queued (build-
+/// time overrides SS_BULKCAP / SS_BULKRUN for experiments).
+const BULK_CAP: usize = const_usize(option_env!("SS_BULKCAP"), 48);
+const BULK_RUN: usize = const_usize(option_env!("SS_BULKRUN"), 32);
 
 impl EvSink for BSink<'_> {
     #[inline(always)]
