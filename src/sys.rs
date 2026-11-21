@@ -224,3 +224,58 @@ pub fn release(addr: usize, len: usize) {
         madvise(a as *mut c_void, len + (addr - a), 4);
     }
 }
+
+
+// ---------------------------------------------------------------- CPU pinning (benchmarks)
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+}
+
+/// Pins the calling thread to one CPU (Linux; false elsewhere or on error).
+pub fn pin_to(cpu: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let mut mask = [0u64; 16];
+        if cpu >= 1024 {
+            return false;
+        }
+        mask[cpu / 64] |= 1u64 << (cpu % 64);
+        unsafe { sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr()) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cpu;
+        false
+    }
+}
+
+/// Hyperthread sibling pairs among CPUs 0..n from sysfs, or None unless
+/// every CPU has exactly one sibling in that range.
+pub fn sibling_pairs(n: usize) -> Option<Vec<(usize, usize)>> {
+    let mut pairs = Vec::new();
+    let mut seen = vec![false; n];
+    for c in 0..n {
+        let txt = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list", c)).ok()?;
+        let mut cpus = Vec::new();
+        for part in txt.trim().split(',') {
+            if let Some((a, b)) = part.split_once('-') {
+                let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
+                cpus.extend(a..=b);
+            } else {
+                cpus.push(part.parse().ok()?);
+            }
+        }
+        if cpus.len() != 2 || !cpus.contains(&c) || cpus.iter().any(|&x| x >= n) {
+            return None;
+        }
+        let (a, b) = (cpus[0].min(cpus[1]), cpus[0].max(cpus[1]));
+        if !seen[a] {
+            seen[a] = true;
+            seen[b] = true;
+            pairs.push((a, b));
+        }
+    }
+    Some(pairs)
+}

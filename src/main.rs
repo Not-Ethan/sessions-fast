@@ -2245,6 +2245,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         floor_bench(&events_in, &ctx);
         std::process::exit(0);
     }
+    if std::env::var("SS_PAIR").is_ok() {
+        pair_bench(&events_in, &links_in, &ctx);
+        std::process::exit(0);
+    }
     if let Ok(stage) = std::env::var("SS_BENCH") {
         for st in stage.split(',') {
             bench_stages(st, &events_in, &links_in, &ctx);
@@ -2809,6 +2813,271 @@ fn event_task_batched<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &C
         }
     });
     acc.wrapping_add(ev_batch_flush(bt, base, ctx, sink, upto))
+}
+
+// ---------------------------------------------------------------- hyperthread pairing feasibility
+//
+// SS_PAIR=1: is a split pipeline worth building, with one hyperthread of each
+// core decoding lines (split + decode + validate) and its sibling doing the
+// output side (user hash, link lookup, both scatters)? Workers run pinned
+// for a fixed time (SS_PAIR_MS, default 2000) and count the items they
+// finish. Decoders loop over the event tasks and store each decoded copy in
+// a small private ring (the producer side of a handoff); sinks loop over
+// copies decoded beforehand, through the production BSink.
+
+#[derive(Clone, Copy, Default)]
+struct Dec {
+    eid: u64,
+    user: u64,
+    ingest: u32,
+    ts: u32,
+    pay: u32,
+    ok: u32,
+}
+
+struct DecVec(Vec<Dec>);
+impl EvSink for DecVec {
+    #[inline(always)]
+    fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>) {
+        let d = match valid {
+            Some((user, ts, pay)) => Dec { eid, user, ingest, ts, pay, ok: 1 },
+            None => Dec { eid, ingest, ..Dec::default() },
+        };
+        self.0.push(d);
+    }
+}
+
+const PRING: usize = 512;
+struct RingOnly<'a> {
+    r: Box<[Dec; PRING]>,
+    i: usize,
+    /// progress published to a paced sink (every 64 copies)
+    prog: Option<&'a AtomicU64>,
+}
+impl EvSink for RingOnly<'_> {
+    #[inline(always)]
+    fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>) {
+        let d = match valid {
+            Some((user, ts, pay)) => Dec { eid, user, ingest, ts, pay, ok: 1 },
+            None => Dec { eid, ingest, ..Dec::default() },
+        };
+        unsafe { *self.r.get_unchecked_mut(self.i & (PRING - 1)) = d };
+        self.i += 1;
+        if self.i % 64 == 0 {
+            if let Some(p) = self.prog {
+                p.store(self.i as u64, Ordering::Release);
+            }
+        }
+    }
+}
+
+fn ev_task_any<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S) {
+    let end = b.as_ptr() as usize + b.len();
+    if ctx.avx2 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            event_task_avx2(b, task, ctx, sink, end)
+        }
+    } else {
+        event_task::<false, _>(b, task, ctx, sink, end)
+    }
+}
+
+fn pair_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
+    let ncpu = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let Some(pairs) = sys::sibling_pairs(ncpu) else {
+        eprintln!("pair: topology is not hyperthread pairs over {} CPUs; nothing to measure", ncpu);
+        return;
+    };
+    let ms = env_usize("SS_PAIR_MS").unwrap_or(2000) as u64;
+    eprintln!("pair: sibling pairs {:?}, {} ms per configuration", pairs, ms);
+    let lb = LocBits::new(ctx.threads, ctx.ps_bits).unwrap();
+    let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
+    let (lt, _) = parse_b(links_in, &empty, &empty, ctx, lb, None);
+    let task_lines: Vec<usize> = ev
+        .tasks
+        .iter()
+        .map(|t| ev.maps[t.file as usize].bytes()[t.start..t.end].iter().filter(|&&c| c == b'\n').count())
+        .collect();
+    let lines: usize = task_lines.iter().sum();
+    // decode everything once (all threads), for the sinks
+    let next = AtomicUsize::new(0);
+    let decs: Vec<Vec<Dec>> = par(ctx.threads, |_| {
+        let mut d = DecVec(Vec::new());
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&task) = ev.tasks.get(i) else { break };
+            ev_task_any(ev.maps[task.file as usize].bytes(), task, ctx, &mut d);
+        }
+        d.0
+    });
+    let all: Vec<Dec> = decs.into_iter().flatten().collect();
+    let copies = all.len();
+    eprintln!("pair: {} lines, {} copies decoded ({:.3} copies/line)", lines, copies, copies as f64 / lines as f64);
+    let np = pairs.len();
+    let pe = 1usize << ctx.pe_bits;
+    let ps = 1usize << ctx.ps_bits;
+
+    #[repr(align(128))]
+    struct Prog(AtomicU64);
+    let progs: Vec<Prog> = (0..np).map(|_| Prog(AtomicU64::new(0))).collect();
+    // role per worker: 0 = decode, 1 = sink, 2 = full (decode + sink),
+    // 3 = sink paced by the decoder on its sibling (same pair index)
+    let run = |name: &str, workers: &[(usize, u8)]| {
+        for p in &progs {
+            p.0.store(0, Ordering::Relaxed);
+        }
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let barrier = std::sync::Barrier::new(workers.len() + 1);
+        let res: Vec<(u8, u64, u64)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = workers
+                .iter()
+                .enumerate()
+                .map(|(wi, &(cpu, role))| {
+                    let (stop, barrier, lt, all, task_lines) = (&stop, &barrier, &lt, &all, &task_lines);
+                    let pi = pairs.iter().position(|p| p.0 == cpu || p.1 == cpu).unwrap_or(0);
+                    let prog = &progs[pi].0;
+                    sc.spawn(move || {
+                        sys::pin_to(cpu);
+                        let slice = &all[(wi * copies / workers.len())..((wi + 1) * copies / workers.len())];
+                        let per = (if role == 1 || role == 3 { slice.len() } else { copies / workers.len() }).max(1);
+                        let mut sink = BSink {
+                            a: Parts::with_wc(pe, per / pe * 5 / 4 + 64, true),
+                            s: Parts::with_wc(ps, per / ps * 5 / 4 + 64, true),
+                            ring: [Pending::default(); BRING],
+                            rh: 0,
+                            rn: 0,
+                            use_bulk: std::env::var("SS_RING").is_err(),
+                            bulk: [Pending::default(); BULK_CAP],
+                            bn: 0,
+                            tbase: ((wi as u64) << (lb.qbits + lb.ibits)) as u32,
+                            overflow: false,
+                            lt,
+                            pe_bits: ctx.pe_bits,
+                            ps_bits: ctx.ps_bits,
+                            lb,
+                            nolookup: false,
+                            direct: false,
+                            cache: PCache::new(),
+                            gt: None,
+                            kills: Vec::new(),
+                            fresh: 0,
+                            batch_out: false,
+                        };
+                        let mut ring = RingOnly { r: Box::new([Dec::default(); PRING]), i: 0, prog: Some(prog) };
+                        // warm up: one pass of the sink side faults its arenas in
+                        if role != 0 {
+                            for d in slice.iter().take(per) {
+                                sink.copy(d.eid, d.ingest, if d.ok != 0 { Some((d.user, d.ts, d.pay)) } else { None });
+                            }
+                            sink.flush();
+                            sink.a.reset();
+                            sink.s.reset();
+                        }
+                        barrier.wait();
+                        let c0 = sys::thread_cpu_ns();
+                        let mut items = 0u64;
+                        let mut since_reset = 0usize;
+                        let mut ti = wi * ev.tasks.len() / workers.len();
+                        let mut di = 0usize;
+                        while !stop.load(Ordering::Relaxed) {
+                            if role == 3 {
+                                // wait until the sibling decoder is 512 copies ahead
+                                while items + 512 > prog.load(Ordering::Acquire) {
+                                    if stop.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    std::hint::spin_loop();
+                                }
+                                let n = 512.min(slice.len() - di);
+                                for d in &slice[di..di + n] {
+                                    sink.copy(d.eid, d.ingest, if d.ok != 0 { Some((d.user, d.ts, d.pay)) } else { None });
+                                }
+                                di += n;
+                                items += n as u64;
+                                since_reset += n;
+                                if di == slice.len() {
+                                    di = 0;
+                                }
+                            } else if role == 1 {
+                                let n = 4096.min(slice.len() - di);
+                                for d in &slice[di..di + n] {
+                                    sink.copy(d.eid, d.ingest, if d.ok != 0 { Some((d.user, d.ts, d.pay)) } else { None });
+                                }
+                                di += n;
+                                items += n as u64;
+                                since_reset += n;
+                                if di == slice.len() {
+                                    di = 0;
+                                }
+                            } else {
+                                let task = ev.tasks[ti % ev.tasks.len()];
+                                let b = ev.maps[task.file as usize].bytes();
+                                if role == 0 {
+                                    ev_task_any(b, task, ctx, &mut ring);
+                                } else {
+                                    ev_task_any(b, task, ctx, &mut sink);
+                                    since_reset += task_lines[ti % ev.tasks.len()];
+                                }
+                                items += task_lines[ti % ev.tasks.len()] as u64;
+                                ti += 1;
+                            }
+                            if since_reset + 2 * 4096 > per {
+                                sink.flush();
+                                sink.a.reset();
+                                sink.s.reset();
+                                since_reset = 0;
+                            }
+                        }
+                        let cpu_ns = sys::thread_cpu_ns() - c0;
+                        std::hint::black_box(ring.i);
+                        (role, items, cpu_ns)
+                    })
+                })
+                .collect();
+            barrier.wait();
+            let t0 = Instant::now();
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            stop.store(true, Ordering::Relaxed);
+            let r = hs.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>();
+            let wall = t0.elapsed().as_secs_f64() * 1e9;
+            for role in 0..4u8 {
+                let (n, items, cpu) = r.iter().filter(|x| x.0 == role).fold((0, 0u64, 0u64), |a, x| (a.0 + 1, a.1 + x.1, a.2 + x.2));
+                if n == 0 {
+                    continue;
+                }
+                let rname = ["decode", "sink", "full", "paced"][role as usize];
+                // per item: thread time, and wall time per core (np cores)
+                eprintln!(
+                    "pair {:34} {:6} x{}: {:6.1} thread-ns/item, {:6.1} wall-ns/item/core ({} items)",
+                    name,
+                    rname,
+                    n,
+                    cpu as f64 / items as f64,
+                    wall * np as f64 / items as f64,
+                    items
+                );
+            }
+            r
+        });
+        std::hint::black_box(res);
+    };
+    let a: Vec<usize> = pairs.iter().map(|p| p.0).collect();
+    let b: Vec<usize> = pairs.iter().map(|p| p.1).collect();
+    let one = |cpus: &[usize], role: u8| cpus.iter().map(|&c| (c, role)).collect::<Vec<_>>();
+    let both = |r0: u8, r1: u8| {
+        let mut v = one(&a, r0);
+        v.extend(one(&b, r1));
+        v
+    };
+    run("decode, one HT per core", &one(&a, 0));
+    run("sink, one HT per core", &one(&b, 1));
+    run("decode + sink on siblings", &both(0, 1));
+    run("decode + PACED sink on siblings", &both(0, 3));
+    run("decode on both HTs", &both(0, 0));
+    run("sink on both HTs", &both(1, 1));
+    run("full, one HT per core", &one(&a, 2));
+    run("full on both HTs (today)", &both(2, 2));
 }
 
 // ---------------------------------------------------------------- parse decomposition
