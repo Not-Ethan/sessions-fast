@@ -71,6 +71,57 @@ pub fn decode36(s: &[u8], prefix: u8) -> Option<u64> {
     Some(v)
 }
 
+/// `decode36` for a field with 16 readable bytes from its start: the same
+/// result for every input (SSSE3, part of the x86-64-v2 baseline).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn decode36_wide(s: &[u8], prefix: u8) -> Option<u64> {
+    use std::arch::x86_64::*;
+    let n = s.len();
+    let p = s.as_ptr();
+    if !(2..=9).contains(&n) || *p != prefix || (n > 2 && *p.add(1) == b'0') {
+        return None;
+    }
+    let m = n - 1; // 1..=8 digits
+    let v = _mm_loadl_epi64(p.add(1) as *const __m128i);
+    let c0 = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+    let ca = _mm_sub_epi8(v, _mm_set1_epi8(b'a' as i8));
+    let isd = _mm_cmpeq_epi8(_mm_min_epu8(c0, _mm_set1_epi8(9)), c0);
+    let isl = _mm_cmpeq_epi8(_mm_min_epu8(ca, _mm_set1_epi8(25)), ca);
+    let ok = _mm_movemask_epi8(_mm_or_si128(isd, isl)) as u32;
+    let need = (1u32 << m) - 1;
+    if ok & need != need {
+        return None;
+    }
+    // digit values; lanes >= m become 0 after the shift below
+    let d = _mm_or_si128(_mm_and_si128(isd, c0), _mm_and_si128(isl, _mm_add_epi8(ca, _mm_set1_epi8(10))));
+    // right-align the m digits in 8 lanes (most significant digit first,
+    // leading zero digits in front)
+    let dd = (_mm_cvtsi128_si64(d) as u64) << (8 * (8 - m));
+    let dv = _mm_cvtsi64_si128(dd as i64);
+    let w = _mm_maddubs_epi16(dv, _mm_setr_epi8(36, 1, 36, 1, 36, 1, 36, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+    let q = _mm_madd_epi16(w, _mm_setr_epi16(1296, 1, 1296, 1, 0, 0, 0, 0));
+    let hi = _mm_cvtsi128_si32(q) as u32 as u64;
+    let lo = _mm_extract_epi32::<1>(q) as u32 as u64;
+    let val = hi * 1_679_616 + lo;
+    if val > MASK {
+        return None;
+    }
+    Some(val)
+}
+
+/// `decode36`, through `decode36_wide` when 16 bytes from the start of `s`
+/// are readable.
+#[inline(always)]
+pub fn decode36_w(s: &[u8], prefix: u8, wide: bool) -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    if wide {
+        return unsafe { decode36_wide(s, prefix) };
+    }
+    let _ = wide;
+    decode36(s, prefix)
+}
+
 /// (v * M1) ^ key from a scrambled value v: undoes the second multiply and
 /// the xorshift.
 #[inline(always)]
@@ -479,4 +530,61 @@ fn task_x<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, ke: u64, bound: u64
     crate::fastev::for_each_line2::<AVX2, _, _>(b, task.start, task.end, safe_end, |f| lp(f), |from, to| {
         scan::for_each_record_x::<7, _, AVX2>(b, from, to, |f| lp(f));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// decode36_wide (and decode36_w) agree with decode36 on every string,
+    /// whatever follows it; base-36 round trips are canonical.
+    #[test]
+    fn decode36_wide_matches() {
+        let mut x: u64 = 0xD36_D36_D36;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alpha = b"0123456789abcdefghijklmnopqrstuvwxyzeuk0Z:`/{ -";
+        let mut hits = 0;
+        for round in 0..3_000_000u64 {
+            let n = (next() % 12) as usize;
+            let mut s: Vec<u8> = (0..n).map(|_| {
+                let r = next();
+                if r % 13 == 0 { (r >> 8) as u8 } else { alpha[((r >> 8) % alpha.len() as u64) as usize] }
+            }).collect();
+            if n > 0 && round % 3 != 0 {
+                s[0] = b"euk"[(round % 3) as usize];
+            }
+            let want_e = decode36(&s, b'e');
+            let want_u = decode36(&s, b'u');
+            hits += want_e.is_some() as u32 + want_u.is_some() as u32;
+            let mut buf = s.clone();
+            buf.extend((0..20).map(|_| (next() & 0xFF) as u8));
+            let f = &buf[..n];
+            assert_eq!(decode36_w(f, b'e', true), want_e, "{:?}", s);
+            assert_eq!(decode36_w(f, b'u', true), want_u, "{:?}", s);
+            assert_eq!(decode36_w(f, b'e', false), want_e);
+        }
+        assert!(hits > 100_000, "{}", hits);
+        // canonical values round-trip
+        for v in [0u64, 1, 35, 36, 1295, 1296, 46655, 1 << 20, MASK - 1, MASK] {
+            let mut s = b"e".to_vec();
+            let mut t = Vec::new();
+            let mut r = v;
+            loop {
+                t.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(r % 36) as usize]);
+                r /= 36;
+                if r == 0 { break; }
+            }
+            t.reverse();
+            s.extend_from_slice(&t);
+            let mut buf = s.clone();
+            buf.extend_from_slice(&[b'z'; 20]);
+            assert_eq!(decode36(&s, b'e'), Some(v));
+            assert_eq!(decode36_w(&buf[..s.len()], b'e', true), Some(v));
+        }
+    }
 }

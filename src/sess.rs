@@ -384,7 +384,7 @@ impl St {
             let cs = &mut cl[self.chist[b] as usize..self.chist[b + 1] as usize];
             let p0 = es[0].person;
             if es.iter().all(|r| r.person == p0) {
-                self.person(p0, es, cs, ctx);
+                self.person(p0, p0, es, cs, ctx);
             } else {
                 self.mixed(es, cs, ctx);
             }
@@ -416,7 +416,7 @@ impl St {
             while l < cs.len() && cs[l].person == p {
                 l += 1;
             }
-            self.person(p, &me[i..k], &mut cs[j..l], ctx);
+            self.person(p, p, &me[i..k], &mut cs[j..l], ctx);
             i = k;
             j = l;
         }
@@ -468,7 +468,9 @@ impl St {
 
     /// One person: events `es` (any order, all with person `p`) and the
     /// clicks of the bucket `cs` (those with person `p` are the person's).
-    fn person(&mut self, p: u64, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
+    /// `p`: the person's value in `es` / `cs` person fields (clicks of other
+    /// persons in `cs` are skipped); `name`: keys::mix of the person key.
+    fn person(&mut self, p: u64, name: u64, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
         self.acc.start();
         // 1. slots
         self.pur.clear();
@@ -579,7 +581,7 @@ impl St {
         // 5. one row per day
         self.ubuf.clear();
         self.ubuf.extend_from_slice(&[0; 4]);
-        keys::decode_into(keys::unmix(p), &mut self.ubuf);
+        keys::decode_into(keys::unmix(name), &mut self.ubuf);
         let ulen = (self.ubuf.len() - 4) as u32;
         self.ubuf[..4].copy_from_slice(&ulen.to_le_bytes());
         let mut i = 0;
@@ -751,11 +753,12 @@ impl PersonSess {
         PersonSess(St::new(ctx, est_rows, 64, 64))
     }
 
-    /// One person: `p` = keys::mix(person key); `es` all its surviving
-    /// events (any order, person = p), `cs` all its clicks (person = p).
+    /// One person: `es` all its surviving events (any order; only ts and
+    /// pay are read), `cs` all its clicks (person field = `p`); `name` =
+    /// keys::mix(person key).
     #[inline]
-    pub(crate) fn person(&mut self, p: u64, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
-        self.0.person(p, es, cs, ctx)
+    pub(crate) fn person(&mut self, p: u64, name: u64, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
+        self.0.person(p, name, es, cs, ctx)
     }
 
     /// Writes this thread's user_daily part (thread 0 always) and returns

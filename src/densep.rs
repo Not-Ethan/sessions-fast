@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use super::{event_pay, ingest_rel, Ctx, Input, SRec, Task, LATE};
-use crate::dense::{decode36, recover, unscramble, M1, M2, MASK};
+use crate::dense::{decode36, decode36_w, recover, unscramble, M1, M2, MASK};
 use crate::links::LinkTable;
 use crate::lookup::NONE;
 use crate::parts::Parts;
@@ -171,6 +171,19 @@ impl Xmap {
     }
 }
 
+/// The slot of a user ID (non-empty), exact for every string. `wide`: 16
+/// bytes from the start of `s` are readable.
+#[inline(always)]
+fn user_slot_w(s: &[u8], d: &Dense, xm: &Xmap, wide: bool) -> u32 {
+    if let Some(v) = decode36_w(s, b'u', wide) {
+        let u = unscramble(v, d.ku);
+        if u < (1 << 39) && (u >> 9) < d.pmax && (u & 511) < 8 {
+            return ((u >> 9) * 8 + (u & 511)) as u32;
+        }
+    }
+    user_slot_x(s, d, xm)
+}
+
 /// The slot of a user ID (non-empty), exact for every string.
 #[inline(always)]
 fn user_slot(s: &[u8], d: &Dense, xm: &Xmap) -> u32 {
@@ -245,16 +258,7 @@ struct DC {
     _q: u64,
 }
 
-/// A click with its person, sorted by person.
-#[derive(Clone, Copy)]
-struct CP {
-    p: u32,
-    camp: u32,
-    ts: u32,
-    ck: u64,
-}
-
-/// A kept valid event in event-number order.
+/// An exceptional event's dedup winner with its person.
 #[derive(Clone, Copy)]
 struct KE {
     p: u32,
@@ -350,7 +354,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     for bi in 0..nb {
         boff[bi + 1] = boff[bi] + evo.iter().map(|o| o.de.len(bi)).sum::<usize>();
     }
-    let kept_all: &'static mut [KE] = arena_mut(boff[nb]);
+    let kept_all: &'static mut [SRec] = arena_mut(boff[nb]);
     let kptr = kept_all.as_mut_ptr() as usize;
     let klen: Vec<AtomicUsize> = (0..nb).map(|_| AtomicUsize::new(0)).collect();
     let nextb = AtomicUsize::new(0);
@@ -385,7 +389,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             }
             gp.sort_unstable_by_key(|r| ((r.n as u64) << 32) | r.ingest as u64);
             // this bucket's region: boff[bi]..boff[bi + 1], written only here
-            let out = unsafe { std::slice::from_raw_parts_mut((kptr as *mut KE).add(boff[bi]), boff[bi + 1] - boff[bi]) };
+            let out = unsafe { std::slice::from_raw_parts_mut((kptr as *mut SRec).add(boff[bi]), boff[bi + 1] - boff[bi]) };
             let mut k = 0usize;
             for s in slot.iter_mut() {
                 if *s == 0 {
@@ -404,14 +408,14 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                 } else {
                     0
                 };
-                out[k] = KE { p: person(r.us & !PFLAG), ts: r.ts & !VALID, pay };
+                out[k] = SRec { person: person(r.us & !PFLAG) as u64, ts: r.ts & !VALID, pay };
                 k += 1;
             }
             klen[bi].store(k, Ordering::Relaxed);
         }
     });
-    let kept_all: &[KE] = kept_all;
-    let kept = |bi: usize| -> &[KE] { &kept_all[boff[bi]..boff[bi] + klen[bi].load(Ordering::Relaxed)] };
+    let kept_all: &[SRec] = kept_all;
+    let kept = |bi: usize| -> &[SRec] { &kept_all[boff[bi]..boff[bi] + klen[bi].load(Ordering::Relaxed)] };
     marks.mark("d.place");
     // 6. exceptional events: dedup among themselves; winners join their
     // persons' gathered events (sorted by person)
@@ -438,11 +442,11 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             if bi >= nb {
                 break;
             }
-            let mut prev = u32::MAX;
+            let mut prev = u64::MAX;
             for e in kept(bi) {
-                if e.p != prev {
-                    runs[e.p as usize].fetch_add(1, Ordering::Relaxed);
-                    prev = e.p;
+                if e.person != prev {
+                    runs[e.person as usize].fetch_add(1, Ordering::Relaxed);
+                    prev = e.person;
                 }
             }
         });
@@ -450,60 +454,87 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     for e in &xwin {
         runs[e.p as usize].fetch_add(2, Ordering::Relaxed);
     }
-    // 8. clicks by person: per click bucket, clicks whose person is a dense
-    // slot in the same bucket range stay there (sorted by person); all
-    // others are "foreign" (sorted by person)
-    // (per bucket: clicks counting-sorted by person & 0xFFFF, and the
-    // 65537 start offsets)
-    let cbuck: Vec<Mutex<(Vec<CP>, Vec<u32>)>> = (0..nbc).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect();
-    let foreign: Mutex<Vec<CP>> = Mutex::new(Vec::new());
-    {
+    // 8. clicks by person: each click to its person's bucket (person >> 16),
+    // then per bucket a counting sort by person & 0xFFFF; clicks are kept as
+    // Cl with person = the person slot
+    let nbp = (np >> 16) + 1;
+    let cl2: Vec<Parts<Cl>> = {
         let nextc = AtomicUsize::new(0);
+        let capb = estc / (threads * nbp) * 5 / 4 + 64;
         super::par(threads, |_| {
-            let mut fl: Vec<CP> = Vec::new();
-            let mut v: Vec<CP> = Vec::new();
+            let mut out: Parts<Cl> = Parts::with_wc(nbp, capb, false);
             loop {
                 let ci = nextc.fetch_add(1, Ordering::Relaxed);
                 if ci >= nbc {
                     break;
                 }
-                v.truncate(0);
                 for o in &clo {
                     for sl in o.get(ci) {
                         for c in sl.iter() {
                             let p = person(c.us);
-                            let cp = CP { p, camp: c.camp, ts: c.ts, ck: c.ck };
-                            if (p as usize) < xbase && (p as usize >> 16) == ci {
-                                v.push(cp);
-                            } else {
-                                fl.push(cp);
-                            }
+                            out.push((p >> 16) as usize, Cl { person: p as u64, ck: c.ck, ts: c.ts, camp: c.camp });
                         }
                     }
                 }
-                let mut off = vec![0u32; 65537];
-                for c in &v {
-                    off[(c.p & 0xFFFF) as usize + 1] += 1;
+            }
+            out
+        })
+    };
+    let mut coff = vec![0usize; nbp + 1];
+    for pb in 0..nbp {
+        coff[pb + 1] = coff[pb] + cl2.iter().map(|o| o.len(pb)).sum::<usize>();
+    }
+    let call: &'static mut [Cl] = arena_mut(coff[nbp]);
+    let caddr = call.as_mut_ptr() as usize;
+    // per person bucket: 65537 start offsets (relative to the bucket)
+    let cidx: &'static mut [u32] = arena_mut(nbp * 65537);
+    let iaddr = cidx.as_mut_ptr() as usize;
+    {
+        let nextp = AtomicUsize::new(0);
+        super::par(threads, |_| {
+            let mut cur = vec![0u32; 65536];
+            loop {
+                let pb = nextp.fetch_add(1, Ordering::Relaxed);
+                if pb >= nbp {
+                    break;
+                }
+                // regions written only by this bucket's iteration
+                let off = unsafe { std::slice::from_raw_parts_mut((iaddr as *mut u32).add(pb * 65537), 65537) };
+                let dst = unsafe { std::slice::from_raw_parts_mut((caddr as *mut Cl).add(coff[pb]), coff[pb + 1] - coff[pb]) };
+                for v in off.iter_mut() {
+                    *v = 0;
+                }
+                for o in &cl2 {
+                    for sl in o.get(pb) {
+                        for c in sl.iter() {
+                            off[(c.person & 0xFFFF) as usize + 1] += 1;
+                        }
+                    }
                 }
                 for i in 0..65536 {
                     off[i + 1] += off[i];
                 }
-                let mut cur = off.clone();
-                let mut out = vec![CP { p: 0, camp: 0, ts: 0, ck: 0 }; v.len()];
-                for c in &v {
-                    let k = &mut cur[(c.p & 0xFFFF) as usize];
-                    out[*k as usize] = *c;
-                    *k += 1;
+                cur.copy_from_slice(&off[..65536]);
+                for o in &cl2 {
+                    for sl in o.get(pb) {
+                        for c in sl.iter() {
+                            let k = &mut cur[(c.person & 0xFFFF) as usize];
+                            dst[*k as usize] = *c;
+                            *k += 1;
+                        }
+                    }
                 }
-                *cbuck[ci].lock().unwrap() = (out, off);
             }
-            foreign.lock().unwrap().append(&mut fl);
         });
     }
-    let cbuck: Vec<(Vec<CP>, Vec<u32>)> = cbuck.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    let mut foreign = foreign.into_inner().unwrap();
-    foreign.sort_unstable_by_key(|c| c.p);
-    let range = |v: &[CP], p: u32| -> (usize, usize) { (v.partition_point(|c| c.p < p), v.partition_point(|c| c.p <= p)) };
+    // the clicks of person p: call[coff[p >> 16] + cidx[..p & 0xFFFF], ..+ 1]
+    let crange = |p: u32| -> (usize, usize) {
+        let pb = p as usize >> 16;
+        let lo = (p & 0xFFFF) as usize;
+        let base = coff[pb];
+        let off = unsafe { std::slice::from_raw_parts((iaddr as *const u32).add(pb * 65537), 65537) };
+        (base + off[lo] as usize, base + off[lo + 1] as usize)
+    };
     marks.mark("d.group");
     // 9. run descriptors (person, bucket, from, to) of every person that is
     // not exactly one run, plus a marker for persons with exceptional
@@ -521,13 +552,13 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                 let k = kept(bi);
                 let mut i = 0;
                 while i < k.len() {
-                    let p = k[i].p;
+                    let p = k[i].person;
                     let mut j = i + 1;
-                    while j < k.len() && k[j].p == p {
+                    while j < k.len() && k[j].person == p {
                         j += 1;
                     }
                     if runs[p as usize].load(Ordering::Relaxed) != 1 {
-                        md.push((p, bi as u32, i as u32, j as u32));
+                        md.push((p as u32, bi as u32, i as u32, j as u32));
                     }
                     i = j;
                 }
@@ -566,36 +597,26 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     let outs = super::par(threads, |t| {
         let mut st = PersonSess::new(ctx, est_rows);
         let mut es: Vec<SRec> = Vec::new();
-        let mut cs: Vec<Cl> = Vec::new();
-        // the person's clicks, then the routine
-        let finish_person = |p: u32, pm: u64, st: &mut PersonSess, es: &mut Vec<SRec>, cs: &mut Vec<Cl>| {
-            cs.clear();
-            if (p as usize) < xbase {
-                let (v, off) = &cbuck[p as usize >> 16];
-                if !off.is_empty() {
-                    let lo = (p & 0xFFFF) as usize;
-                    let (a, b) = (off[lo] as usize, off[lo + 1] as usize);
-                    cs.extend(v[a..b].iter().map(|c| Cl { person: pm, ck: c.ck, ts: c.ts, camp: c.camp }));
-                }
-            }
-            let (a, b) = range(&foreign, p);
-            cs.extend(foreign[a..b].iter().map(|c| Cl { person: pm, ck: c.ck, ts: c.ts, camp: c.camp }));
-            st.person(pm, es, cs, ctx);
+        // the person's clicks (its own range of `call`: every person is
+        // processed once, so ranges are never shared), then the routine
+        let finish_person = |p: u32, es: &[SRec], st: &mut PersonSess| {
+            let (a, b) = crange(p);
+            let cs = unsafe { std::slice::from_raw_parts_mut((caddr as *mut Cl).add(a), b - a) };
+            st.person(p as u64, pmix(p, &d, &xkeys), es, cs, ctx);
         };
         loop {
             let gi = nextg.fetch_add(1, Ordering::Relaxed);
             let Some(&(_, a, b)) = gr.get(gi) else { break };
             let p = mv[a].0;
-            let pm = pmix(p, &d, &xkeys);
             es.clear();
             for &(_, bi, i, j) in &mv[a..b] {
                 if bi != u32::MAX {
-                    es.extend(kept(bi as usize)[i as usize..j as usize].iter().map(|e| SRec { person: pm, ts: e.ts, pay: e.pay }));
+                    es.extend_from_slice(&kept(bi as usize)[i as usize..j as usize]);
                 }
             }
             let (xa, xb) = (xwin.partition_point(|e| e.p < p), xwin.partition_point(|e| e.p <= p));
-            es.extend(xwin[xa..xb].iter().map(|e| SRec { person: pm, ts: e.ts, pay: e.pay }));
-            finish_person(p, pm, &mut st, &mut es, &mut cs);
+            es.extend(xwin[xa..xb].iter().map(|e| SRec { person: p as u64, ts: e.ts, pay: e.pay }));
+            finish_person(p, &es, &mut st);
         }
         loop {
             let bi = nextb.fetch_add(1, Ordering::Relaxed);
@@ -605,16 +626,13 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             let k = kept(bi);
             let mut i = 0;
             while i < k.len() {
-                let p = k[i].p;
+                let p = k[i].person;
                 let mut j = i + 1;
-                while j < k.len() && k[j].p == p {
+                while j < k.len() && k[j].person == p {
                     j += 1;
                 }
                 if runs[p as usize].load(Ordering::Relaxed) == 1 {
-                    let pm = pmix(p, &d, &xkeys);
-                    es.clear();
-                    es.extend(k[i..j].iter().map(|e| SRec { person: pm, ts: e.ts, pay: e.pay }));
-                    finish_person(p, pm, &mut st, &mut es, &mut cs);
+                    finish_person(p as u32, &k[i..j], &mut st);
                 }
                 i = j;
             }
@@ -729,9 +747,9 @@ fn ev_line(f: &[&[u8]; 7], ctx: &Ctx, d: &Dense, xm: &Xmap, o: &mut EvOut, safe_
         valid = true;
         ts = (t - ws) as u32;
         pay = py;
-        us = user_slot(f[1], d, xm);
+        us = user_slot_w(f[1], d, xm, wide);
     }
-    let n = match decode36(f[0], b'e') {
+    let n = match decode36_w(f[0], b'e', wide) {
         Some(v) => unscramble(v, d.ke),
         None => u64::MAX,
     };
@@ -811,7 +829,7 @@ fn cl_task_x<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &
         if camp == NONE {
             return;
         }
-        let us = user_slot(f[1], d, xm);
+        let us = user_slot_w(f[1], d, xm, wide);
         let ck = if wide { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) };
         let q = ((us >> 16) as usize).min(nbc - 1);
         v.push(q, DC { us, camp: camp as u32, ts: (t - cws) as u32, _p: 0, ck, _q: 0 });
