@@ -20,7 +20,11 @@
 //! yields. Every other line (any other shape, a field too long for the
 //! windows, a line within `MARGIN` bytes of the end of the buffer) is handed
 //! to the general scanner on its own: same lines, same fields by
-//! construction. The fields then go through the unchanged `event_line`.
+//! construction. The fields then go through the unchanged `event_line`
+//! (`event_fast`, opt-in, is the same logic with experimental decoders).
+//! The next line start is taken from the newline masks of the 128 bytes at
+//! the line start, which keeps the line-to-line dependency chain short; the
+//! field walk must find the same newline.
 //!
 //! The fast path never reads beyond `b` (nor beyond `safe_end`).
 
@@ -52,13 +56,29 @@ const MARGIN: usize = 192;
 
 // ---------------------------------------------------------------- masks
 
+/// Unaligned 32-byte load as one instruction: for the x86-64-v2 target the
+/// compiler splits `_mm256_loadu_si256` into two 16-byte loads and an insert
+/// (build with SS_NOASMLOAD set to get that back, for comparison).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn load32(p: *const u8) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    if option_env!("SS_NOASMLOAD").is_some() {
+        return _mm256_loadu_si256(p as *const __m256i);
+    }
+    let v: __m256i;
+    std::arch::asm!("vmovdqu {0}, ymmword ptr [{1}]", out(ymm_reg) v, in(reg) p, options(pure, readonly, nostack, preserves_flags));
+    v
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn masks64_avx2(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
-    let a = _mm256_loadu_si256(p as *const __m256i);
-    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let a = load32(p);
+    let b = load32(p.add(32));
     let m = |v: __m256i, ch: u8| -> u64 { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(ch as i8))) as u32 as u64 };
     (m(a, b',') | (m(b, b',') << 32), m(a, b'\n') | (m(b, b'\n') << 32), m(a, b'"') | (m(b, b'"') << 32))
 }

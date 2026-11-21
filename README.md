@@ -11,6 +11,7 @@ writes `/output/user_daily/*.parquet` and `/output/campaign_daily/*.parquet`.
 | --- | --- |
 | `src/main.rs` | Pipeline phases, records, sessionization, attribution, output |
 | `src/scan.rs` | CSV dialect scanner (SIMD masks, branch-light line splitting) |
+| `src/fastev.rs` | Line-local splitter for event lines (general scanner as fallback) |
 | `src/ts.rs` | Timestamp forms F1/F2/F3, prices; fast SWAR path + general path |
 | `src/keys.rs` | IDs as exact 64-bit keys (order-preserving packing + interned fallback) |
 | `src/links.rs` | Lock-free concurrent union-find for linked IDs |
@@ -47,7 +48,12 @@ counters); phases are separated by joins.
 5. **Events.** Each line: event_id key, `ingest_ts`, and a validity bit
    (user, ts in window, type, product, purchase price, not late) with the payload
    (user, ts offset, price, category rank). Records are scattered by a hash of
-   event_id into 256 partitions per thread.
+   event_id into 256 partitions per thread. Event lines are split one at a time
+   (`src/fastev.rs`): comma/newline/quote masks of a 64-byte window at the line
+   start (fields 0-2) and one at field 3 (fields 3-6); the quote rule is checked
+   with a carry trick, the next line start comes from the newline masks. Any line
+   of another shape goes through the general scanner on its own
+   (`SS_FASTEV=0` uses the scanner for everything).
 6. **Clicks.** Parsed, validated (ts in the click window, campaign known),
    resolved to a person (link-table lookups prefetched through a small ring),
    scattered by a hash of the person. Click dedup is unnecessary: copies are
