@@ -177,12 +177,35 @@ impl LinkTable {
 
     /// Joins two IDs. Safe to call from many threads at once.
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn link(&self, a: u64, b: u64, alloc: &mut DenseAlloc) {
         let da = self.insert(a, alloc);
         let db = self.insert(b, alloc);
         if da != db {
             self.union(da, db);
         }
+    }
+
+    /// Dense indices of both IDs of a link, inserting them if absent.
+    #[inline(always)]
+    pub fn insert_pair(&self, a: u64, b: u64, alloc: &mut DenseAlloc) -> (u32, u32) {
+        (self.insert(a, alloc), self.insert(b, alloc))
+    }
+
+    /// Joins two inserted IDs by dense index. Safe to call from many threads
+    /// at once, also while other threads are still inserting.
+    #[inline(always)]
+    pub fn union_dense(&self, da: u32, db: u32) {
+        if da != db {
+            self.union(da, db);
+        }
+    }
+
+    /// Prefetches the union-find entries of a dense index.
+    #[inline(always)]
+    pub fn prefetch_dense(&self, d: u32) {
+        crate::prefetch(self.parent.as_ptr().wrapping_add(d as usize) as *const u8);
+        crate::prefetch(self.dkey.as_ptr().wrapping_add(d as usize) as *const u8);
     }
 
     /// Number of blocks for `finalize_roots` (dense indices).
