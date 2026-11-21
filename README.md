@@ -69,9 +69,7 @@ counters); phases are separated by joins.
 
 ```sh
 docker buildx build --platform linux/amd64 --load -t shopping-sessions .
-# scorer-like run (see the starter's scripts/docker_run.sh for the exact flags)
-docker run --rm --network none --read-only --user 1000:1000 \
-  -v "$PWD/dev":/data:ro -v "$PWD/out":/output shopping-sessions
+IMAGE=shopping-sessions tools/docker_run.sh dev out   # the scorer's container flags
 ```
 
 Without Docker: `cargo build --release && target/release/sessions DATA_DIR OUTPUT_DIR`.
@@ -98,7 +96,7 @@ requires identical tables.
   container flags (read-only root, uid 1000, no network), on both the AVX2 path
   and the forced SSE2 path (`SS_NOAVX2=1`).
 - 1M-event dev set: exact match with the published `dev-answer` (native arm64,
-  arm64 image, amd64 image under emulation on both SIMD paths).
+  and the amd64 image under emulation on both SIMD paths).
 - The Python reference (`reference/reference.py`, written independently from
   `rules.md`) passes all fixtures and matches `dev-answer` exactly.
 - Cross-checks against the reference on generated data (distinct seeds, 1K to
@@ -111,6 +109,23 @@ requires identical tables.
 - `cargo test`: fuzz tests of the scanner against a naive splitter (including
   4 KiB window crossings), of the fast timestamp parser against the general one
   (3M inputs), and of ID packing (round trip and byte order).
+
+## Performance notes
+
+Measured on an Apple M1 (4 performance + 4 efficiency cores, 16 GB) that was
+heavily shared with other workloads (load average 80-400, swap nearly full,
+thermally throttled), so wall-clock numbers are pessimistic and noisy; the
+scorer (8 vCPUs of an Intel Xeon, linux/amd64) could not be measured.
+
+- 20M events, 8 threads, native arm64, best of 3: 3.6 s wall (input not fully
+  page-cached on this machine); thread CPU: parse 4.6 s, dedup 1.6 s,
+  sessions + output 1.4-2.1 s. Peak RSS 2.3-3.2 GB including mapped input.
+- 4M events, 1 thread: about 2.7 G cycles in total (about 510 cycles per input
+  line), split parse 56% / dedup 23% / sessions 20%.
+- 1M-event dev set in the amd64 image: peak RSS 212 MB.
+
+Expected peak memory at 60M events: roughly 10-12 GB including page-cached
+input (extrapolated linearly from 20M, not measured), within the 24 GB limit.
 
 ## Limits (all far above anything the generator produces)
 
