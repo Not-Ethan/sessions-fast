@@ -577,25 +577,54 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     corder.sort_unstable_by_key(|&ci| std::cmp::Reverse(coff[ci + 1] - coff[ci]));
     stat("d_click_bucket_max", corder.first().map_or(0, |&ci| coff[ci + 1] - coff[ci]));
     let foreign: Mutex<Vec<Cl>> = Mutex::new(Vec::new());
+    // a click's person, if local to bucket ci
+    let local = |c: &DC, ci: usize| -> (u32, bool) {
+        let p = person(c.us);
+        (p, (p as usize) < xbase && (p as usize >> 16) == ci)
+    };
+    // Light buckets: one worker each, two passes (count, then scatter).
+    // Heavy buckets (whales): one task per (bucket, source part) for the
+    // count and for the scatter, with per-part offsets in between.
+    let nparts = clo.len();
+    let heavy_min = coff[nbc] / (threads * 4) + 1;
+    let nh = corder.iter().take_while(|&&ci| coff[ci + 1] - coff[ci] >= heavy_min).count();
+    let (heavy, light) = corder.split_at(nh);
+    stat("d_heavy_click_buckets", nh);
+    // per (heavy bucket, part): 65536 counts, then start offsets
+    let htab: &'static mut [u32] = arena_mut(nh * nparts * 65536);
+    let haddr = htab.as_mut_ptr() as usize;
+    let tab = |h: usize, t: usize| -> &mut [u32] {
+        // (h, t) regions are disjoint; each is used by one task at a time
+        unsafe { std::slice::from_raw_parts_mut((haddr as *mut u32).add((h * nparts + t) * 65536), 65536) }
+    };
     {
-        let nextc = AtomicUsize::new(0);
+        let next = AtomicUsize::new(0);
         super::par(threads, |_| {
             let mut cnt = vec![0u32; 65537];
-            let mut tmp: Vec<Cl> = Vec::new();
             let mut fl: Vec<Cl> = Vec::new();
             loop {
-                let Some(&ci) = corder.get(nextc.fetch_add(1, Ordering::Relaxed)) else { break };
-                tmp.clear();
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k < nh * nparts {
+                    let (h, t) = (k / nparts, k % nparts);
+                    let ci = heavy[h];
+                    let tb = tab(h, t);
+                    for sl in clo[t].get(ci) {
+                        for c in sl.iter() {
+                            let (p, l) = local(c, ci);
+                            if l {
+                                tb[(p & 0xFFFF) as usize] += 1;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let Some(&ci) = light.get(k - nh * nparts) else { break };
                 for o in &clo {
                     for sl in o.get(ci) {
                         for c in sl.iter() {
-                            let p = person(c.us);
-                            let cl = Cl { person: p as u64, ck: c.ck, ts: c.ts, camp: c.camp };
-                            if (p as usize) < xbase && (p as usize >> 16) == ci {
+                            let (p, l) = local(c, ci);
+                            if l {
                                 cnt[(p & 0xFFFF) as usize + 1] += 1;
-                                tmp.push(cl);
-                            } else {
-                                fl.push(cl);
                             }
                         }
                     }
@@ -603,17 +632,84 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                 for i in 0..65536 {
                     cnt[i + 1] += cnt[i];
                 }
+                let n = cnt[65536] as usize;
                 // this bucket's regions, written only here
-                let dst = unsafe { std::slice::from_raw_parts_mut((caddr as *mut Cl).add(coff[ci]), tmp.len()) };
-                let dk = unsafe { std::slice::from_raw_parts_mut((kaddr as *mut u32).add(coff[ci]), tmp.len()) };
-                for c in &tmp {
-                    let k = &mut cnt[(c.person & 0xFFFF) as usize];
-                    dst[*k as usize] = *c;
-                    dk[*k as usize] = c.person as u32;
-                    *k += 1;
+                let dst = unsafe { std::slice::from_raw_parts_mut((caddr as *mut Cl).add(coff[ci]), n) };
+                let dk = unsafe { std::slice::from_raw_parts_mut((kaddr as *mut u32).add(coff[ci]), n) };
+                for o in &clo {
+                    for sl in o.get(ci) {
+                        for c in sl.iter() {
+                            let (p, l) = local(c, ci);
+                            let cl = Cl { person: p as u64, ck: c.ck, ts: c.ts, camp: c.camp };
+                            if l {
+                                let k = &mut cnt[(p & 0xFFFF) as usize];
+                                dst[*k as usize] = cl;
+                                dk[*k as usize] = p;
+                                *k += 1;
+                            } else {
+                                fl.push(cl);
+                            }
+                        }
+                    }
                 }
-                clen[ci].store(tmp.len(), Ordering::Relaxed);
+                clen[ci].store(n, Ordering::Relaxed);
                 cnt.fill(0);
+            }
+            foreign.lock().unwrap().append(&mut fl);
+        });
+    }
+    if nh > 0 {
+        // heavy buckets: start offsets in (person, part) order
+        let next = AtomicUsize::new(0);
+        super::par(threads, |_| loop {
+            let h = next.fetch_add(1, Ordering::Relaxed);
+            if h >= nh {
+                break;
+            }
+            let mut run = 0u32;
+            for key in 0..65536 {
+                for t in 0..nparts {
+                    let tb = tab(h, t);
+                    let c = tb[key];
+                    tb[key] = run;
+                    run += c;
+                }
+            }
+            clen[heavy[h]].store(run as usize, Ordering::Relaxed);
+        });
+        let next = AtomicUsize::new(0);
+        super::par(threads, |_| {
+            let mut fl: Vec<Cl> = Vec::new();
+            loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k >= nh * nparts {
+                    break;
+                }
+                let (h, t) = (k / nparts, k % nparts);
+                let ci = heavy[h];
+                let tb = tab(h, t);
+                let n = clen[ci].load(Ordering::Relaxed);
+                // each (person, part) range is written only by this task
+                // (raw writes: other tasks write other indices of the region)
+                let dst = (caddr as *mut Cl).wrapping_add(coff[ci]);
+                let dk = (kaddr as *mut u32).wrapping_add(coff[ci]);
+                for sl in clo[t].get(ci) {
+                    for c in sl.iter() {
+                        let (p, l) = local(c, ci);
+                        let cl = Cl { person: p as u64, ck: c.ck, ts: c.ts, camp: c.camp };
+                        if l {
+                            let k = &mut tb[(p & 0xFFFF) as usize];
+                            assert!((*k as usize) < n);
+                            unsafe {
+                                dst.add(*k as usize).write(cl);
+                                dk.add(*k as usize).write(p);
+                            }
+                            *k += 1;
+                        } else {
+                            fl.push(cl);
+                        }
+                    }
+                }
             }
             foreign.lock().unwrap().append(&mut fl);
         });
