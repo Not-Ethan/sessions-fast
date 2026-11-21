@@ -35,7 +35,7 @@ use super::{event_pay, ingest_rel, Ctx, Input, SRec, Task, LATE};
 use crate::dense::{decode36, decode36_w, recover, unscramble, M1, M2, MASK};
 use crate::links::LinkTable;
 use crate::lookup::NONE;
-use crate::parts::Parts;
+use crate::parts::{self, Parts};
 use crate::sess::{Cl, Out2, PersonSess};
 use crate::{fastev, keys, scan};
 
@@ -55,6 +55,12 @@ pub struct Dense {
     pub bound: u64,
     /// person indexes below this get dense slots
     pub pmax: u64,
+    /// sizing estimates from the sample (performance only, never results):
+    /// event numbers in use, user slots in use, event lines, purchase share
+    pub n_est: u64,
+    pub s_est: u64,
+    pub lines_est: usize,
+    pub pfrac: f64,
 }
 
 impl Dense {
@@ -112,22 +118,32 @@ pub fn decide(ev: &Input, ctx: &Ctx) -> Option<Dense> {
     }
     let bound = (2 * est as u64).clamp(1 << 16, 1 << 32);
     let pmax = ((est as u64) / 8 + 4096).min(1 << 27);
-    // samples: the first lines of up to 16 tasks
+    // samples: the first lines of up to 16 tasks spread over the input
     let (mut es, mut us, mut lines, mut bad) = (Vec::new(), Vec::new(), 0usize, 0usize);
-    for task in ev.tasks.iter().take(16) {
+    let (mut eall, mut uall, mut sbytes, mut purch) = (Vec::new(), Vec::new(), 0usize, 0usize);
+    let nt = ev.tasks.len().min(16);
+    for k in 0..nt {
+        let task = ev.tasks[k * ev.tasks.len() / nt];
         let b = ev.maps[task.file as usize].bytes();
         let end = scan::next_line_start(b, (task.start + 8192).min(task.end)).min(task.end);
+        sbytes += end - task.start;
         scan::for_each_record_x::<7, _, false>(b, task.start, end, |f| {
             lines += 1;
+            purch += (f[4] == b"purchase") as usize;
             match decode36(f[0], b'e') {
-                Some(v) if es.len() < 64 => es.push(v),
-                Some(_) => {}
+                Some(v) => {
+                    if es.len() < 64 {
+                        es.push(v);
+                    }
+                    eall.push(v);
+                }
                 None => bad += 1,
             }
             if let Some(v) = decode36(f[1], b'u') {
                 if us.len() < 64 {
                     us.push(v);
                 }
+                uall.push(v);
             }
         });
     }
@@ -150,10 +166,32 @@ pub fn decide(ev: &Input, ctx: &Ctx) -> Option<Dense> {
     if !force && (lines < 64 || bad * 20 > lines) {
         return None;
     }
+    // sizing: event numbers in use ~ 90th percentile / 0.9 (robust to a
+    // few outliers), user slots in use ~ largest sampled slot
+    let mut ns: Vec<u64> = eall.iter().map(|&v| unscramble(v, ke)).filter(|&n| n < bound).collect();
+    ns.sort_unstable();
+    let n_est = if ns.len() >= 32 { (ns[ns.len() * 9 / 10] * 10 / 9 + (1 << 16)).min(bound) } else { bound };
+    let xb = pmax * 8;
+    let smax = uall
+        .iter()
+        .map(|&v| unscramble(v, ku))
+        .filter(|&u| u < (1 << 39) && (u >> 9) < pmax && (u & 511) < 8)
+        .map(|u| (u >> 9) * 8 + (u & 511))
+        .max();
+    let s_est = match smax {
+        Some(m) if uall.len() >= 32 => (m + m / 20 + (1 << 16)).min(xb),
+        _ => xb,
+    };
+    let lines_est = if sbytes > 0 && lines > 0 { (ev.bytes as f64 * lines as f64 / sbytes as f64) as usize + 1 } else { est };
+    let pfrac = if lines > 0 { purch as f64 / lines as f64 } else { 1.0 / 16.0 };
     stat("d_bound", bound);
     stat("d_pmax", pmax);
     stat("d_sample_lines", lines);
-    Some(Dense { ke, ku, bound, pmax })
+    stat("d_n_est", n_est);
+    stat("d_s_est", s_est);
+    stat("d_lines_est", lines_est);
+    stat("d_pfrac", format!("{:.4}", pfrac));
+    Some(Dense { ke, ku, bound, pmax, n_est, s_est, lines_est, pfrac })
 }
 
 /// Exceptional user IDs: exact key -> id (sharded).
@@ -306,10 +344,13 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     link_roots(&lt, &d, &xm, proot, &xroot, threads);
     marks.mark("d.slots");
     // 2. events
+    // bucket capacities (overflow is exact, only slower): copies spread
+    // evenly over the buckets of the event numbers in use
     let nb = (d.bound >> BSHIFT) as usize + 1;
-    let est = ev.bytes / 70 + 1;
-    let cap = est / (threads * nb) * 5 / 4 + 64;
-    let capp = est / 16 / (threads * nb) + 32;
+    let est = d.lines_est;
+    let used = ((d.n_est >> BSHIFT) as usize + 1).min(nb);
+    let cap = (est as f64 * 1.4 / (threads * used) as f64) as usize + 64;
+    let capp = (cap as f64 * (d.pfrac * 1.5 + 0.01)) as usize + 32;
     let next = AtomicUsize::new(0);
     let evo: Vec<EvOut> = super::par(threads, |_| {
         let mut o = EvOut { de: Parts::with_wc(nb, cap, true), dp: Parts::with_wc(nb, capp, true), xe: Vec::new() };
@@ -325,10 +366,12 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
         o
     });
     marks.mark("d.events");
+    stat("d_over_ev", parts::WC_OVER_LINES.load(Ordering::Relaxed));
     // 3. clicks, bucketed by user slot >> 16 (exceptional slots: last bucket)
     let nbc = (xbase >> 16) + 1;
     let estc = cl.bytes / 44 + 1;
-    let capc = estc / (threads * nbc) * 5 / 4 + 64;
+    let usedc = ((d.s_est >> 16) as usize + 1).min(nbc);
+    let capc = (estc as f64 * 1.4 / (threads * usedc) as f64) as usize + 64;
     let next = AtomicUsize::new(0);
     let clo: Vec<Parts<DC>> = super::par(threads, |_| {
         let mut v: Parts<DC> = Parts::with_wc(nbc, capc, true);
@@ -343,6 +386,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
         v
     });
     marks.mark("d.clicks");
+    stat("d_over_cl", parts::WC_OVER_LINES.load(Ordering::Relaxed));
     // 4. exceptional slots' roots, the person table
     let xkeys = xm.key_table();
     stat("d_xslots", xkeys.len());
