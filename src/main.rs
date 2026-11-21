@@ -147,7 +147,7 @@ fn person_hash(lt: &LinkTable, user: u64, h: u64) -> u64 {
     // h == mix(user) at every call, so this is mix(person) whether or not
     // the user is linked, without a branch on the lookup result
     debug_assert_eq!(h, keys::mix(user));
-    keys::mix(lt.person_or_self(user, h))
+    lt.person_hash(user, h)
 }
 
 // ---------------------------------------------------------------- context
@@ -2314,6 +2314,7 @@ fn main() {
 fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String {
     sys::NOHUGE.store(std::env::var("SS_NOHUGE").is_ok(), Ordering::Relaxed);
     scan::USE_V1.store(std::env::var("SS_SCAN1").is_ok(), Ordering::Relaxed);
+    parts::OLD_LINE_OVER.store(std::env::var("SS_OLDOVER").map_or(false, |v| v == "1"), Ordering::Relaxed);
     LINKS_US.store(0, Ordering::Relaxed);
     let mut marks = Marks::new(verbose);
     // SS_PROF (with SS_VERBOSE): sub-phase timers; perturbs the timing a little
@@ -2556,7 +2557,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
 
     if verbose {
         return format!(
-            "sessions: {} | pipeline={} links={:.1}ms {} threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB {} | sub:{}",
+            "sessions: {} | pipeline={} links={:.1}ms {} threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} wc_over_lines={} peak_rss={}MB {} | sub:{}",
             marks.report(),
             pipeline,
             LINKS_US.load(Ordering::Relaxed) as f64 / 1e3,
@@ -2567,6 +2568,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
             ps_bits,
             rows,
             keys::any_fallback(),
+            parts::WC_OVER_LINES.load(Ordering::Relaxed),
             sys::peak_rss_mb(),
             sys::anon_summary(),
             prof::report()

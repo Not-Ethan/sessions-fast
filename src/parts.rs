@@ -20,13 +20,20 @@ const WCB: usize = match option_env!("SS_WCBYTES") {
 #[derive(Clone, Copy)]
 struct Line([u64; WCB / 8]);
 
+/// Staged lines that went to an overflow vector (statistics, SS_VERBOSE).
+pub static WC_OVER_LINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// SS_OLDOVER=1: `line_over` through a temporary Vec, as before (A/B).
+pub static OLD_LINE_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub struct Parts<T: Copy> {
     arena: *mut T,
     cap: usize,
     lens: Vec<u32>,
     over: Vec<UnsafeCell<Vec<T>>>,
-    /// write-combining staging lines (empty when off)
+    /// write-combining staging lines (empty when off, and after `finish`)
     wc: Vec<Line>,
+    /// write combining was on: `lens` counts every record, overflow included
+    wc_mode: bool,
 }
 
 unsafe impl<T: Copy + Send> Send for Parts<T> {}
@@ -59,6 +66,7 @@ impl<T: Copy> Parts<T> {
             lens: vec![0; nparts],
             over: (0..nparts).map(|_| UnsafeCell::new(Vec::new())).collect(),
             wc: if wc { vec![Line([0; WCB / 8]); nparts] } else { Vec::new() },
+            wc_mode: wc,
         }
     }
 
@@ -133,9 +141,17 @@ impl<T: Copy> Parts<T> {
     #[cold]
     #[inline(never)]
     fn line_over(&mut self, p: usize) {
+        WC_OVER_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if OLD_LINE_OVER.load(std::sync::atomic::Ordering::Relaxed) {
+            // previous version (SS_OLDOVER=1): through a temporary Vec
+            let recs = unsafe { std::slice::from_raw_parts(self.wc[p].0.as_ptr() as *const T, Self::WC_RECS) };
+            let recs: Vec<T> = recs.to_vec();
+            self.over[p].get_mut().extend_from_slice(&recs);
+            return;
+        }
+        // the staging line and the overflow vector are disjoint fields
         let recs = unsafe { std::slice::from_raw_parts(self.wc[p].0.as_ptr() as *const T, Self::WC_RECS) };
-        let recs: Vec<T> = recs.to_vec();
-        self.over[p].get_mut().extend_from_slice(&recs);
+        self.over[p].get_mut().extend_from_slice(recs);
     }
 
     /// Writes the full staged line of partition p, whose first record has
@@ -177,7 +193,10 @@ impl<T: Copy> Parts<T> {
 
     #[inline(always)]
     pub fn len(&self, p: usize) -> usize {
-        if !self.wc.is_empty() {
+        // with write combining `lens` already counts the overflow records,
+        // before and after `finish` (SS_OLDOVER=1: the old count, which added
+        // the overflow again after `finish`)
+        if !self.wc.is_empty() || (self.wc_mode && !OLD_LINE_OVER.load(std::sync::atomic::Ordering::Relaxed)) {
             return self.lens[p] as usize;
         }
         self.lens[p] as usize + unsafe { (*self.over[p].get()).len() }

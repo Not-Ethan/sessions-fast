@@ -30,6 +30,9 @@ pub struct LinkTable {
     dpkey: &'static [AtomicU64],
     /// next free block of dense indices
     next_block: AtomicU32,
+    /// after finalize, slot values hold keys::mix(person key) instead of the
+    /// person key (SS_OLDPH=1: raw keys, mixed at every lookup, as before)
+    mixed: bool,
 }
 
 pub const FINALIZE_BLOCK: usize = 1 << 16;
@@ -54,7 +57,7 @@ impl DenseAlloc {
 
 impl LinkTable {
     pub fn empty() -> Self {
-        LinkTable { slots: &[], mask: 0, amask: !0, parent: &[], dkey: &[], dpkey: &[], next_block: AtomicU32::new(0) }
+        LinkTable { slots: &[], mask: 0, amask: !0, parent: &[], dkey: &[], dpkey: &[], next_block: AtomicU32::new(0), mixed: false }
     }
 
     /// A table for `total_pairs` links built by up to `threads` threads.
@@ -77,6 +80,7 @@ impl LinkTable {
             dkey: arena(nd),
             dpkey: arena(nd),
             next_block: AtomicU32::new(0),
+            mixed: std::env::var("SS_OLDPH").map_or(true, |v| v != "1"),
         }
     }
 
@@ -230,15 +234,26 @@ impl LinkTable {
     }
 
     /// Finalize, step 2 (after every block finished step 1): each occupied
-    /// slot's value becomes its person key.
+    /// slot's value becomes its person key, stored as keys::mix(person key)
+    /// when `mixed` (the lookups below undo or use that consistently).
     pub fn finalize_vals(&self, b: usize) {
         let n = self.slots.len();
         for i in b * FINALIZE_BLOCK..((b + 1) * FINALIZE_BLOCK).min(n) {
             if self.slots[i][0].load(Ordering::Relaxed) != 0 {
                 let d = (self.slots[i][1].load(Ordering::Relaxed) - 1) as usize;
                 let pk = self.dpkey[d].load(Ordering::Relaxed);
-                self.slots[i][1].store(pk, Ordering::Relaxed);
+                self.slots[i][1].store(if self.mixed { keys::mix(pk) } else { pk }, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// The person key held in a finalized slot value.
+    #[inline(always)]
+    fn val_key(&self, v: u64) -> u64 {
+        if self.mixed {
+            keys::unmix(v)
+        } else {
+            v
         }
     }
 
@@ -253,7 +268,7 @@ impl LinkTable {
             let s = &self.slots[i];
             let kk = s[0].load(Ordering::Relaxed);
             if kk == k {
-                return s[1].load(Ordering::Relaxed);
+                return self.val_key(s[1].load(Ordering::Relaxed));
             }
             if kk == 0 {
                 return k;
@@ -265,6 +280,7 @@ impl LinkTable {
     /// `person_of` for a key whose hash `h` = keys::mix(k) is known:
     /// Some(person key) if k is linked, None if it is not in the table.
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn person_of_h(&self, k: u64, h: u64) -> Option<u64> {
         if self.slots.is_empty() {
             return None;
@@ -274,7 +290,7 @@ impl LinkTable {
             let s = &self.slots[i];
             let kk = s[0].load(Ordering::Relaxed);
             if kk == k {
-                return Some(s[1].load(Ordering::Relaxed));
+                return Some(self.val_key(s[1].load(Ordering::Relaxed)));
             }
             if kk == 0 {
                 return None;
@@ -291,12 +307,41 @@ impl LinkTable {
     /// without deletions: a key sits after every slot of its probe sequence
     /// that precedes it, and those were all occupied when it was inserted.
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn person_or_self(&self, k: u64, h: u64) -> u64 {
+        match self.probe(k, h) {
+            Some(v) => self.val_key(v),
+            None => k,
+        }
+    }
+
+    /// keys::mix of the person key of user key `k`, whose hash `h` =
+    /// keys::mix(k) is known (the user's own hash when it is not linked).
+    /// With `mixed` the table already holds the mixed value.
+    #[inline(always)]
+    pub fn person_hash(&self, k: u64, h: u64) -> u64 {
+        debug_assert_eq!(h, keys::mix(k));
+        match self.probe(k, h) {
+            Some(v) => {
+                if self.mixed {
+                    v
+                } else {
+                    keys::mix(v)
+                }
+            }
+            None => h,
+        }
+    }
+
+    /// The raw finalized slot value of key `k` (hash `h`), if `k` is in the
+    /// table: the group probe described above.
+    #[inline(always)]
+    fn probe(&self, k: u64, h: u64) -> Option<u64> {
         if self.slots.is_empty() {
-            return k;
+            return None;
         }
         if self.amask != !3 {
-            return self.person_of_h(k, h).unwrap_or(k);
+            return self.probe_slots(k, h);
         }
         let mut i = self.start(h);
         loop {
@@ -312,9 +357,26 @@ impl LinkTable {
             if m | z != 0 {
                 let j = (m | 16).trailing_zeros() as usize & 3;
                 let v = g[j][1].load(Ordering::Relaxed);
-                return if m != 0 { v } else { k };
+                return if m != 0 { Some(v) } else { None };
             }
             i = (i + 4) & self.mask;
+        }
+    }
+
+    /// `probe`, one slot at a time.
+    #[inline(always)]
+    fn probe_slots(&self, k: u64, h: u64) -> Option<u64> {
+        let mut i = self.start(h);
+        loop {
+            let s = &self.slots[i];
+            let kk = s[0].load(Ordering::Relaxed);
+            if kk == k {
+                return Some(s[1].load(Ordering::Relaxed));
+            }
+            if kk == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
         }
     }
 
@@ -391,7 +453,14 @@ mod tests {
                 let h = keys::mix(k);
                 let p = t.person_of_h(k, h).expect("inserted key present");
                 assert_eq!(t.person_or_self(k, h), p);
+                assert_eq!(t.person_hash(k, h), keys::mix(p));
                 found += 1;
+            }
+            for n in 1..=2000u64 {
+                let k = key(next());
+                let h = keys::mix(k);
+                assert_eq!(t.person_hash(k, h), keys::mix(t.person_of_h(k, h).unwrap_or(k)));
+                let _ = n;
             }
             assert!(found > 0);
         }
