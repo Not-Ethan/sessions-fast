@@ -2367,7 +2367,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let chunk = env_usize("SS_CHUNK").unwrap_or(2 << 20);
     let links_in = load_input(&data_dir.join("links"), chunk);
     let events_in = load_input(&data_dir.join("events"), chunk);
-    let clicks_in = load_input(&data_dir.join("clicks"), chunk);
+    // click tasks run last in the parse phase: half-size chunks shorten the
+    // tail where threads wait for the slowest (join idle 14-24 -> 6-8
+    // thread-ms on the twin, d7; SS_CCHUNK overrides)
+    let clicks_in = load_input(&data_dir.join("clicks"), env_usize("SS_CCHUNK").unwrap_or(chunk / 2).max(1));
     marks.mark("mmap");
     let est_lines = events_in.bytes / 75 + 1;
     let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 12));
@@ -2494,7 +2497,16 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         marks.mark("write");
         souts.iter().map(|s| s.nrows).sum()
     } else {
-        let mut outs = sess::sessions2(&sbufs, &cbufs, &ctx, &ud);
+        let mut dead = Vec::new();
+        for inp in [&links_in, &events_in, &clicks_in] {
+            for m in &inp.maps {
+                let b = m.bytes();
+                if !b.is_empty() {
+                    dead.push((b.as_ptr() as usize, b.len()));
+                }
+            }
+        }
+        let mut outs = sess::sessions2(&sbufs, &cbufs, &ctx, &ud, &dead);
         marks.mark("sessions");
         sess::write_campaign_daily2(&cd.join("part-0.parquet"), &mut outs, &ctx);
         marks.mark("write");

@@ -160,6 +160,7 @@ struct St {
     mixed_e: Vec<SRec>,
     /// persons with at most this many clicks use `attribute_small`
     bf_max: usize,
+
     /// per campaign: id of the last session it assisted (attribute_small)
     stamp: Vec<u32>,
     stamp_id: u32,
@@ -226,7 +227,7 @@ const IDLE: Slot = Slot { mn: u32::MAX, mx: 0, cnt: 0, sidx: 0 };
 
 impl St {
     fn new(ctx: &Ctx, est_rows: usize, max_ev: usize, max_cl: usize) -> St {
-        let nw = nslots(ctx).div_ceil(64);
+        let nw = SLOTS_ALL / 64;
         St {
             hist: Vec::new(),
             cur: Vec::new(),
@@ -235,6 +236,7 @@ impl St {
             cl: Buf::new(max_cl),
             mixed_e: Vec::new(),
             bf_max: crate::env_usize("SS_BF").unwrap_or(16),
+
             stamp: vec![0; ctx.ncamp.max(1)],
             stamp_id: 0,
             slot: vec![IDLE; nw * 64],
@@ -276,6 +278,7 @@ impl St {
         }
     }
 
+    #[inline(never)]
     fn partition(&mut self, q: usize, sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx) {
         let n: usize = sbufs.iter().map(|t| t.len(q)).sum();
         if n == 0 {
@@ -289,11 +292,21 @@ impl St {
         // histogram; dead copies go to the extra bucket nb
         self.hist.clear();
         self.hist.resize(nb + 2, 0);
-        for t in sbufs {
-            for sl in t.get(q) {
-                for r in sl {
-                    let b = if r.ts == DEAD { nb } else { ((r.person >> shift) & bmask) as usize };
-                    self.hist[b + 1] += 1;
+        // bucket of a record: the person-hash bits below the partition bits,
+        // or nb for a dead copy (branch-free); always <= nb
+        let bucket = |r: &SRec| -> usize {
+            let dead = 0usize.wrapping_sub((r.ts == DEAD) as usize);
+            (((r.person >> shift) & bmask) as usize & !dead) | (nb & dead)
+        };
+        {
+            let hist = &mut self.hist[..nb + 2];
+            for t in sbufs {
+                for sl in t.get(q) {
+                    for r in sl {
+                        let b = bucket(r);
+                        // b + 1 <= nb + 1 < hist.len()
+                        unsafe { *hist.get_unchecked_mut(b + 1) += 1 };
+                    }
                 }
             }
         }
@@ -307,13 +320,19 @@ impl St {
         self.ev.set_len_for_overwrite(n);
         {
             let ev = self.ev.as_mut_slice();
+            let cur = &mut self.cur[..nb + 1];
             for t in sbufs {
                 for sl in t.get(q) {
                     for r in sl {
-                        let b = if r.ts == DEAD { nb } else { ((r.person >> shift) & bmask) as usize };
-                        let c = self.cur[b] as usize;
-                        ev[c] = *r;
-                        self.cur[b] = c as u32 + 1;
+                        let b = bucket(r);
+                        // b <= nb < cur.len(); cur[b] < hist[b + 1] <= n = ev.len()
+                        // (same buckets as the histogram over the same records)
+                        unsafe {
+                            let c = *cur.get_unchecked(b) as usize;
+                            debug_assert!(c < ev.len());
+                            *ev.get_unchecked_mut(c) = *r;
+                            *cur.get_unchecked_mut(b) = c as u32 + 1;
+                        }
                     }
                 }
             }
@@ -453,16 +472,24 @@ impl St {
         self.acc.start();
         // 1. slots
         self.pur.clear();
-        for r in es {
-            let t = r.ts;
-            let s = (t / W) as usize;
-            let a = &mut self.slot[s];
-            a.mn = a.mn.min(t);
-            a.mx = a.mx.max(t);
-            a.cnt += 1;
-            self.bits[s >> 6] |= 1u64 << (s & 63);
-            if r.pay != 0 {
-                self.pur.push((t, r.pay));
+        // bit w: bitmap word w is non-zero
+        let mut summary = 0u64;
+        {
+            let slot = &mut self.slot[..SLOTS_ALL];
+            let bits = &mut self.bits[..SLOTS_ALL / 64];
+            for r in es {
+                let t = r.ts;
+                let s = (t / W) as usize;
+                // s <= u32::MAX / W < SLOTS_ALL
+                let a = unsafe { slot.get_unchecked_mut(s) };
+                a.mn = a.mn.min(t);
+                a.mx = a.mx.max(t);
+                a.cnt += 1;
+                unsafe { *bits.get_unchecked_mut(s >> 6) |= 1u64 << (s & 63) };
+                summary |= 1u64 << (s >> 6);
+                if r.pay != 0 {
+                    self.pur.push((t, r.pay));
+                }
             }
         }
         self.acc.lap(P_SLOTS);
@@ -470,11 +497,10 @@ impl St {
         self.sess.clear();
         let mut last_slot = usize::MAX - 1;
         let mut last_max = 0u32;
-        for w in 0..self.bits.len() {
+        while summary != 0 {
+            let w = summary.trailing_zeros() as usize;
+            summary &= summary - 1;
             let mut word = self.bits[w];
-            if word == 0 {
-                continue;
-            }
             self.bits[w] = 0;
             while word != 0 {
                 let s = w * 64 + word.trailing_zeros() as usize;
@@ -709,14 +735,19 @@ impl St {
     }
 }
 
-/// Number of 30-minute slots in the event window.
-fn nslots(ctx: &Ctx) -> usize {
-    ((ctx.we - ctx.ws - 1) / W as i64) as usize + 1
-}
+/// Slot arrays cover every u32 offset (u32::MAX / W < 2432), so a slot
+/// index computed from any u32 is in bounds; real offsets are below the
+/// window length (at most 24 days: 1152 slots, 18 bitmap words).
+const SLOTS_ALL: usize = 2432;
+const _: () = assert!(((u32::MAX / W) as usize) < SLOTS_ALL && SLOTS_ALL % 64 == 0 && SLOTS_ALL / 64 <= 64);
 
 /// Sessions, attribution and aggregation per person partition; each thread
 /// then writes its own user_daily part file.
-pub fn sessions2(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: &Path) -> Vec<Out2> {
+/// `dead`: further memory ranges nobody reads during this phase (the input
+/// file mappings); with every arena allocated before this phase, they are
+/// released in parallel once all partitions are done (SS_KEEPMEM keeps
+/// them), so the single-threaded exit teardown has less to free.
+pub fn sessions2(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: &Path, dead: &[(usize, usize)]) -> Vec<Out2> {
     if prof::ON.load(Ordering::Relaxed) {
         name_slots();
     }
@@ -730,12 +761,41 @@ pub fn sessions2(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: 
     // generous: the arenas only take memory where written
     let est_rows = total / ctx.threads / 4 + 4096;
     let next = AtomicUsize::new(0);
+    // Arenas that exist now (parse and dedup outputs, link table) are only
+    // read by the partition loop below; arenas allocated from here on
+    // (this phase's buffers and output columns) are not in the list.
+    let release = std::env::var("SS_KEEPMEM").is_err();
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    if release {
+        for (a, l) in sys::arenas().into_iter().chain(dead.iter().copied()) {
+            let mut o = 0;
+            while o < l {
+                let n = (l - o).min(32 << 20);
+                pieces.push((a + o, n));
+                o += n;
+            }
+        }
+    }
+    let bar = std::sync::Barrier::new(ctx.threads);
+    let next_piece = AtomicUsize::new(0);
     par(ctx.threads, |t| {
         let mut st = St::new(ctx, est_rows, max_ev, max_cl);
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(&(_, q)) = order.get(i) else { break };
             st.partition(q, sbufs, cbufs, ctx);
+        }
+        if release {
+            // this thread's partition buffers are done with
+            sys::release(st.ev.ptr as usize, st.ev.cap * std::mem::size_of::<SRec>());
+            sys::release(st.cl.ptr as usize, st.cl.cap * std::mem::size_of::<Cl>());
+            // after every thread's last partition, the inputs are dead
+            bar.wait();
+            loop {
+                let i = next_piece.fetch_add(1, Ordering::Relaxed);
+                let Some(&(a, l)) = pieces.get(i) else { break };
+                sys::release(a, l);
+            }
         }
         if t == 0 || st.cols.n > 0 {
             st.acc.start();
