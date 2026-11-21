@@ -26,7 +26,11 @@ VARIANTS = [
     {"NCPU": "3", "SS_PE_BITS": "2", "SS_PS_BITS": "9", "SS_CHUNK": "65536"},
     {"NCPU": "1", "SS_PE_BITS": "11", "SS_PS_BITS": "3"},
     {"NCPU": "5", "SS_CAPDIV": "50", "SS_CHUNK": "300000"},
+    {"NCPU": "4", "SS_LEGACY": "1", "SS_PS_BITS": "7"},
+    {"NCPU": "6", "SS_LOCBITS": "5", "SS_PS_BITS": "4", "SS_CHUNK": "100000"},
 ]
+if os.environ.get("CROSSCHECK_VARIANTS"):
+    VARIANTS = [VARIANTS[int(i)] for i in os.environ["CROSSCHECK_VARIANTS"].split(",")]
 
 
 def main():

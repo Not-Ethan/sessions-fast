@@ -13,7 +13,7 @@ SECTIONS=${SECTIONS:-"info native docker compare fixtures"}
 SEEDS=${SEEDS:-"7"}
 has() { case " $SECTIONS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 G=${GEN:-generate}
-PHASES='total=[0-9.]*ms|parse=[0-9.]*ms\(cpu [0-9]*|dedup=[0-9.]*ms\(cpu [0-9]*|sessions=[0-9.]*ms\(cpu [0-9]*'
+PHASES='total=[0-9.]*ms|links=[0-9.]*ms|parse=[0-9.]*ms\(cpu [0-9]*|dedup=[0-9.]*ms\(cpu [0-9]*|sessions=[0-9.]*ms\(cpu [0-9]*'
 
 if has info; then
   echo "=== info"
@@ -39,8 +39,7 @@ for seed in $SEEDS; do
   echo "=== seed $seed: $(du -sh $D | cut -f1), $(ls $D/events | wc -l) event files"
   if has stages; then
     echo "--- single-thread stage costs (new binary, best of 3 passes)"
-    NCPU=1 SS_BENCH=scan,line,ev,evre,push16,evb,evbre "$W/new-bin" $D $O/x 2>&1
-    NCPU=1 SS_TSW=1 SS_BENCH=line "$W/new-bin" $D $O/x 2>&1 | sed 's/^/tsw /'
+    NCPU=1 SS_BENCH=scan,line,ev,push28,push16,push16wc "$W/new-bin" $D $O/x 2>&1
     PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
     if [ -n "$PERF" ]; then
       sudo env SS_BENCH=ev "$PERF" record -F 4999 -o /tmp/perf_ev.data "$W/prof-bin" $D $O/x 2>&1 | tail -1
@@ -57,6 +56,7 @@ for seed in $SEEDS; do
         nat base "$W/base-bin" $D $n
         nat new "$W/new-bin" $D $n
         nat new-legacy "$W/new-bin" $D $n SS_LEGACY=1
+        nat new-nowc "$W/new-bin" $D $n SS_NOWC=1
       done
     done
   fi
@@ -92,12 +92,14 @@ if has fixtures; then
 fi
 
 if has perf; then
-  echo "=== perf (new, 1 thread)"
+  echo "=== perf (new, whole pipeline, 1 thread)"
   PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
   D=/dev/shm/d$(echo $SEEDS | cut -d' ' -f1)
   if [ -n "$PERF" ] && [ -x "$W/prof-bin" ]; then
     sudo rm -rf $O/nat
-    sudo env NCPU=1 "$PERF" record -F 4999 -o /tmp/perf.data "$W/prof-bin" "$D" $O/nat 2>&1 | tail -1
-    sudo "$PERF" report -i /tmp/perf.data --stdio --no-children --sort symbol 2>/dev/null | grep -E "^ +[0-9]" | head -40 | cut -c1-150
+    sudo env NCPU=1 SS_VERBOSE=1 "$PERF" record -F 2999 -o /tmp/perf.data "$W/prof-bin" "$D" $O/nat 2>&1 | grep -E "parse=|perf record" | tr '|' '\n' | grep -E "parse|dedup|sessions=|perf"
+    sudo "$PERF" report -i /tmp/perf.data --stdio --no-children --sort symbol 2>/dev/null | grep -E "^ +[0-9]" | head -25 | cut -c1-160
+    echo "--- hottest source lines"
+    timeout 400 sudo "$PERF" report -i /tmp/perf.data --stdio --no-children --sort srcline 2>/dev/null | grep -E "^ +[0-9]" | head -90 | cut -c1-160
   fi
 fi

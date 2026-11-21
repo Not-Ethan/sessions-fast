@@ -464,7 +464,7 @@ fn event_line_slow<S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut S) {
 /// `safe_end` is the end address of readable memory after `b` (>= its end).
 #[inline(always)]
 fn event_task<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
-    scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
+    scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, #[inline(always)] |f| {
         if f[0].is_empty() {
             return;
         }
@@ -491,7 +491,7 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
         r.person = lt.person_of(r.person);
         c.push(part(r.person, ctx.ps_bits), r);
     };
-    scan::for_each_record_x::<4, _, AVX2>(b, task.start, task.end, |f| {
+    scan::for_each_record_x::<4, _, AVX2>(b, task.start, task.end, #[inline(always)] |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -921,12 +921,16 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
     let bar = std::sync::Barrier::new(nl);
     let cell: std::sync::OnceLock<LinkTable> = std::sync::OnceLock::new();
     let (f1, f2) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let t0 = Instant::now();
     let outs = par(ctx.threads, |t| {
         link_worker(t, links_in, &lnext, &pairs, &bar, &cell, &f1, &f2);
+        if t == 0 {
+            LINKS_US.store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         let lt = cell.get().unwrap();
         let mut sink = BSink {
-            a: Parts::new(pe, cap_a),
-            s: Parts::new(ps, cap_s),
+            a: Parts::with_wc(pe, cap_a, true),
+            s: Parts::with_wc(ps, cap_s, true),
             ring: [Pending::default(); BRING],
             rh: 0,
             rn: 0,
@@ -970,10 +974,15 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
                 }
             }
         }
+        sink.a.finish();
+        sink.s.finish();
         BOut { a: sink.a, s: sink.s, c, overflow: sink.overflow }
     });
     (cell.into_inner().unwrap(), outs)
 }
+
+/// Wall time of the links step of `parse_b` (verbose report).
+static LINKS_US: AtomicU64 = AtomicU64::new(0);
 
 /// Records per sub-bucket targeted by the in-cache split in `dedup_b`.
 const SUB_B: usize = 8 * 1024;
@@ -1793,9 +1802,10 @@ fn main() {
     if verbose {
         let rows: usize = souts.iter().map(|s| s.nrows).sum();
         eprintln!(
-            "sessions: {} | pipeline={} threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB",
+            "sessions: {} | pipeline={} links={:.1}ms threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB",
             marks.report(),
             pipeline,
+            LINKS_US.load(Ordering::Relaxed) as f64 / 1e3,
             threads,
             ctx.avx2,
             pe_bits,
@@ -1822,7 +1832,7 @@ impl EvSink for NullSink {
 }
 
 #[inline(always)]
-fn bench_task<const AVX2: bool>(stage: &str, b: &[u8], task: Task, ctx: &Ctx, parts: &mut (Parts<ERec>, u32)) -> u64 {
+fn bench_task<const AVX2: bool>(stage: &str, b: &[u8], task: Task, ctx: &Ctx, parts: &mut (Parts<ERec>, u32), a16: &mut Parts<ARec>) -> u64 {
     let mut acc = 0u64;
     let end = b.as_ptr() as usize + b.len();
     match stage {
@@ -1858,13 +1868,17 @@ fn bench_task<const AVX2: bool>(stage: &str, b: &[u8], task: Task, ctx: &Ctx, pa
             acc = ns.0;
         }
         "ev" | "evre" => event_task::<AVX2, _>(b, task, ctx, parts, end),
-        "push16" => {
-            // a 16-byte record per line into 256 partitions chosen by a hash
+        "push28" | "push16" | "push16wc" => {
+            // one record per line into 256 partitions chosen by a hash
             let mut i = task.start as u64;
             scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
                 i = i.wrapping_add(f[3].len() as u64 + 1);
                 let h = keys::mix(i);
-                parts.0.push((h >> 56) as usize, ERec { eid: h, user: 0, ingest: 0, ts: 0, pay: 0 });
+                if stage == "push28" {
+                    parts.0.push((h >> 56) as usize, ERec { eid: h, user: 0, ingest: 0, ts: 0, pay: 0 });
+                } else {
+                    a16.push((h >> 56) as usize, ARec { eid: h, ingest: 0, loc: 0 });
+                }
             })
         }
         _ => fail("unknown SS_BENCH stage"),
@@ -1874,8 +1888,8 @@ fn bench_task<const AVX2: bool>(stage: &str, b: &[u8], task: Task, ctx: &Ctx, pa
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn bench_task_avx2(stage: &str, b: &[u8], task: Task, ctx: &Ctx, parts: &mut (Parts<ERec>, u32)) -> u64 {
-    bench_task::<true>(stage, b, task, ctx, parts)
+unsafe fn bench_task_avx2(stage: &str, b: &[u8], task: Task, ctx: &Ctx, parts: &mut (Parts<ERec>, u32), a16: &mut Parts<ARec>) -> u64 {
+    bench_task::<true>(stage, b, task, ctx, parts, a16)
 }
 
 /// SS_BENCH=STAGE: single-threaded stage benchmark over events/, best of 3
@@ -1898,20 +1912,22 @@ fn bench_stages(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
             fresh = (Parts::<ERec>::new(1 << ctx.pe_bits, est / (1 << ctx.pe_bits) * 3 / 2 + 64), ctx.pe_bits);
             &mut fresh
         };
+        let mut a16 = Parts::<ARec>::with_wc(256, est / 256 * 3 / 2 + 64, stage == "push16wc");
         let t = Instant::now();
         for task in &ev.tasks {
             let b = ev.maps[task.file as usize].bytes();
             acc = acc.wrapping_add(if ctx.avx2 {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    bench_task_avx2(stage, b, *task, ctx, parts)
+                    bench_task_avx2(stage, b, *task, ctx, parts, &mut a16)
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 0
             } else {
-                bench_task::<false>(stage, b, *task, ctx, parts)
+                bench_task::<false>(stage, b, *task, ctx, parts, &mut a16)
             });
         }
+        a16.finish();
         best = best.min(t.elapsed().as_secs_f64() * 1e3);
         acc = acc.wrapping_add(parts.0.total() as u64);
     }
