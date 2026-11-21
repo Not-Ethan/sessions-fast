@@ -56,6 +56,18 @@ impl<T: Copy> Parts<T> {
         }
     }
 
+    /// Touches every page of the arena (benchmark only: separates page-fault
+    /// cost from record writing).
+    pub fn prefault(&self) {
+        let bytes = self.lens.len() * self.cap * std::mem::size_of::<T>();
+        let p = self.arena as *mut u8;
+        let mut i = 0;
+        while i < bytes {
+            unsafe { p.add(i).write_volatile(0) };
+            i += 4096;
+        }
+    }
+
     #[inline(always)]
     pub fn push(&mut self, p: usize, v: T) {
         let l = self.lens[p] as usize;

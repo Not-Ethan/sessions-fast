@@ -480,6 +480,20 @@ struct ParseOut {
 /// late, (user key, ts - window_start in ms, pay).
 trait EvSink {
     fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>);
+
+    /// The parsed copies of a batch (lines with `ing == i64::MIN` were
+    /// dropped and are skipped), in any order. Default: one `copy` each.
+    #[inline(always)]
+    fn copy_batch(&mut self, bt: &EvBatch, n: usize, ctx: &Ctx) {
+        for i in 0..n {
+            let ing = bt.ing[i];
+            if ing == i64::MIN {
+                continue;
+            }
+            let valid = if bt.ok[i] { Some((bt.user[i], (bt.ts[i] - ctx.ws) as u32, bt.pay[i])) } else { None };
+            self.copy(bt.eid[i], ingest_rel(ing, ctx.ws_s), valid);
+        }
+    }
 }
 
 /// Legacy pipeline: one ERec per copy, routed by event_id.
@@ -647,6 +661,12 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn event_task_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, e: &mut S, safe_end: usize) {
     event_task::<true, S>(b, task, ctx, e, safe_end)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn event_task_batched_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, e: &mut S, safe_end: usize, bt: &mut EvBatch) {
+    event_task_batched::<true, S>(b, task, ctx, e, safe_end, bt, 7);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1105,6 +1125,8 @@ struct BSink<'a> {
     use_bulk: bool,
     bulk: [Pending; BULK_CAP],
     bn: usize,
+    /// batched output for batched parsing (SS_BATCHOUT=0 disables)
+    batch_out: bool,
     /// global event_id table mode (no dedup records); kills to apply later
     gt: Option<&'a EidTable>,
     kills: Vec<u32>,
@@ -1184,6 +1206,61 @@ const BULK_CAP: usize = const_usize(option_env!("SS_BULKCAP"), 48);
 const BULK_RUN: usize = const_usize(option_env!("SS_BULKRUN"), 32);
 
 impl EvSink for BSink<'_> {
+    /// Batched output: hash users and prefetch their link-table slots for the
+    /// whole batch, resolve persons, then write the session records, then the
+    /// dedup records (one write-combining stream at a time). Same records as
+    /// `copy` per line; only the order within the batch differs.
+    #[inline(always)]
+    fn copy_batch(&mut self, bt: &EvBatch, n: usize, ctx: &Ctx) {
+        if !self.batch_out || self.gt.is_some() || self.nolookup || self.direct || self.cache.on {
+            for i in 0..n {
+                let ing = bt.ing[i];
+                if ing == i64::MIN {
+                    continue;
+                }
+                let valid = if bt.ok[i] { Some((bt.user[i], (bt.ts[i] - ctx.ws) as u32, bt.pay[i])) } else { None };
+                self.copy(bt.eid[i], ingest_rel(ing, ctx.ws_s), valid);
+            }
+            return;
+        }
+        let mut h = [0u64; EB];
+        for i in 0..n {
+            if bt.ok[i] {
+                h[i] = keys::mix(bt.user[i]);
+                self.lt.prefetch_h(h[i]);
+            }
+        }
+        let mut hp = [0u64; EB];
+        for i in 0..n {
+            if bt.ok[i] {
+                hp[i] = person_hash(self.lt, bt.user[i], h[i]);
+            }
+        }
+        let mut loc = [LOC_NONE; EB];
+        for i in 0..n {
+            if bt.ok[i] {
+                let person = hp[i];
+                let q = (person >> (64 - self.ps_bits)) as usize;
+                let k = self.s.len(q);
+                self.s.push(q, SRec { person, ts: (bt.ts[i] - ctx.ws) as u32, pay: bt.pay[i] });
+                loc[i] = if k < self.lb.imax {
+                    self.tbase | ((q as u32) << self.lb.ibits) | k as u32
+                } else {
+                    self.overflow = true;
+                    LOC_NONE
+                };
+            }
+        }
+        for i in 0..n {
+            let ing = bt.ing[i];
+            if ing == i64::MIN {
+                continue;
+            }
+            let eid = bt.eid[i];
+            self.a.push((eid >> (64 - self.pe_bits)) as usize, ARec { eid, ingest: ingest_rel(ing, ctx.ws_s), loc: loc[i] });
+        }
+    }
+
     #[inline(always)]
     fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>) {
         match valid {
@@ -1296,12 +1373,15 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
             gt,
             kills: Vec::new(),
             fresh: 0,
+            batch_out: std::env::var("SS_BATCHOUT").map_or(true, |v| v != "0"),
         };
         // table mode: the bulk queue also carries invalid copies
         if gt.is_some() {
             sink.use_bulk = true;
         }
         let mut c: Parts<CRec> = Parts::with_wc(ps, cap_c, true);
+        let batched = std::env::var("SS_BATCH").is_ok();
+        let mut evb = EvBatch::new();
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= ntasks {
@@ -1311,7 +1391,16 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
                 let task = ev.tasks[i];
                 let b = ev.maps[task.file as usize].bytes();
                 let safe_end = b.as_ptr() as usize + b.len();
-                if avx2 {
+                if batched {
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            event_task_batched_avx2(b, task, ctx, &mut sink, safe_end, &mut evb)
+                        }
+                    } else {
+                        event_task_batched::<false, _>(b, task, ctx, &mut sink, safe_end, &mut evb, 7);
+                    }
+                } else if avx2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
                         event_task_avx2(b, task, ctx, &mut sink, safe_end)
@@ -2584,6 +2673,144 @@ fn floor_bench(ev: &Input, ctx: &Ctx) {
 }
 
 
+// ---------------------------------------------------------------- batched event parsing
+//
+// The scanner appends each well-formed line's field offsets/lengths to a
+// block of EB lines (structure of arrays); each column is then decoded in its
+// own loop over the block (independent iterations), and the copies are handed
+// to the sink in a last loop. The per-column functions are exactly those of
+// `event_line`, so each copy's (eid, ingest, valid) is the same; only the
+// order of copies differs (lines near a buffer end take the per-line path at
+// once), and copy order cannot change results (dedup ties are between
+// identical copies; session records are grouped and sorted downstream).
+
+const EB: usize = 64;
+
+struct EvBatch {
+    n: usize,
+    off: [[u32; EB]; 7],
+    len: [[u32; EB]; 7],
+    ing: [i64; EB],
+    ts: [i64; EB],
+    eid: [u64; EB],
+    pay: [u32; EB],
+    user: [u64; EB],
+    ok: [bool; EB],
+}
+
+impl EvBatch {
+    fn new() -> Box<EvBatch> {
+        Box::new(EvBatch {
+            n: 0,
+            off: [[0; EB]; 7],
+            len: [[0; EB]; 7],
+            ing: [0; EB],
+            ts: [0; EB],
+            eid: [0; EB],
+            pay: [0; EB],
+            user: [0; EB],
+            ok: [false; EB],
+        })
+    }
+}
+
+/// Field j of batched line i.
+#[inline(always)]
+fn bfield<'a>(bt: &EvBatch, base: *const u8, j: usize, i: usize) -> &'a [u8] {
+    unsafe { std::slice::from_raw_parts(base.add(bt.off[j][i] as usize), bt.len[j][i] as usize) }
+}
+
+/// Decodes and emits the batched lines, column by column. `upto` < 7 stops
+/// after a stage (benchmark); 7 = everything.
+#[inline(always)]
+fn ev_batch_flush<S: EvSink>(bt: &mut EvBatch, base: *const u8, ctx: &Ctx, sink: &mut S, upto: u32) -> u64 {
+    let n = bt.n;
+    bt.n = 0;
+    let mut acc = 0u64;
+    let (ws, we) = (ctx.ws, ctx.we);
+    if upto >= 1 {
+        for i in 0..n {
+            bt.ing[i] = ctx.tsp.parse(bfield(bt, base, 3, i)).unwrap_or(i64::MIN);
+        }
+    }
+    if upto >= 2 {
+        for i in 0..n {
+            bt.eid[i] = keys::mix(unsafe { keys::key_of_wide(bfield(bt, base, 0, i)) });
+        }
+    }
+    if upto >= 3 {
+        for i in 0..n {
+            bt.ts[i] = ctx.tsp.parse(bfield(bt, base, 2, i)).unwrap_or(i64::MIN);
+        }
+    }
+    if upto >= 4 {
+        for i in 0..n {
+            let t = bt.ts[i];
+            let mut ok = (bt.len[1][i] != 0) & (bt.len[5][i] != 0) & (t != i64::MIN) & (t >= ws) & (t < we);
+            let mut pay = 0u32;
+            if ok {
+                match event_pay(bfield(bt, base, 4, i), bfield(bt, base, 6, i), bfield(bt, base, 5, i), ctx, true) {
+                    Some(p) => pay = p,
+                    None => ok = false,
+                }
+            }
+            // the late check (only meaningful when the copy is kept at all)
+            ok &= bt.ing[i] != i64::MIN && bt.ing[i] - t <= LATE;
+            bt.ok[i] = ok;
+            bt.pay[i] = pay;
+        }
+    }
+    if upto >= 5 {
+        for i in 0..n {
+            if bt.ok[i] {
+                bt.user[i] = unsafe { keys::key_of_wide(bfield(bt, base, 1, i)) };
+            }
+        }
+    }
+    if upto >= 6 {
+        sink.copy_batch(bt, n, ctx);
+    } else {
+        for i in 0..n {
+            acc = acc
+                .wrapping_add(bt.off[3][i] as u64)
+                .wrapping_add(bt.ing[i] as u64)
+                .wrapping_add(bt.eid[i])
+                .wrapping_add(bt.ts[i] as u64)
+                .wrapping_add(bt.pay[i] as u64 ^ bt.ok[i] as u64)
+                .wrapping_add(bt.user[i]);
+        }
+    }
+    acc
+}
+
+/// `event_task`, batched (see above). `upto` as in `ev_batch_flush`.
+#[inline(always)]
+fn event_task_batched<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize, bt: &mut EvBatch, upto: u32) -> u64 {
+    let base = b.as_ptr();
+    let mut acc = 0u64;
+    scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, #[inline(always)] |f| {
+        if f[0].is_empty() {
+            return;
+        }
+        if f[6].as_ptr() as usize + 32 > safe_end {
+            if upto >= 6 {
+                event_line_slow(f, ctx, sink);
+            }
+            return;
+        }
+        let i = bt.n;
+        for j in 0..7 {
+            bt.off[j][i] = (f[j].as_ptr() as usize - base as usize) as u32;
+            bt.len[j][i] = f[j].len() as u32;
+        }
+        bt.n = i + 1;
+        if bt.n == EB {
+            acc = acc.wrapping_add(ev_batch_flush(bt, base, ctx, sink, upto));
+        }
+    });
+    acc.wrapping_add(ev_batch_flush(bt, base, ctx, sink, upto))
+}
+
 // ---------------------------------------------------------------- parse decomposition
 // SS_DECOMP=1: cumulative event-parse stages, single thread and NCPU threads,
 // thread-time per event line (each stage includes everything before it).
@@ -2620,12 +2847,31 @@ fn decomp_task<const AVX2: bool>(stage: u32, b: &[u8], task: Task, ctx: &Ctx, si
             acc = ns.0;
         }
         // + record scatter (dedup + session records, no person lookup), + lookup
-        _ => {
+        6..=8 => {
             event_task::<AVX2, _>(b, task, ctx, sink, end);
             sink.flush();
         }
+        // batched: 9 split, 10 +ingest, 11 +eid, 12 +ts, 13 +valid/pay, 14 +user,
+        // 15 +scatter (no lookup), 16 +lookup
+        _ => {
+            let bt = BT.with(|c| c.as_ptr());
+            let bt = unsafe { &mut **bt };
+            let upto = stage - 9;
+            if upto >= 6 {
+                acc = event_task_batched::<AVX2, _>(b, task, ctx, sink, end, bt, 7);
+                sink.flush();
+            } else {
+                let mut ns = NullSink(0);
+                acc = event_task_batched::<AVX2, _>(b, task, ctx, &mut ns, end, bt, upto);
+                acc = acc.wrapping_add(ns.0);
+            }
+        }
     }
     acc
+}
+
+thread_local! {
+    static BT: std::cell::RefCell<Box<EvBatch>> = std::cell::RefCell::new(EvBatch::new());
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2647,8 +2893,32 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
     let pe = 1usize << ctx.pe_bits;
     let ps = 1usize << ctx.ps_bits;
     let est = ev.bytes / 72 + 1;
-    let names = ["split", "+event_id", "+user_id", "+ts", "+ingest", "+type/product/price/valid", "+scatter(no lookup)", "+person lookup", "(stage 5)+scatter direct, no ring"];
-    for stage in 0..9u32 {
+    let names = [
+        "split",
+        "+event_id",
+        "+user_id",
+        "+ts",
+        "+ingest",
+        "+type/product/price/valid",
+        "+scatter(no lookup)",
+        "+person lookup",
+        "(stage 5)+scatter direct, no ring",
+        "B: split into SoA",
+        "B: +ingest column",
+        "B: +event_id column",
+        "B: +ts column",
+        "B: +type/product/price/valid",
+        "B: +user_id column",
+        "B: +scatter(no lookup)",
+        "B: +person lookup",
+    ];
+    let stages: Vec<u32> = std::env::var("SS_DECOMP_STAGES")
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_else(|| (0..17).collect());
+    let prefault = std::env::var("SS_DECOMP_PREFAULT").is_ok();
+    static PREF_NS: AtomicU64 = AtomicU64::new(0);
+    for stage in stages {
         for &nt in &[1usize, ctx.threads] {
             let mut best = (f64::MAX, 0f64);
             for _ in 0..3 {
@@ -2671,13 +2941,20 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
                         pe_bits: ctx.pe_bits,
                         ps_bits: ctx.ps_bits,
                         lb,
-                        nolookup: stage == 6,
+                        nolookup: stage == 6 || stage == 15,
                         direct: stage == 8,
                         cache: PCache::new(),
                         gt: None,
                         kills: Vec::new(),
                         fresh: 0,
+                        batch_out: std::env::var("SS_BATCHOUT").map_or(true, |v| v != "0"),
                     };
+                    if prefault {
+                        let t0 = sys::thread_cpu_ns();
+                        sink.a.prefault();
+                        sink.s.prefault();
+                        PREF_NS.fetch_add(sys::thread_cpu_ns() - t0, Ordering::Relaxed);
+                    }
                     let mut a = 0u64;
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -2699,7 +2976,7 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
                     a ^ sink.a.total() as u64
                 });
                 let wall = t.elapsed().as_secs_f64() * 1e3;
-                let cpu = PHASE_CPU_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+                let cpu = (PHASE_CPU_NS.swap(0, Ordering::Relaxed) as f64 - PREF_NS.swap(0, Ordering::Relaxed) as f64) / 1e6;
                 std::hint::black_box(accs);
                 sys::release_from(keep);
                 if wall < best.0 {
@@ -2864,6 +3141,7 @@ fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
         gt: None,
         kills: Vec::new(),
         fresh: 0,
+        batch_out: false,
     };
     let mut reused = mk(&lt);
     let mut best = f64::MAX;
