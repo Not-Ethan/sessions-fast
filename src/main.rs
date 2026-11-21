@@ -5,6 +5,9 @@ mod links;
 mod parts;
 mod lookup;
 mod parquet;
+mod prof;
+mod cbench;
+mod sess;
 mod scan;
 mod sys;
 mod ts;
@@ -264,22 +267,32 @@ fn load_input(dir: &Path, chunk: usize) -> Input {
 
 static PHASE_CPU_NS: AtomicU64 = AtomicU64::new(0);
 static PHASE_MAX_NS: AtomicU64 = AtomicU64::new(0);
+/// Summed time threads spent finished but waiting for the join (ns).
+static PHASE_IDLE_NS: AtomicU64 = AtomicU64::new(0);
+/// Latest thread start after the phase began (ns).
+static PHASE_SPAWN_NS: AtomicU64 = AtomicU64::new(0);
 
 fn par<R: Send>(threads: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
+    let t0 = Instant::now();
     std::thread::scope(|s| {
         let f = &f;
         let hs: Vec<_> = (0..threads)
             .map(|t| {
                 s.spawn(move || {
+                    PHASE_SPAWN_NS.fetch_max(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let r = f(t);
                     let ns = sys::thread_cpu_ns();
                     PHASE_CPU_NS.fetch_add(ns, Ordering::Relaxed);
                     PHASE_MAX_NS.fetch_max(ns, Ordering::Relaxed);
-                    r
+                    (r, t0.elapsed())
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+        let rs: Vec<_> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+        let tj = t0.elapsed();
+        let idle: u64 = rs.iter().map(|(_, e)| tj.saturating_sub(*e).as_nanos() as u64).sum();
+        PHASE_IDLE_NS.fetch_add(idle, Ordering::Relaxed);
+        rs.into_iter().map(|(r, _)| r).collect()
     })
 }
 
@@ -293,7 +306,7 @@ struct Marks {
     verbose: bool,
     /// minor faults at the previous mark (verbose only)
     flt: i64,
-    items: Vec<(&'static str, f64, f64, f64, i64)>,
+    items: Vec<(&'static str, f64, f64, f64, i64, f64, f64)>,
 }
 
 impl Marks {
@@ -316,13 +329,15 @@ impl Marks {
             df = f - self.flt;
             self.flt = f;
         }
-        self.items.push((name, (now - self.prev).as_secs_f64() * 1e3, cpu, mx, df));
+        let idle = PHASE_IDLE_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        let spawn = PHASE_SPAWN_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        self.items.push((name, (now - self.prev).as_secs_f64() * 1e3, cpu, mx, df, idle, spawn));
         self.prev = now;
     }
     fn report(&self) -> String {
         let mut s = format!("total={:.1}ms |", self.t0.elapsed().as_secs_f64() * 1e3);
-        for (n, w, c, m, f) in &self.items {
-            s.push_str(&format!(" {}={:.1}ms(cpu {:.0}/max {:.0} flt {})", n, w, c, m, f));
+        for (n, w, c, m, f, idle, spawn) in &self.items {
+            s.push_str(&format!(" {}={:.1}ms(cpu {:.0}/max {:.0} flt {} idle {:.1} spawn {:.2})", n, w, c, m, f, idle, spawn));
         }
         let (ut, st, minf, majf, nvcsw, nivcsw) = sys::rusage();
         s.push_str(&format!(
@@ -596,9 +611,21 @@ fn event_task<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink
     });
 }
 
+/// Receives every valid click, routed by person (partition `q`).
+trait CSink {
+    fn push_click(&mut self, q: usize, r: CRec);
+}
+
+impl CSink for Parts<CRec> {
+    #[inline(always)]
+    fn push_click(&mut self, q: usize, r: CRec) {
+        self.push(q, r)
+    }
+}
+
 /// One chunk of clicks/: parse, validate, resolve the person, route by person.
 #[inline(always)]
-fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>, safe_end: usize, cache: &mut PCache) {
+fn click_task<const AVX2: bool, C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut C, safe_end: usize, cache: &mut PCache) {
     let we = ctx.we;
     let cws = ctx.ws - WEEK;
     // Person lookups go through a small ring so the link-table slot can be
@@ -607,11 +634,11 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
     let mut ring = [(CRec { person: 0, ck: 0, ts: 0, camp: 0, _pad: 0 }, 0u64); RING];
     let mut rh = 0usize;
     let mut rn = 0usize;
-    let emit = |c: &mut Parts<CRec>, cache: &mut PCache, (mut r, h): (CRec, u64)| {
+    let emit = |c: &mut C, cache: &mut PCache, (mut r, h): (CRec, u64)| {
         let user = r.person;
         r.person = person_hash(lt, user, h);
         cache.put(user, h, r.person);
-        c.push((r.person >> (64 - ctx.ps_bits)) as usize, r);
+        c.push_click((r.person >> (64 - ctx.ps_bits)) as usize, r);
     };
     scan::for_each_record_x::<4, _, AVX2>(b, task.start, task.end, #[inline(always)] |f| {
         if f[0].is_empty() || f[1].is_empty() {
@@ -637,7 +664,7 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
         let h = keys::mix(user);
         let ck = if wide { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) };
         if let Some(hp) = cache.get(user, h) {
-            c.push((hp >> (64 - ctx.ps_bits)) as usize, CRec { person: hp, ck, ts: (t - cws) as u32, camp: camp as u32, _pad: 0 });
+            c.push_click((hp >> (64 - ctx.ps_bits)) as usize, CRec { person: hp, ck, ts: (t - cws) as u32, camp: camp as u32, _pad: 0 });
             return;
         }
         lt.prefetch_h(h);
@@ -671,8 +698,8 @@ unsafe fn event_task_batched_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, e:
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn click_task_avx2(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>, safe_end: usize, cache: &mut PCache) {
-    click_task::<true>(b, task, ctx, lt, c, safe_end, cache)
+unsafe fn click_task_avx2<C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut C, safe_end: usize, cache: &mut PCache) {
+    click_task::<true, C>(b, task, ctx, lt, c, safe_end, cache)
 }
 
 /// AVX2 + BMI1/2 available and not disabled with SS_NOAVX2.
@@ -771,7 +798,7 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
                         click_task_avx2(b, task, ctx, lt, &mut out.c, safe_end, &mut pcache)
                     }
                 } else {
-                    click_task::<false>(b, task, ctx, lt, &mut out.c, safe_end, &mut pcache)
+                    click_task::<false, _>(b, task, ctx, lt, &mut out.c, safe_end, &mut pcache)
                 }
             }
         }
@@ -1424,7 +1451,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
                         click_task_avx2(b, task, ctx, lt, &mut c, safe_end, &mut sink.cache)
                     }
                 } else {
-                    click_task::<false>(b, task, ctx, lt, &mut c, safe_end, &mut sink.cache)
+                    click_task::<false, _>(b, task, ctx, lt, &mut c, safe_end, &mut sink.cache)
                 }
                 if release {
                     sys::release_inner(b.as_ptr() as usize + task.start, b.as_ptr() as usize + task.end);
@@ -1703,6 +1730,8 @@ struct SState {
     wcount: Vec<u32>,
     wpos: Vec<u32>,
     active: Vec<u16>,
+    /// sub-phase timers (verbose)
+    acc: prof::Acc,
 }
 
 impl SState {
@@ -1722,6 +1751,7 @@ impl SState {
             wcount: vec![0; ctx.ncamp.max(1)],
             wpos: vec![0; ctx.ncamp.max(1)],
             active: Vec::new(),
+            acc: prof::Acc::new(),
         }
     }
 
@@ -1750,6 +1780,7 @@ impl SState {
     }
 
     fn flush_day(&mut self, person: u64, day: u32, sessions: u32, events: u32, revenue: u64, ctx: &Ctx, out: &mut SOut) {
+        self.acc.lap(S_WALK);
         let mut top = u32::MAX;
         let mut best = 0u64;
         for &c in &self.touched {
@@ -1764,6 +1795,7 @@ impl SState {
         }
         self.touched.clear();
         out.rows.push(URow { person, day: (ctx.first_day + day as i64) as i32, sessions, events, top, revenue });
+        self.acc.lap(S_ROWS);
     }
 
     fn partition(
@@ -1778,6 +1810,7 @@ impl SState {
         if n == 0 {
             return;
         }
+        self.acc.start();
         self.map.reset(n / 8 + 16);
         self.persons.clear();
         self.ridx.clear();
@@ -1796,6 +1829,7 @@ impl SState {
             }
         }
         let np = self.persons.len();
+        self.acc.lap(S_MAP);
         self.start.clear();
         self.start.resize(np + 1, 0);
         for &i in &self.ridx {
@@ -1823,6 +1857,7 @@ impl SState {
                 }
             }
         }
+        self.acc.lap(S_CSORT);
         // clicks of these persons
         self.cidx.clear();
         self.cstart.clear();
@@ -1862,22 +1897,40 @@ impl SState {
                 }
             }
         }
+        self.acc.lap(S_CGROUP);
         let mut ev = std::mem::take(&mut self.ev);
         let mut clicks = std::mem::take(&mut self.clicks);
-        for p in 0..np {
-            let es = &mut ev[self.start[p] as usize..self.start[p + 1] as usize];
-            let cs = &mut clicks[self.cstart[p] as usize..self.cstart[p + 1] as usize];
-            self.person(self.persons[p], es, cs, ctx, out);
+        if !self.acc.on() {
+            for p in 0..np {
+                let es = &mut ev[self.start[p] as usize..self.start[p + 1] as usize];
+                let cs = &mut clicks[self.cstart[p] as usize..self.cstart[p + 1] as usize];
+                person_sort(es, cs);
+                self.person(self.persons[p], es, cs, ctx, out);
+            }
+        } else {
+            // timed: the same work in three passes
+            for p in 0..np {
+                ev[self.start[p] as usize..self.start[p + 1] as usize].sort_unstable();
+            }
+            self.acc.lap(S_ESORT);
+            for p in 0..np {
+                person_sort(&mut [], &mut clicks[self.cstart[p] as usize..self.cstart[p + 1] as usize]);
+            }
+            self.acc.lap(S_CLSORT);
+            for p in 0..np {
+                let es = &mut ev[self.start[p] as usize..self.start[p + 1] as usize];
+                let cs = &mut clicks[self.cstart[p] as usize..self.cstart[p + 1] as usize];
+                self.person(self.persons[p], es, cs, ctx, out);
+            }
+            self.acc.lap(S_WALK);
         }
         self.ev = ev;
         self.clicks = clicks;
     }
 
+    /// Sessions, attribution and rows of one person whose events and clicks
+    /// are sorted (`person_sort`).
     fn person(&mut self, person: u64, ev: &mut [u64], cl: &mut [Click], ctx: &Ctx, out: &mut SOut) {
-        ev.sort_unstable();
-        if cl.len() > 1 {
-            cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::cmp(a.ck, b.ck)));
-        }
         let ndays = ctx.ndays;
         let organic = ctx.ncamp;
         let (mut add, mut rem) = (0usize, 0usize);
@@ -1962,6 +2015,42 @@ impl SState {
     }
 }
 
+/// Sorts a person's events by (ts, pay) and clicks by (ts, click_id).
+#[inline(always)]
+fn person_sort(ev: &mut [u64], cl: &mut [Click]) {
+    ev.sort_unstable();
+    if cl.len() > 1 {
+        cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::cmp(a.ck, b.ck)));
+    }
+}
+
+// sub-phase timer slots of the sessions phase (verbose)
+const S_MAP: usize = 0;
+const S_CSORT: usize = 1;
+const S_CGROUP: usize = 2;
+const S_ESORT: usize = 3;
+const S_CLSORT: usize = 4;
+const S_WALK: usize = 5;
+const S_ROWS: usize = 6;
+const S_ENCODE: usize = 7;
+const S_FWRITE: usize = 8;
+
+fn name_session_slots() {
+    for (i, n) in [
+        (S_MAP, "s.map"),
+        (S_CSORT, "s.countsort"),
+        (S_CGROUP, "s.clickgroup"),
+        (S_ESORT, "s.evsort"),
+        (S_CLSORT, "s.clicksort"),
+        (S_WALK, "s.walk"),
+        (S_ROWS, "s.rows"),
+        (S_ENCODE, "s.encode"),
+        (S_FWRITE, "s.fwrite"),
+    ] {
+        prof::name(i, n);
+    }
+}
+
 /// Sessions, attribution and aggregation per person partition; each thread then
 /// writes its own user_daily part file (overlapping with threads still busy).
 fn sessions(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: &Path) -> Vec<SOut> {
@@ -1985,8 +2074,9 @@ fn sessions(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: &Path
             st.partition(q, sbufs, cbufs, ctx, &mut out);
         }
         if t == 0 || !out.rows.is_empty() {
-            write_user_daily(&ud.join(format!("part-{}.parquet", t)), &out.rows, ctx);
+            write_user_daily(&ud.join(format!("part-{}.parquet", t)), &out.rows, ctx, &mut st.acc);
         }
+        st.acc.commit();
         out.nrows = out.rows.len();
         out.rows = Vec::new();
         out
@@ -1995,7 +2085,8 @@ fn sessions(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: &Path
 
 // ---------------------------------------------------------------- output
 
-fn write_user_daily(path: &Path, rows: &[URow], ctx: &Ctx) {
+fn write_user_daily(path: &Path, rows: &[URow], ctx: &Ctx, acc: &mut prof::Acc) {
+    acc.start();
     let n = rows.len();
     let mut ubytes = Vec::with_capacity(n * 10 + 16);
     let mut uends = Vec::with_capacity(n);
@@ -2030,7 +2121,10 @@ fn write_user_daily(path: &Path, rows: &[URow], ctx: &Ctx) {
         Column { name: "revenue_cents", data: Data::I64 { values: &revs } },
         Column { name: "top_category", data: Data::Str { bytes: &cbytes, ends: &cends, valid: Some(&cvalid) } },
     ];
-    parquet::write_file(path, n, &cols).unwrap_or_else(|e| fail(&format!("{}: {}", path.display(), e)));
+    let buf = parquet::encode(n, &cols);
+    acc.lap(S_ENCODE);
+    std::fs::write(path, &buf).unwrap_or_else(|e| fail(&format!("{}: {}", path.display(), e)));
+    acc.lap(S_FWRITE);
 }
 
 fn write_campaign_daily(path: &Path, souts: &[SOut], ctx: &Ctx) {
@@ -2150,6 +2244,13 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     scan::USE_V1.store(std::env::var("SS_SCAN1").is_ok(), Ordering::Relaxed);
     LINKS_US.store(0, Ordering::Relaxed);
     let mut marks = Marks::new(verbose);
+    // SS_PROF (with SS_VERBOSE): sub-phase timers; perturbs the timing a little
+    let profile = verbose && std::env::var("SS_PROF").is_ok();
+    prof::ON.store(profile, Ordering::Relaxed);
+    if profile {
+        prof::calibrate_start();
+        name_session_slots();
+    }
 
     // manifest + lookups
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).unwrap_or_else(|e| fail(&format!("manifest: {}", e)));
@@ -2241,6 +2342,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         decomp_bench(&events_in, &links_in, &ctx);
         std::process::exit(0);
     }
+    if std::env::var("SS_CDECOMP").is_ok() {
+        cbench::click_decomp(&clicks_in, &links_in, &ctx);
+        std::process::exit(0);
+    }
     if std::env::var("SS_FLOOR").is_ok() {
         floor_bench(&events_in, &ctx);
         std::process::exit(0);
@@ -2311,10 +2416,20 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let cd = out_dir.join("campaign_daily");
     std::fs::create_dir_all(&ud).unwrap_or_else(|e| fail(&format!("{}: {}", ud.display(), e)));
     std::fs::create_dir_all(&cd).unwrap_or_else(|e| fail(&format!("{}: {}", cd.display(), e)));
-    let souts = sessions(&sbufs, &cbufs, &ctx, &ud);
-    marks.mark("sessions");
-    write_campaign_daily(&cd.join("part-0.parquet"), &souts, &ctx);
-    marks.mark("write");
+    // SS_OLDSESS: the previous sessions phase (sort per person), for comparison
+    let rows: usize = if std::env::var("SS_OLDSESS").is_ok() {
+        let souts = sessions(&sbufs, &cbufs, &ctx, &ud);
+        marks.mark("sessions");
+        write_campaign_daily(&cd.join("part-0.parquet"), &souts, &ctx);
+        marks.mark("write");
+        souts.iter().map(|s| s.nrows).sum()
+    } else {
+        let outs = sess::sessions2(&sbufs, &cbufs, &ctx, &ud);
+        marks.mark("sessions");
+        sess::write_campaign_daily2(&cd.join("part-0.parquet"), &outs, &ctx);
+        marks.mark("write");
+        outs.iter().map(|o| o.nrows).sum()
+    };
     if std::env::var("SS_FREE").is_ok() {
         // Experiment: release arena pages on all threads (MADV_DONTNEED takes
         // the mmap lock shared) so that the kernel's single-threaded exit
@@ -2349,9 +2464,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     }
 
     if verbose {
-        let rows: usize = souts.iter().map(|s| s.nrows).sum();
         return format!(
-            "sessions: {} | pipeline={} links={:.1}ms {} threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB {}",
+            "sessions: {} | pipeline={} links={:.1}ms {} threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB {} | sub:{}",
             marks.report(),
             pipeline,
             LINKS_US.load(Ordering::Relaxed) as f64 / 1e3,
@@ -2363,7 +2477,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
             rows,
             keys::any_fallback(),
             sys::peak_rss_mb(),
-            sys::anon_summary()
+            sys::anon_summary(),
+            prof::report()
         );
     }
     String::new()
