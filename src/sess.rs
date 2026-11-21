@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::parts::Parts;
-use crate::{ceil_log2, fail, keys, par, parquet, prof, sys, CRec, Click, Ctx, SRec, DAY, DEAD, WEEK};
+use crate::{ceil_log2, fail, keys, par, parquet, prof, sys, CRec, Ctx, SRec, DAY, DEAD, WEEK};
 
 /// Slot width: the session gap (1,800,000 ms).
 const W: u32 = crate::GAP;
@@ -120,14 +120,21 @@ impl<T: Copy> Buf<T> {
     }
 }
 
-/// One thread's campaign_daily accumulators, indexed [day][campaign].
+/// Credited sessions, purchasing sessions and revenue of one (day, campaign).
+#[derive(Clone, Copy, Default)]
+pub struct Cred {
+    pub s: u32,
+    pub p: u32,
+    pub r: u64,
+}
+
+/// One thread's campaign_daily accumulators, indexed [campaign][day] (an
+/// assist interval of one campaign touches consecutive days).
 pub struct Out2 {
     pub nrows: usize,
-    /// [day * (ncamp + 1) + camp]; camp ncamp = organic
-    pub cs: Vec<u32>,
-    pub cp: Vec<u32>,
-    pub cr: Vec<u64>,
-    /// [day * ncamp + camp]
+    /// [camp * ndays + day]; camp ncamp = organic
+    pub cred: Vec<Cred>,
+    /// [camp * ndays + day]
     pub assist: Vec<u32>,
 }
 
@@ -151,12 +158,15 @@ struct St {
     chist: Vec<u32>,
     cl: Buf<Cl>,
     mixed_e: Vec<SRec>,
-    mixed_c: Vec<Cl>,
+    /// persons with at most this many clicks use `attribute_small`
+    bf_max: usize,
+    /// per campaign: id of the last session it assisted (attribute_small)
+    stamp: Vec<u32>,
+    stamp_id: u32,
     slot: Vec<Slot>,
     bits: Vec<u64>,
     pur: Vec<(u32, u32)>,
     sess: Vec<Sess>,
-    pc: Vec<Click>,
     catsum: Vec<u64>,
     touched: Vec<u32>,
     wcount: Vec<u32>,
@@ -164,7 +174,10 @@ struct St {
     /// session index at which the campaign entered the window
     since: Vec<u32>,
     active: Vec<u16>,
+    /// PLAIN encoding (length + bytes) of the current person's name
     ubuf: Vec<u8>,
+    /// PLAIN encoding of each category name, by rank
+    cat_plain: Vec<Vec<u8>>,
     cols: Cols,
     out: Out2,
     acc: prof::Acc,
@@ -186,6 +199,9 @@ const C_SESS: usize = 1;
 const C_MIXED: usize = 2;
 const C_PCLICK: usize = 3;
 const C_INTERVALS: usize = 4;
+const C_SMALLP: usize = 5;
+const C_SMALLC: usize = 6;
+const C_SMALLS: usize = 7;
 
 fn name_slots() {
     for (i, n) in [
@@ -201,7 +217,7 @@ fn name_slots() {
     ] {
         prof::name(i, n);
     }
-    for (i, n) in [(C_PERSONS, "persons"), (C_SESS, "sessions"), (C_MIXED, "mixed_buckets"), (C_PCLICK, "person_clicks"), (C_INTERVALS, "assist_intervals")] {
+    for (i, n) in [(C_PERSONS, "persons"), (C_SESS, "sessions"), (C_MIXED, "mixed_buckets"), (C_PCLICK, "person_clicks"), (C_INTERVALS, "assist_intervals"), (C_SMALLP, "small_persons"), (C_SMALLC, "small_clicks"), (C_SMALLS, "small_sessions")] {
         prof::cname(i, n);
     }
 }
@@ -218,12 +234,13 @@ impl St {
             chist: Vec::new(),
             cl: Buf::new(max_cl),
             mixed_e: Vec::new(),
-            mixed_c: Vec::new(),
+            bf_max: crate::env_usize("SS_BF").unwrap_or(16),
+            stamp: vec![0; ctx.ncamp.max(1)],
+            stamp_id: 0,
             slot: vec![IDLE; nw * 64],
             bits: vec![0; nw],
             pur: Vec::new(),
             sess: Vec::new(),
-            pc: Vec::new(),
             catsum: vec![0; ctx.ndays * 256],
             touched: Vec::new(),
             wcount: vec![0; ctx.ncamp.max(1)],
@@ -231,6 +248,15 @@ impl St {
             since: vec![0; ctx.ncamp.max(1)],
             active: Vec::new(),
             ubuf: Vec::with_capacity(64),
+            cat_plain: ctx
+                .cat_names
+                .iter()
+                .map(|c| {
+                    let mut v = (c.len() as u32).to_le_bytes().to_vec();
+                    v.extend_from_slice(c);
+                    v
+                })
+                .collect(),
             cols: Cols {
                 uid: Buf::new(est_rows * 16),
                 day: Buf::new(est_rows),
@@ -243,9 +269,7 @@ impl St {
             },
             out: Out2 {
                 nrows: 0,
-                cs: vec![0; ctx.ndays * (ctx.ncamp + 1)],
-                cp: vec![0; ctx.ndays * (ctx.ncamp + 1)],
-                cr: vec![0; ctx.ndays * (ctx.ncamp + 1)],
+                cred: vec![Cred::default(); ctx.ndays * (ctx.ncamp + 1)],
                 assist: vec![0; ctx.ndays * ctx.ncamp],
             },
             acc: prof::Acc::new(),
@@ -328,16 +352,17 @@ impl St {
         self.acc.lap(P_CLICKS);
         let (evp, evn) = (self.ev.ptr, self.ev.len);
         let (clp, cln) = (self.cl.ptr, self.cl.len);
-        // the buffers are not touched again until the next partition
+        // the buffers are not touched through `self` again until the next
+        // partition; each bucket's click range is handed out once
         let ev: &[SRec] = unsafe { std::slice::from_raw_parts(evp, evn) };
-        let cl: &[Cl] = unsafe { std::slice::from_raw_parts(clp, cln) };
+        let cl: &mut [Cl] = unsafe { std::slice::from_raw_parts_mut(clp, cln) };
         for b in 0..nb {
             let (e0, e1) = (self.hist[b] as usize, self.hist[b + 1] as usize);
             if e0 == e1 {
                 continue;
             }
             let es = &ev[e0..e1];
-            let cs = &cl[self.chist[b] as usize..self.chist[b + 1] as usize];
+            let cs = &mut cl[self.chist[b] as usize..self.chist[b + 1] as usize];
             let p0 = es[0].person;
             if es.iter().all(|r| r.person == p0) {
                 self.person(p0, es, cs, ctx);
@@ -350,16 +375,13 @@ impl St {
     /// A bucket holding several persons: sort events and clicks by person.
     #[cold]
     #[inline(never)]
-    fn mixed(&mut self, es: &[SRec], cs: &[Cl], ctx: &Ctx) {
+    fn mixed(&mut self, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
         self.acc.count(C_MIXED, 1);
         let mut me = std::mem::take(&mut self.mixed_e);
-        let mut mc = std::mem::take(&mut self.mixed_c);
         me.clear();
         me.extend_from_slice(es);
         me.sort_unstable_by_key(|r| r.person);
-        mc.clear();
-        mc.extend_from_slice(cs);
-        mc.sort_unstable_by_key(|c| c.person);
+        cs.sort_unstable_by_key(|c| c.person);
         let mut i = 0;
         let mut j = 0;
         while i < me.len() {
@@ -368,19 +390,18 @@ impl St {
             while k < me.len() && me[k].person == p {
                 k += 1;
             }
-            while j < mc.len() && mc[j].person < p {
+            while j < cs.len() && cs[j].person < p {
                 j += 1;
             }
             let mut l = j;
-            while l < mc.len() && mc[l].person == p {
+            while l < cs.len() && cs[l].person == p {
                 l += 1;
             }
-            self.person(p, &me[i..k], &mc[j..l], ctx);
+            self.person(p, &me[i..k], &mut cs[j..l], ctx);
             i = k;
             j = l;
         }
         self.mixed_e = me;
-        self.mixed_c = mc;
     }
 
     /// Campaign `c` enters the window while session `si` is being set up.
@@ -399,11 +420,11 @@ impl St {
     /// set up; if it was the campaign's last, the campaign assisted sessions
     /// since[c] .. si.
     #[inline(always)]
-    fn win_remove(&mut self, c: u32, si: usize, ncamp: usize) {
+    fn win_remove(&mut self, c: u32, si: usize, ndays: usize) {
         let ci = c as usize;
         self.wcount[ci] -= 1;
         if self.wcount[ci] == 0 {
-            self.assist_range(ci, self.since[ci] as usize, si, ncamp);
+            self.assist_range(ci, self.since[ci] as usize, si, ndays);
             let p = self.wpos[ci] as usize;
             let last = self.active.pop().unwrap();
             if p < self.active.len() {
@@ -415,12 +436,12 @@ impl St {
 
     /// Campaign `c` assisted the person's sessions a .. b: count them per day.
     #[inline(always)]
-    fn assist_range(&mut self, c: usize, a: usize, b: usize, ncamp: usize) {
+    fn assist_range(&mut self, c: usize, a: usize, b: usize, ndays: usize) {
         let mut i = a;
         while i < b {
             let s = self.sess[i];
             let j = (s.dend as usize).min(b);
-            self.out.assist[s.day as usize * ncamp + c] += (j - i) as u32;
+            self.out.assist[c * ndays + s.day as usize] += (j - i) as u32;
             i = j;
         }
         self.acc.count(C_INTERVALS, 1);
@@ -428,7 +449,7 @@ impl St {
 
     /// One person: events `es` (any order, all with person `p`) and the
     /// clicks of the bucket `cs` (those with person `p` are the person's).
-    fn person(&mut self, p: u64, es: &[SRec], cs: &[Cl], ctx: &Ctx) {
+    fn person(&mut self, p: u64, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
         self.acc.start();
         // 1. slots
         self.pur.clear();
@@ -496,69 +517,45 @@ impl St {
             self.catsum[idx] += price;
         }
         self.acc.lap(P_WALK);
-        // 3. the person's clicks, by ts
-        self.pc.clear();
-        for c in cs {
-            if c.person == p {
-                self.pc.push(Click { ts: c.ts, camp: c.camp, ck: c.ck });
+        // 3. the person's clicks (the bucket's clicks of person p), by ts
+        let mut m = cs.len();
+        if let Some(k0) = cs.iter().position(|c| c.person != p) {
+            m = k0;
+            for k in k0 + 1..cs.len() {
+                if cs[k].person == p {
+                    cs[m] = cs[k];
+                    m += 1;
+                }
             }
         }
-        if self.pc.len() > 1 {
-            self.pc.sort_unstable_by_key(|c| c.ts);
+        let pc = &mut cs[..m];
+        let small = pc.len() <= self.bf_max;
+        if pc.len() > 1 && !small {
+            pc.sort_unstable_by_key(|c| c.ts);
         }
+        let pc = &*pc;
         self.acc.count(C_PERSONS, 1);
-        self.acc.count(C_PCLICK, self.pc.len() as u64);
+        self.acc.count(C_PCLICK, pc.len() as u64);
         self.acc.count(C_SESS, ns as u64);
+        if small {
+            self.acc.count(C_SMALLP, 1);
+            self.acc.count(C_SMALLC, pc.len() as u64);
+            self.acc.count(C_SMALLS, ns as u64);
+        }
         self.acc.lap(P_CSORT);
         // 4. attribution
-        let ncamp = ctx.ncamp;
-        let nc1 = ncamp + 1;
-        let pc = std::mem::take(&mut self.pc);
-        let (mut add, mut rem) = (0usize, 0usize);
-        for si in 0..ns {
-            let s = self.sess[si];
-            // click offsets c (base window_start - 7 days) qualify iff start <= c <= start + 7 days
-            let hi = s.start as u64 + WEEK as u64;
-            while add < pc.len() && pc[add].ts as u64 <= hi {
-                self.win_add(pc[add].camp, si);
-                add += 1;
-            }
-            while rem < add && pc[rem].ts < s.start {
-                self.win_remove(pc[rem].camp, si, ncamp);
-                rem += 1;
-            }
-            let credit = if add > rem {
-                // latest ts; among equal ts the smallest click_id
-                let tmax = pc[add - 1].ts;
-                let mut best = add - 1;
-                let mut k = add - 1;
-                while k > rem && pc[k - 1].ts == tmax {
-                    k -= 1;
-                    if keys::cmp(pc[k].ck, pc[best].ck) == CmpOrd::Less {
-                        best = k;
-                    }
-                }
-                pc[best].camp as usize
-            } else {
-                ncamp
-            };
-            let ci = s.day as usize * nc1 + credit;
-            self.out.cs[ci] += 1;
-            self.out.cp[ci] += s.purch;
-            self.out.cr[ci] += s.rev;
+        if small {
+            self.attribute_small(pc, ctx.ncamp, ctx.ndays);
+        } else {
+            self.attribute_window(pc, ctx.ncamp, ctx.ndays);
         }
-        // campaigns still in the window assisted every session since they entered
-        while let Some(&c) = self.active.last() {
-            let c = c as usize;
-            self.assist_range(c, self.since[c] as usize, ns, ncamp);
-            self.wcount[c] = 0;
-            self.active.pop();
-        }
-        self.pc = pc;
         self.acc.lap(P_ATTR);
         // 5. one row per day
         self.ubuf.clear();
+        self.ubuf.extend_from_slice(&[0; 4]);
         keys::decode_into(keys::unmix(p), &mut self.ubuf);
+        let ulen = (self.ubuf.len() - 4) as u32;
+        self.ubuf[..4].copy_from_slice(&ulen.to_le_bytes());
         let mut i = 0;
         while i < ns {
             let j = self.sess[i].dend as usize;
@@ -577,6 +574,94 @@ impl St {
         self.acc.lap(P_ROWS);
     }
 
+    /// Credits and assists of the current person's sessions when it has few
+    /// clicks: every session checks every click (unsorted) against the rule
+    /// directly. A click qualifies iff start - 7 days <= click.ts <= start
+    /// (offsets: start <= c.ts <= start + 7 days); the credit is the latest
+    /// qualifying ts, ties to the smallest click_id; each campaign with a
+    /// qualifying click assists once (stamped per session).
+    fn attribute_small(&mut self, pc: &[Cl], ncamp: usize, ndays: usize) {
+        for si in 0..self.sess.len() {
+            let s = self.sess[si];
+            let lo = s.start;
+            let hi = s.start as u64 + WEEK as u64;
+            if self.stamp_id == u32::MAX {
+                self.stamp.iter_mut().for_each(|x| *x = 0);
+                self.stamp_id = 0;
+            }
+            self.stamp_id += 1;
+            let sid = self.stamp_id;
+            let mut best = usize::MAX;
+            for (k, c) in pc.iter().enumerate() {
+                if c.ts >= lo && c.ts as u64 <= hi {
+                    if best == usize::MAX
+                        || c.ts > pc[best].ts
+                        || (c.ts == pc[best].ts && keys::cmp(c.ck, pc[best].ck) == CmpOrd::Less)
+                    {
+                        best = k;
+                    }
+                    let ci = c.camp as usize;
+                    if self.stamp[ci] != sid {
+                        self.stamp[ci] = sid;
+                        self.out.assist[ci * ndays + s.day as usize] += 1;
+                    }
+                }
+            }
+            let credit = if best == usize::MAX { ncamp } else { pc[best].camp as usize };
+            let cr = &mut self.out.cred[credit * ndays + s.day as usize];
+            cr.s += 1;
+            cr.p += s.purch;
+            cr.r += s.rev;
+        }
+    }
+
+    /// Credits and assists of the current person's sessions, its clicks
+    /// sorted by ts: a sliding 7-day window, assists per activation interval.
+    fn attribute_window(&mut self, pc: &[Cl], ncamp: usize, ndays: usize) {
+        let ns = self.sess.len();
+        let (mut add, mut rem) = (0usize, 0usize);
+        for si in 0..ns {
+            let s = self.sess[si];
+            // click offsets c (base window_start - 7 days) qualify iff start <= c <= start + 7 days
+            let hi = s.start as u64 + WEEK as u64;
+            while add < pc.len() && pc[add].ts as u64 <= hi {
+                self.win_add(pc[add].camp, si);
+                add += 1;
+            }
+            while rem < add && pc[rem].ts < s.start {
+                self.win_remove(pc[rem].camp, si, ndays);
+                rem += 1;
+            }
+            let credit = if add > rem {
+                // latest ts; among equal ts the smallest click_id
+                let tmax = pc[add - 1].ts;
+                let mut best = add - 1;
+                let mut k = add - 1;
+                while k > rem && pc[k - 1].ts == tmax {
+                    k -= 1;
+                    if keys::cmp(pc[k].ck, pc[best].ck) == CmpOrd::Less {
+                        best = k;
+                    }
+                }
+                pc[best].camp as usize
+            } else {
+                ncamp
+            };
+            let ci = credit * ndays + s.day as usize;
+            let cr = &mut self.out.cred[ci];
+            cr.s += 1;
+            cr.p += s.purch;
+            cr.r += s.rev;
+        }
+        // campaigns still in the window assisted every session since they entered
+        while let Some(&c) = self.active.last() {
+            let c = c as usize;
+            self.assist_range(c, self.since[c] as usize, ns, ndays);
+            self.wcount[c] = 0;
+            self.active.pop();
+        }
+    }
+
     /// Appends the user_daily row of the current person for local day `day`.
     #[inline(always)]
     fn row(&mut self, day: u32, sessions: u32, events: u32, revenue: u64, ctx: &Ctx) {
@@ -593,7 +678,6 @@ impl St {
             }
         }
         let cols = &mut self.cols;
-        cols.uid.extend(&(self.ubuf.len() as u32).to_le_bytes());
         cols.uid.extend(&self.ubuf);
         cols.day.push((ctx.first_day + day as i64) as i32);
         cols.sess.push(sessions as i32);
@@ -605,9 +689,7 @@ impl St {
         }
         if top != u32::MAX {
             cols.def.as_mut_slice()[i / 8] |= 1 << (i % 8);
-            let name = &ctx.cat_names[top as usize];
-            cols.top.extend(&(name.len() as u32).to_le_bytes());
-            cols.top.extend(name);
+            cols.top.extend(&self.cat_plain[top as usize]);
         }
         cols.n += 1;
     }
@@ -666,63 +748,63 @@ pub fn sessions2(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: 
     })
 }
 
-/// Merges the threads' accumulators and writes campaign_daily.
-pub fn write_campaign_daily2(path: &Path, outs: &[Out2], ctx: &Ctx) {
+/// Merges the threads' accumulators (into the first one's arrays, already
+/// resident) and writes campaign_daily from huge-page column buffers.
+pub fn write_campaign_daily2(path: &Path, outs: &mut [Out2], ctx: &Ctx) {
     let ndays = ctx.ndays;
     let ncamp = ctx.ncamp;
     let nc1 = ncamp + 1;
-    let mut cs = vec![0u64; ndays * nc1];
-    let mut cp = vec![0u64; ndays * nc1];
-    let mut cr = vec![0u64; ndays * nc1];
-    let mut asv = vec![0u64; ndays * ncamp];
-    for o in outs {
-        for i in 0..cs.len() {
-            cs[i] += o.cs[i] as u64;
-            cp[i] += o.cp[i] as u64;
-            cr[i] += o.cr[i];
+    let (first, rest) = outs.split_first_mut().expect("at least one thread");
+    for o in rest.iter() {
+        for (a, b) in first.cred.iter_mut().zip(&o.cred) {
+            a.s += b.s;
+            a.p += b.p;
+            a.r += b.r;
         }
-        for i in 0..asv.len() {
-            asv[i] += o.assist[i] as u64;
+        for (a, b) in first.assist.iter_mut().zip(&o.assist) {
+            *a += *b;
         }
     }
-    let mut ibytes = Vec::new();
-    let mut iends = Vec::new();
-    let mut chbytes = Vec::new();
-    let mut chends = Vec::new();
-    let mut days = Vec::new();
-    let (mut s, mut ps, mut rv, mut av) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let est = nc1 * ndays;
+    let mut ids: Buf<u8> = Buf::new(est * 16);
+    let mut chs: Buf<u8> = Buf::new(est * 24);
+    let mut days: Buf<i32> = Buf::new(est);
+    let (mut sv, mut pv, mut rv, mut av): (Buf<i64>, Buf<i64>, Buf<i64>, Buf<i64>) = (Buf::new(est), Buf::new(est), Buf::new(est), Buf::new(est));
+    let plain = |b: &mut Buf<u8>, x: &[u8]| {
+        b.extend(&(x.len() as u32).to_le_bytes());
+        b.extend(x);
+    };
     for c in 0..nc1 {
         for d in 0..ndays {
-            let k = d * nc1 + c;
-            let a = if c < ncamp { asv[d * ncamp + c] } else { 0 };
-            if cs[k] == 0 && a == 0 {
+            let k = c * ndays + d;
+            let cr = first.cred[k];
+            let a = if c < ncamp { first.assist[k] } else { 0 };
+            if cr.s == 0 && a == 0 {
                 continue;
             }
             if c < ncamp {
-                ibytes.extend_from_slice(&ctx.camp_ids[c]);
-                chbytes.extend_from_slice(&ctx.camp_channels[c]);
+                plain(&mut ids, &ctx.camp_ids[c]);
+                plain(&mut chs, &ctx.camp_channels[c]);
             } else {
-                ibytes.extend_from_slice(b"organic");
-                chbytes.extend_from_slice(b"organic");
+                plain(&mut ids, b"organic");
+                plain(&mut chs, b"organic");
             }
-            iends.push(ibytes.len() as u32);
-            chends.push(chbytes.len() as u32);
             days.push((ctx.first_day + d as i64) as i32);
-            s.push(cs[k] as i64);
-            ps.push(cp[k] as i64);
-            rv.push(cr[k] as i64);
+            sv.push(cr.s as i64);
+            pv.push(cr.p as i64);
+            rv.push(cr.r as i64);
             av.push(a as i64);
         }
     }
-    use parquet::{Column, Data};
+    use parquet::Raw;
     let cols = [
-        Column { name: "campaign_id", data: Data::Str { bytes: &ibytes, ends: &iends, valid: None } },
-        Column { name: "channel", data: Data::Str { bytes: &chbytes, ends: &chends, valid: None } },
-        Column { name: "day", data: Data::I32 { values: &days, date: true } },
-        Column { name: "sessions", data: Data::I64 { values: &s } },
-        Column { name: "purchasing_sessions", data: Data::I64 { values: &ps } },
-        Column { name: "revenue_cents", data: Data::I64 { values: &rv } },
-        Column { name: "assisted_sessions", data: Data::I64 { values: &av } },
+        Raw::Req { name: "campaign_id", ty: parquet::T_BYTE_ARRAY, conv: Some(parquet::CONV_UTF8), body: ids.as_slice() },
+        Raw::Req { name: "channel", ty: parquet::T_BYTE_ARRAY, conv: Some(parquet::CONV_UTF8), body: chs.as_slice() },
+        Raw::Req { name: "day", ty: parquet::T_INT32, conv: Some(parquet::CONV_DATE), body: parquet::le_bytes(days.as_slice()) },
+        Raw::Req { name: "sessions", ty: parquet::T_INT64, conv: None, body: parquet::le_bytes(sv.as_slice()) },
+        Raw::Req { name: "purchasing_sessions", ty: parquet::T_INT64, conv: None, body: parquet::le_bytes(pv.as_slice()) },
+        Raw::Req { name: "revenue_cents", ty: parquet::T_INT64, conv: None, body: parquet::le_bytes(rv.as_slice()) },
+        Raw::Req { name: "assisted_sessions", ty: parquet::T_INT64, conv: None, body: parquet::le_bytes(av.as_slice()) },
     ];
-    parquet::write_file(path, days.len(), &cols).unwrap_or_else(|e| fail(&format!("{}: {}", path.display(), e)));
+    parquet::write_raw(path, days.len, &cols).unwrap_or_else(|e| fail(&format!("{}: {}", path.display(), e)));
 }
