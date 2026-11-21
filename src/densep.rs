@@ -39,8 +39,8 @@ use crate::parts::{self, Parts};
 use crate::sess::{Cl, Out2, PersonSess};
 use crate::{fastev, keys, scan};
 
-const BSHIFT: u32 = 16;
-const BSIZE: usize = 1 << BSHIFT;
+/// Event-number bucket bits (SS_DBSHIFT, 12..=20, default 16; `Dense::bshift`).
+const BSHIFT_DEFAULT: u32 = 16;
 const VALID: u32 = 1 << 31;
 const PFLAG: u32 = 1 << 31;
 /// Flag in `runs`: the person has foreign clicks.
@@ -66,6 +66,8 @@ pub struct Dense {
     pub s_est: u64,
     pub lines_est: usize,
     pub pfrac: f64,
+    /// event-number bucket bits
+    pub bshift: u32,
 }
 
 impl Dense {
@@ -196,7 +198,8 @@ pub fn decide(ev: &Input, ctx: &Ctx) -> Option<Dense> {
     stat("d_s_est", s_est);
     stat("d_lines_est", lines_est);
     stat("d_pfrac", format!("{:.4}", pfrac));
-    Some(Dense { ke, ku, bound, pmax, n_est, s_est, lines_est, pfrac })
+    let bshift = std::env::var("SS_DBSHIFT").ok().and_then(|v| v.parse::<u32>().ok()).filter(|b| (12..=20).contains(b)).unwrap_or(BSHIFT_DEFAULT);
+    Some(Dense { ke, ku, bound, pmax, n_est, s_est, lines_est, pfrac, bshift })
 }
 
 /// Exceptional user IDs: exact key -> id (sharded).
@@ -351,9 +354,10 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     // 2. events
     // bucket capacities (overflow is exact, only slower): copies spread
     // evenly over the buckets of the event numbers in use
-    let nb = (d.bound >> BSHIFT) as usize + 1;
+    let bsize = 1usize << d.bshift;
+    let nb = (d.bound >> d.bshift) as usize + 1;
     let est = d.lines_est;
-    let used = ((d.n_est >> BSHIFT) as usize + 1).min(nb);
+    let used = ((d.n_est >> d.bshift) as usize + 1).min(nb);
     let cap = (est as f64 * 1.4 / (threads * used) as f64) as usize + 64;
     let capp = (cap as f64 * (d.pfrac * 1.5 + 0.01)) as usize + 32;
     let next = AtomicUsize::new(0);
@@ -433,8 +437,8 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
         // slot i: the winning copy of event number (bucket base + i); its
         // `n` field is reused for the purchase amount (0 until the purchase
         // record is seen); occ: occupied slots
-        let mut slot = vec![DE::default(); BSIZE];
-        let mut occ = vec![0u64; BSIZE / 64];
+        let mut slot = vec![DE::default(); bsize];
+        let mut occ = vec![0u64; bsize / 64];
         let mut blk: Vec<(u32, u32, u32)> = Vec::with_capacity(PF_BLOCK);
         loop {
             let bi = nextb.fetch_add(1, Ordering::Relaxed);
@@ -447,7 +451,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             for o in &evo {
                 for sl in o.de.get(bi) {
                     for r in sl.iter() {
-                        let i = r.n as usize & (BSIZE - 1);
+                        let i = r.n as usize & (bsize - 1);
                         let w = &mut occ[i >> 6];
                         let m = 1u64 << (i & 63);
                         // ties: equal-ingest copies are identical (rules),
@@ -466,7 +470,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             for o in &evo {
                 for sl in o.dp.get(bi) {
                     for r in sl.iter() {
-                        let i = r.n as usize & (BSIZE - 1);
+                        let i = r.n as usize & (bsize - 1);
                         assert!(occ[i >> 6] & (1u64 << (i & 63)) != 0, "dense: purchase record without event");
                         let w = &mut slot[i];
                         if w.ingest == r.ingest && w.us & PFLAG != 0 {
@@ -487,7 +491,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                 }
                 blk.clear();
             };
-            for wi in 0..BSIZE / 64 {
+            for wi in 0..bsize / 64 {
                 let mut w = occ[wi];
                 occ[wi] = 0;
                 while w != 0 {
@@ -958,7 +962,7 @@ fn arena_mut<T>(n: usize) -> &'static mut [T] {
 //     n >= d.bound (or the ID is not canonical: n = u64::MAX) ->
 //     o.xe.push(XE { key: keys::key_of(event_id), ingest, valid, us, ts,
 //     pay }) (us/ts/pay 0 when not valid);
-//   - else into bucket n >> BSHIFT of o.de: valid copy DE { n, ingest,
+//   - else into bucket n >> d.bshift of o.de: valid copy DE { n, ingest,
 //     ts: ts | VALID, us: user_slot | (PFLAG if pay != 0) }, invalid copy
 //     DE { n, ingest, ts: 0, us: 0 }; a valid purchase also pushes
 //     DP { n, ingest, pay } into the same bucket of o.dp.
@@ -1026,7 +1030,7 @@ fn ev_line(f: &[&[u8]; 7], ctx: &Ctx, d: &Dense, xm: &Xmap, o: &mut EvOut, safe_
         o.xe.push(XE { key: keys::key_of(f[0]), ingest, valid, us, ts, pay });
         return;
     }
-    let b = (n >> BSHIFT) as usize;
+    let b = (n >> d.bshift) as usize;
     if valid {
         let pf = if pay != 0 { PFLAG } else { 0 };
         unsafe { o.de.push_unchecked(b, DE { n: n as u32, ingest, ts: ts | VALID, us: us | pf }) };
