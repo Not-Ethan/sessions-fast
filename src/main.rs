@@ -7,6 +7,7 @@ mod lookup;
 mod parquet;
 mod prof;
 mod cbench;
+mod dense;
 mod fastev;
 mod sess;
 mod scan;
@@ -2442,6 +2443,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     }
     if std::env::var("SS_EVCHECK").is_ok() {
         fastev::check(&events_in, &ctx);
+        std::process::exit(0);
+    }
+    if std::env::var("SS_DENSEBENCH").is_ok() {
+        dense::bench(&links_in, &events_in, &ctx);
         std::process::exit(0);
     }
     if std::env::var("SS_DECOMP").is_ok() {
