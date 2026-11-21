@@ -139,6 +139,15 @@ mod x86 {
         e
     }
 
+    /// The largest sizes densep::decide picks (bound 2^32, pmax 2^27): many
+    /// more scrambled values are dense; bshift 20.
+    fn env_big() -> Env {
+        let mut e = env_at("2026-10-01T00:00:00Z", 7, 1 << 32, 1 << 27, 20, false);
+        e.d.ke = 0x31_4159_2653 & MASK;
+        e.d.ku = 0x27_1828_1828 & MASK;
+        e
+    }
+
     fn have_cpu() -> bool {
         let ok = crate::use_avx2();
         if !ok {
@@ -1324,6 +1333,113 @@ mod x86 {
         }
     }
 
+    /// Lines whose every field is drawn from a pool of adversarial values
+    /// (valid values most of the time), so anomalies combine.
+    fn combo_lines(e: &Env, kind: Kind, seed: u64, n: usize) -> Vec<Vec<u8>> {
+        let mut g = Gen::new(e, seed);
+        let d = e.d;
+        let (ws, we) = (e.ctx.ws, e.ctx.we);
+        let lo = if kind == Kind::Ev { ws } else { ws - WEEK };
+        let tsv = ts_values(lo, we);
+        let mut eids = id_variants(&mut g.r, if kind == Kind::Ev { b'e' } else { b'k' }, &eid(&d, 5));
+        for nn in [0, 1, d.bound - 1, d.bound, d.bound + 1, MASK] {
+            eids.push(eid(&d, nn));
+        }
+        let mut uids = id_variants(&mut g.r, b'u', &uid(&d, 512 * 3 + 2));
+        for u in [0, 7, 8, (d.pmax - 1) * 512 + 7, d.pmax * 512, (1 << 39) - 1, 1 << 39] {
+            uids.push(uid(&d, u));
+        }
+        let prods = ["", "p1", "p3000", "p3001", "P1", "p0", "p01", "p", "p 1", "p99999999", "c_1"];
+        let camps = ["c_1", "c_100", "c_101", "c_0", "c_01", "C_1", "c_", "", " c_1", "organic", "x9"];
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let mut f = if kind == Kind::Ev { g.ev() } else { g.cl() };
+            let nf = f.len();
+            let tsi = if kind == Kind::Ev { 2 } else { 3 };
+            if g.r.chance(0.25) {
+                f[0] = g.r.pick(&eids).clone();
+            }
+            if g.r.chance(0.25) {
+                f[1] = g.r.pick(&uids).clone();
+            }
+            if g.r.chance(0.3) {
+                f[tsi] = g.r.pick(&tsv).clone();
+                if kind == Kind::Ev && g.r.chance(0.7) {
+                    if let Some(t) = crate::ts::parse_ts(f[2].as_bytes()) {
+                        if (ws - 30 * DAY..we + 30 * DAY).contains(&t) {
+                            f[3] = f1(t + g.r.range(-5000, LATE + 5000));
+                        }
+                    }
+                }
+            }
+            if kind == Kind::Ev {
+                if g.r.chance(0.15) {
+                    f[3] = g.r.pick(&tsv).clone();
+                }
+                if g.r.chance(0.2) {
+                    f[4] = s(*g.r.pick(TYPES));
+                }
+                if g.r.chance(0.3) {
+                    f[6] = s(*g.r.pick(PRICES));
+                }
+                if g.r.chance(0.15) {
+                    f[5] = s(*g.r.pick(&prods));
+                }
+            } else if g.r.chance(0.2) {
+                f[2] = s(*g.r.pick(&camps));
+            }
+            let q = if g.r.chance(0.2) { g.r.below(1 << nf) as u32 } else { 0 };
+            out.push(join(&f, q));
+        }
+        out
+    }
+
+    #[test]
+    fn k3test_ev_combos() {
+        if !have_cpu() {
+            return;
+        }
+        for (k, e) in [env_default(), env_small_buckets(), env_big()].iter().enumerate() {
+            let lines = combo_lines(e, Kind::Ev, 401 + k as u64, if k == 0 { 300_000 } else { 100_000 });
+            let chunks: &[usize] = if k == 2 { &[4096, 1 << 40] } else { &[1, 4096, 1 << 40] };
+            check_lines(e, Kind::Ev, &lines, 1000, chunks, &format!("ev combos (env {})", k));
+        }
+    }
+
+    #[test]
+    fn k3test_cl_combos() {
+        if !have_cpu() {
+            return;
+        }
+        for (k, e) in [env_default(), env_small_buckets(), env_big()].iter().enumerate() {
+            let lines = combo_lines(e, Kind::Cl, 501 + k as u64, if k == 0 { 200_000 } else { 100_000 });
+            let chunks: &[usize] = if k == 2 { &[4096, 1 << 40] } else { &[1, 4096, 1 << 40] };
+            check_lines(e, Kind::Cl, &lines, 1000, chunks, &format!("cl combos (env {})", k));
+        }
+    }
+
+    /// Value mutations with the largest dense sizes (more mutated IDs stay
+    /// dense).
+    #[test]
+    fn k3test_big_dense_value_mutations() {
+        if !have_cpu() {
+            return;
+        }
+        let e = env_big();
+        let mut g = Gen::new(&e, 601);
+        let mut r = Rng::new(602);
+        let mut ev = Vec::new();
+        let mut cl = Vec::new();
+        for _ in 0..150_000 {
+            let l = join(&g.ev(), if r.chance(0.1) { r.below(128) as u32 } else { 0 });
+            ev.push(mutate_value(&mut r, &l));
+            let l = join(&g.cl(), if r.chance(0.1) { r.below(16) as u32 } else { 0 });
+            cl.push(mutate_value(&mut r, &l));
+        }
+        check_lines(&e, Kind::Ev, &ev, 1000, &[4096, 1 << 40], "ev value mutations (big dense)");
+        check_lines(&e, Kind::Cl, &cl, 1000, &[4096, 1 << 40], "cl value mutations (big dense)");
+    }
+
     /// Field and line lengths across k3's split limits: field 3 starting
     /// at offsets around 32 and 64, fields 3..6 around 64 bytes, lines
     /// around 96 bytes (product, price and ID lengths, ts forms, quotes).
@@ -1445,6 +1561,34 @@ mod x86 {
                 t.push(b'\n');
                 t.extend(std::iter::repeat(b'z').take(trail));
                 check_text(e, &mut o, kind, &t, &[1, 1 << 40], &format!("{} single line, {} bytes after it", name, trail));
+            }
+        }
+        // tiny buffers: a line alone (with and without its newline), after
+        // 0..20 bytes of padding, and buffers around MARGIN + FRONT bytes
+        for l in &lines {
+            for lead in 0..=20usize {
+                for nl in [true, false] {
+                    let mut t = Vec::new();
+                    if lead > 0 {
+                        t.extend(std::iter::repeat(b'x').take(lead - 1));
+                        t.push(b'\n');
+                    }
+                    t.extend_from_slice(l);
+                    if nl {
+                        t.push(b'\n');
+                    }
+                    check_text(e, &mut o, kind, &t, &[1, 1 << 40], &format!("{} tiny buffer, lead {}", name, lead));
+                    for total in 200..=216usize {
+                        let mut u = t.clone();
+                        if !nl {
+                            u.push(b'\n');
+                        }
+                        if u.len() < total {
+                            u.extend(std::iter::repeat(b'w').take(total - u.len()));
+                            check_text(e, &mut o, kind, &u, &[1, 1 << 40], &format!("{} buffer of {} bytes, lead {}", name, total, lead));
+                        }
+                    }
+                }
             }
         }
         eprintln!("k3test {} alignment: OK", name);
