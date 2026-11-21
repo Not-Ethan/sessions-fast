@@ -43,6 +43,8 @@ const BSHIFT: u32 = 16;
 const BSIZE: usize = 1 << BSHIFT;
 const VALID: u32 = 1 << 31;
 const PFLAG: u32 = 1 << 31;
+/// Flag in `runs`: the person has foreign clicks.
+const FOREIGN: u32 = 1 << 31;
 /// Single-run persons with at least this many kept events are processed
 /// with the gathered ones (first, largest first).
 const BIG_RUN: usize = 512;
@@ -716,6 +718,11 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     }
     let mut foreign = foreign.into_inner().unwrap();
     foreign.sort_unstable_by_key(|c| c.person);
+    // persons with foreign clicks: flagged in `runs` (so they are gathered,
+    // and only they search the foreign list)
+    for c in &foreign {
+        runs[c.person as usize].fetch_or(FOREIGN, Ordering::Relaxed);
+    }
     stat("d_foreign_clicks", foreign.len());
     stat("d_xwin", xwin.len());
     marks.mark("d.group");
@@ -793,7 +800,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
         // the person's clicks (its own range of `call`: every person is
         // processed once, so ranges are never shared; plus foreign ones),
         // then the routine
-        let mut finish_person = |p: u32, es: &[SRec], st: &mut PersonSess| {
+        let mut finish_person = |p: u32, es: &[SRec], st: &mut PersonSess, has_foreign: bool| {
             let (mut a, mut b) = (0usize, 0usize);
             if (p as usize) < xbase {
                 let ci = p as usize >> 16;
@@ -824,7 +831,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             }
             let pm = pmix(p, &d, &xkeys);
             let pp = p as u64;
-            let (fa, fb) = if foreign.is_empty() { (0, 0) } else { (foreign.partition_point(|c| c.person < pp), foreign.partition_point(|c| c.person <= pp)) };
+            let (fa, fb) = if !has_foreign { (0, 0) } else { (foreign.partition_point(|c| c.person < pp), foreign.partition_point(|c| c.person <= pp)) };
             if fa == fb {
                 let cs = unsafe { std::slice::from_raw_parts_mut((caddr as *mut Cl).add(a), b - a) };
                 st.person(pp, pm, es, cs, ctx);
@@ -847,7 +854,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             }
             let (xa, xb) = (xwin.partition_point(|e| e.p < p), xwin.partition_point(|e| e.p <= p));
             es.extend(xwin[xa..xb].iter().map(|e| SRec { person: p as u64, ts: e.ts, pay: e.pay }));
-            finish_person(p, &es, &mut st);
+            finish_person(p, &es, &mut st, runs[p as usize].load(Ordering::Relaxed) & FOREIGN != 0);
         }
         loop {
             let bi = nextb.fetch_add(1, Ordering::Relaxed);
@@ -863,7 +870,8 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                     j += 1;
                 }
                 if runs[p as usize].load(Ordering::Relaxed) == 1 && j - i < BIG_RUN {
-                    finish_person(p as u32, &k[i..j], &mut st);
+                    // (runs == 1: no foreign clicks)
+                    finish_person(p as u32, &k[i..j], &mut st, false);
                 }
                 i = j;
             }
