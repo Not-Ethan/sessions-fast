@@ -2403,6 +2403,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     fastev::ON.store(std::env::var("SS_FASTEV").map_or(true, |v| v != "0"), Ordering::Relaxed);
     fastev::CURSORS.store(env_usize("SS_FASTK").unwrap_or(1).clamp(1, 2), Ordering::Relaxed);
     fastev::DEC.store(std::env::var("SS_FASTDEC").map_or(false, |v| v == "1"), Ordering::Relaxed);
+    fastev::SEL.store(std::env::var("SS_FASTSEL").map_or(false, |v| v == "1"), Ordering::Relaxed);
     if std::env::var("SS_EVCHECK").is_ok() {
         fastev::check(&events_in, &ctx);
         std::process::exit(0);

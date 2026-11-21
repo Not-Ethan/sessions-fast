@@ -36,6 +36,8 @@ pub static CURSORS: AtomicUsize = AtomicUsize::new(1);
 /// Decode fast-path lines with `event_fast` instead of `event_line`
 /// (SS_FASTDEC=1).
 pub static DEC: AtomicBool = AtomicBool::new(false);
+/// With DEC: event ts through `ts_sel` (SS_FASTSEL=1).
+pub static SEL: AtomicBool = AtomicBool::new(false);
 
 /// Lines handed to the general scanner by `slow_line` (statistics).
 pub static SLOW: AtomicUsize = AtomicUsize::new(0);
@@ -478,16 +480,68 @@ unsafe fn f1(days: &Days, b: *const u8) -> Option<Option<i64>> {
     Some(if (bad | over) == 0 { Some(e.ms + tod as i64 * 1000) } else { None })
 }
 
-/// `ctx.tsp.parse(b)` (= `ts::parse_ts`), F1 through the date table. 32
-/// bytes from the start of `b` must be readable.
+/// `tsp.parse(b)` (= `ts::parse_ts`), F1 through the date table. 32 bytes
+/// from the start of `b` must be readable.
 #[inline(always)]
-fn ts_fast(ctx: &Ctx, days: &Days, b: &[u8]) -> Option<i64> {
+fn ts_fast(tsp: &ts::TsParser, days: &Days, b: &[u8]) -> Option<i64> {
     if b.len() == 20 && b[19] == b'Z' {
         if let Some(v) = unsafe { f1(days, b.as_ptr()) } {
             return v;
         }
     }
-    ctx.tsp.parse(b)
+    tsp.parse(b)
+}
+
+/// 8 ASCII digits (first char in the lowest byte) to their value (as ts.rs).
+#[inline(always)]
+fn parse8(w: u64) -> u64 {
+    let l = w.wrapping_sub(0x3030_3030_3030_3030);
+    let c = (l.wrapping_mul(10).wrapping_add(l >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let c = (c.wrapping_mul(100).wrapping_add(c >> 16)) & 0x0000_FFFF_0000_FFFF;
+    (c.wrapping_mul(10000).wrapping_add(c >> 32)) & 0xFFFF_FFFF
+}
+
+/// `ts_fast` with F1 (date table) and 13-digit F3 decoded side by side and
+/// selected by length, so the F1/F3 choice needs no branch; other shapes and
+/// F1 dates outside the table take `tsp.parse`. 32 bytes from the start of
+/// `b` must be readable.
+#[inline(always)]
+fn ts_sel(tsp: &ts::TsParser, days: &Days, b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    let p = b.as_ptr();
+    unsafe {
+        let is1 = (n == 20) & (*p.add(19) == b'Z');
+        let is3 = n == 13;
+        if !(is1 | is3) {
+            return tsp.parse(b);
+        }
+        let w0 = rd(p, 0);
+        let w1 = rd(p, 8);
+        let e = days.slots.get_unchecked(dslot(w1));
+        let hit = days.on & (e.w0 == w0) & (e.dd == (w1 & 0xFFFF));
+        let w = rd(p, 11);
+        let bad = digits_bad(w, 0xFFFF_00FF_FF00_FFFF) | ((w & 0x0000_FF00_00FF_0000) ^ 0x0000_3A00_003A_0000) | (((w1 >> 16) & 0xFF) ^ b'T' as u64);
+        let v = w & 0x0F0F_0F0F_0F0F_0F0F;
+        let pr = v.wrapping_mul(10).wrapping_add(v >> 8);
+        let over = pr.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080;
+        let tod = (pr & 0xFF) * 3600 + ((pr >> 24) & 0xFF) * 60 + ((pr >> 48) & 0xFF);
+        let ok1 = (bad | over) == 0;
+        let v1 = e.ms + tod as i64 * 1000;
+        // F3: 13 digits, as TsParser::parse
+        let wb = rd(p, 5);
+        let ok3 = (digits_bad(w0, !0) | digits_bad(wb, !0)) == 0;
+        let v3 = (parse8(w0) * 100_000 + parse8((wb & !0xFF_FFFF) | 0x30_3030)) as i64;
+        if is1 & !hit {
+            return tsp.parse(b);
+        }
+        let ok = if is3 { ok3 } else { ok1 };
+        let v = if is3 { v3 } else { v1 };
+        if ok {
+            Some(v)
+        } else {
+            None
+        }
+    }
 }
 
 /// `event_line::<true>` for a fast-path line (f[0] non-empty, 32 readable
@@ -496,14 +550,15 @@ fn ts_fast(ctx: &Ctx, days: &Days, b: &[u8]) -> Option<i64> {
 #[inline(always)]
 fn event_fast<S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, days: &Days, sink: &mut S) {
     let (ws, we) = (ctx.ws, ctx.we);
-    let Some(ing) = ts_fast(ctx, days, f[3]) else { return };
+    let Some(ing) = ts_fast(&ctx.tsp, days, f[3]) else { return };
     let eid = keys::mix(unsafe { keys::key_of_wide(f[0]) });
     let ingest = ingest_rel(ing, ctx.ws_s);
     let valid = 'v: {
         if f[1].is_empty() || f[5].is_empty() {
             break 'v None;
         }
-        let Some(t) = ts_fast(ctx, days, f[2]) else { break 'v None };
+        let t = if SEL.load(Ordering::Relaxed) { ts_sel(&ctx.tsp, days, f[2]) } else { ts_fast(&ctx.tsp, days, f[2]) };
+        let Some(t) = t else { break 'v None };
         if t < ws || t >= we {
             break 'v None;
         }
@@ -628,6 +683,7 @@ pub fn task_fast_any<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, s
 pub fn check(ev: &super::Input, ctx: &Ctx) {
     let saved = CURSORS.load(Ordering::Relaxed);
     let saved_dec = DEC.load(Ordering::Relaxed);
+    let saved_sel = SEL.load(Ordering::Relaxed);
     let mut lines = 0usize;
     let mut copies = 0usize;
     for task in &ev.tasks {
@@ -637,9 +693,10 @@ pub fn check(ev: &super::Input, ctx: &Ctx) {
         super::event_task_scan_any(b, *task, ctx, &mut want, safe_end);
         lines += b[task.start..task.end].iter().filter(|&&c| c == b'\n').count();
         copies += want.0.len();
-        for (k, dec) in [(1, false), (2, false), (1, true), (2, true)] {
+        for (k, dec, sel) in [(1, false, false), (2, false, false), (1, true, false), (2, true, false), (1, true, true)] {
             CURSORS.store(k, Ordering::Relaxed);
             DEC.store(dec, Ordering::Relaxed);
+            SEL.store(sel, Ordering::Relaxed);
             let mut got = RecSink::default();
             task_fast_any(b, *task, ctx, &mut got, safe_end);
             let same = if k == 1 {
@@ -652,20 +709,21 @@ pub fn check(ev: &super::Input, ctx: &Ctx) {
                 a == w
             };
             if !same {
-                eprintln!("evcheck: MISMATCH file {} [{}, {}) cursors {} dec {} ({} vs {} copies)", task.file, task.start, task.end, k, dec, got.0.len(), want.0.len());
+                eprintln!("evcheck: MISMATCH file {} [{}, {}) cursors {} dec {} sel {} ({} vs {} copies)", task.file, task.start, task.end, k, dec, sel, got.0.len(), want.0.len());
                 std::process::exit(1);
             }
         }
     }
     CURSORS.store(saved, Ordering::Relaxed);
     DEC.store(saved_dec, Ordering::Relaxed);
+    SEL.store(saved_sel, Ordering::Relaxed);
     eprintln!(
         "evcheck: OK {} tasks, {} lines, {} copies identical (cursors 1-2, event_line and event_fast, avx2={}); {} lines took the general path",
         ev.tasks.len(),
         lines,
         copies,
         ctx.avx2,
-        SLOW.load(Ordering::Relaxed) / 4
+        SLOW.load(Ordering::Relaxed) / 5
     );
 }
 
@@ -875,7 +933,38 @@ mod tests {
             let ws = if wi == 0 { ts::parse_ts(b"2028-02-20T00:00:00Z").unwrap() } else { ws };
             let we = ws + (1 + (r() % 24) as i64) * 86_400_000;
             let days = Days::new(ws, we);
+            let tsp = ts::TsParser::new(ws - 10 * 86_400_000, we + 10 * 86_400_000);
+            // ts_sel / ts_fast on any field (32 readable bytes after its start)
+            let check_any = |s: &[u8]| {
+                let mut buf = s.to_vec();
+                buf.extend_from_slice(&[b'7'; 40]);
+                let b = &buf[..s.len()];
+                let want = ts::parse_ts(b);
+                assert_eq!(ts_sel(&tsp, &days, b), want, "sel {:?}", String::from_utf8_lossy(b));
+                assert_eq!(ts_fast(&tsp, &days, b), want, "fast {:?}", String::from_utf8_lossy(b));
+            };
+            for _ in 0..3000 {
+                let ms = ws - 2 * 86_400_000 + (r() % (30 * 86_400_000)) as i64;
+                let mut t = match r() % 4 {
+                    0 => format!("{}", ms),
+                    1 => format!("{:013}", r() % 10_000_000_000_000),
+                    2 => format!("{:0w$}", ms, w = 13 + (r() % 4) as usize),
+                    _ => {
+                        let (y, m, d) = civil_from_days(ms.div_euclid(86_400_000));
+                        let sod = ms.rem_euclid(86_400_000) / 1000;
+                        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}", y, m, d, sod / 3600, sod / 60 % 60, sod % 60,
+                                ["Z", "+01:00", "-10:30", "z", ""][(r() % 5) as usize])
+                    }
+                }
+                .into_bytes();
+                if r() % 3 == 0 && !t.is_empty() {
+                    let at = (r() as usize) % t.len();
+                    t[at] = b"0123456789Z:-T. x\"\xff"[(r() % 19) as usize];
+                }
+                check_any(&t);
+            }
             let check = |s: &[u8], hits: &mut u64| {
+                check_any(s);
                 let mut buf = s.to_vec();
                 buf.extend_from_slice(&[b'9'; 40]);
                 let b = &buf[..20];
