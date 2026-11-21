@@ -283,6 +283,41 @@ impl LinkTable {
         }
     }
 
+    /// The person key of user key `k` (hash `h`) after `finalize`, or `k`
+    /// itself when `k` is not in the table. Same result as `person_of_h`
+    /// (`unwrap_or(k)`), but probes a whole 64-byte group of 4 slots per
+    /// step: one compare per slot into a match mask and an empty mask, and a
+    /// select instead of data-dependent branches. Exact for linear probing
+    /// without deletions: a key sits after every slot of its probe sequence
+    /// that precedes it, and those were all occupied when it was inserted.
+    #[inline(always)]
+    pub fn person_or_self(&self, k: u64, h: u64) -> u64 {
+        if self.slots.is_empty() {
+            return k;
+        }
+        if self.amask != !3 {
+            return self.person_of_h(k, h).unwrap_or(k);
+        }
+        let mut i = self.start(h);
+        loop {
+            // i is a multiple of 4 and the table holds a power of two >= 16
+            // slots, so the group is in bounds
+            let g = unsafe { self.slots.get_unchecked(i..i + 4) };
+            let k0 = g[0][0].load(Ordering::Relaxed);
+            let k1 = g[1][0].load(Ordering::Relaxed);
+            let k2 = g[2][0].load(Ordering::Relaxed);
+            let k3 = g[3][0].load(Ordering::Relaxed);
+            let m = (k0 == k) as u32 | ((k1 == k) as u32) << 1 | ((k2 == k) as u32) << 2 | ((k3 == k) as u32) << 3;
+            let z = (k0 == 0) as u32 | ((k1 == 0) as u32) << 1 | ((k2 == 0) as u32) << 2 | ((k3 == 0) as u32) << 3;
+            if m | z != 0 {
+                let j = (m | 16).trailing_zeros() as usize & 3;
+                let v = g[j][1].load(Ordering::Relaxed);
+                return if m != 0 { v } else { k };
+            }
+            i = (i + 4) & self.mask;
+        }
+    }
+
     #[inline(always)]
     pub fn prefetch_h(&self, h: u64) {
         if self.slots.is_empty() {
@@ -299,5 +334,67 @@ impl LinkTable {
         }
         let i = self.start(keys::mix(k));
         crate::prefetch(self.slots.as_ptr().wrapping_add(i) as *const u8);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The group probe agrees with the slot-by-slot probe, also at a high
+    /// load factor (full groups, probes that wrap around the table end).
+    #[test]
+    fn group_probe_matches() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let key = |n: u64| keys::key_of(format!("u{:x}", n).as_bytes());
+        for &(declared, actual, space) in &[(1000usize, 1800usize, 5000u64), (1000, 400, 3000), (50, 90, 1 << 40)] {
+            let t = LinkTable::with_pairs(declared, 1);
+            let mut a = DenseAlloc::new();
+            let mut pairs = Vec::new();
+            let mut inserted = Vec::new();
+            for _ in 0..actual {
+                let (u, v) = (key(next() % space + 1), key(next() % space + 1));
+                let (du, dv) = t.insert_pair(u, v, &mut a);
+                pairs.push((du, dv));
+                inserted.push(u);
+                inserted.push(v);
+            }
+            for &(du, dv) in &pairs {
+                t.union_dense(du, dv);
+            }
+            for b in 0..t.root_blocks() {
+                t.finalize_roots(b);
+            }
+            for b in 0..t.val_blocks() {
+                t.finalize_vals(b);
+            }
+            let mut found = 0;
+            for n in 1..=space.min(20_000) {
+                let k = key(n);
+                let h = keys::mix(k);
+                let want = t.person_of_h(k, h).unwrap_or(k);
+                assert_eq!(t.person_or_self(k, h), want, "key {}", n);
+                found += t.person_of_h(k, h).is_some() as u32;
+            }
+            for _ in 0..20_000 {
+                let k = key(next());
+                let h = keys::mix(k);
+                assert_eq!(t.person_or_self(k, h), t.person_of_h(k, h).unwrap_or(k));
+            }
+            for &k in &inserted {
+                let h = keys::mix(k);
+                let p = t.person_of_h(k, h).expect("inserted key present");
+                assert_eq!(t.person_or_self(k, h), p);
+                found += 1;
+            }
+            assert!(found > 0);
+        }
+        assert_eq!(LinkTable::empty().person_or_self(7, keys::mix(7)), 7);
     }
 }

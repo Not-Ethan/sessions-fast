@@ -10,9 +10,15 @@
 
 use std::cell::UnsafeCell;
 
+/// Write-combining staging line size in bytes (build-time SS_WCBYTES: 64 or 128).
+const WCB: usize = match option_env!("SS_WCBYTES") {
+    Some(v) if v.len() == 3 => 128,
+    _ => 64,
+};
+
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-struct Line([u64; 8]);
+struct Line([u64; WCB / 8]);
 
 pub struct Parts<T: Copy> {
     arena: *mut T,
@@ -27,8 +33,8 @@ unsafe impl<T: Copy + Send> Send for Parts<T> {}
 unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
 
 impl<T: Copy> Parts<T> {
-    /// records per 64-byte line (write combining)
-    const WC_RECS: usize = 64 / std::mem::size_of::<T>();
+    /// records per staging line (write combining)
+    const WC_RECS: usize = WCB / std::mem::size_of::<T>();
 
     pub fn new(nparts: usize, cap: usize) -> Self {
         Self::with_wc(nparts, cap, false)
@@ -52,7 +58,7 @@ impl<T: Copy> Parts<T> {
             cap,
             lens: vec![0; nparts],
             over: (0..nparts).map(|_| UnsafeCell::new(Vec::new())).collect(),
-            wc: if wc { vec![Line([0; 8]); nparts] } else { Vec::new() },
+            wc: if wc { vec![Line([0; WCB / 8]); nparts] } else { Vec::new() },
         }
     }
 
@@ -86,6 +92,36 @@ impl<T: Copy> Parts<T> {
         } else {
             self.push_over(p, v);
         }
+    }
+
+    /// `push` without bounds checks on the partition index.
+    ///
+    /// # Safety
+    /// `p` must be below the number of partitions.
+    #[inline(always)]
+    pub unsafe fn push_unchecked(&mut self, p: usize, v: T) {
+        debug_assert!(p < self.lens.len());
+        let l = *self.lens.get_unchecked(p) as usize;
+        if !self.wc.is_empty() {
+            let k = l % Self::WC_RECS;
+            (self.wc.get_unchecked_mut(p).0.as_mut_ptr() as *mut T).add(k).write(v);
+            *self.lens.get_unchecked_mut(p) = l as u32 + 1;
+            if k == Self::WC_RECS - 1 {
+                self.flush_line(p, l + 1 - Self::WC_RECS);
+            }
+            return;
+        }
+        self.push(p, v);
+    }
+
+    /// `len` without bounds checks, for a write-combining Parts.
+    ///
+    /// # Safety
+    /// `p` must be below the number of partitions, and write combining on.
+    #[inline(always)]
+    pub unsafe fn len_wc_unchecked(&self, p: usize) -> usize {
+        debug_assert!(p < self.lens.len() && !self.wc.is_empty());
+        *self.lens.get_unchecked(p) as usize
     }
 
     #[cold]
@@ -187,14 +223,13 @@ fn stream_line(dst: *mut u8, src: &Line) {
         use std::arch::x86_64::*;
         let s = src.0.as_ptr() as *const __m128i;
         let d = dst as *mut __m128i;
-        _mm_stream_si128(d, _mm_load_si128(s));
-        _mm_stream_si128(d.add(1), _mm_load_si128(s.add(1)));
-        _mm_stream_si128(d.add(2), _mm_load_si128(s.add(2)));
-        _mm_stream_si128(d.add(3), _mm_load_si128(s.add(3)));
+        for j in 0..WCB / 16 {
+            _mm_stream_si128(d.add(j), _mm_load_si128(s.add(j)));
+        }
     }
     #[cfg(not(target_arch = "x86_64"))]
     unsafe {
-        std::ptr::copy_nonoverlapping(src.0.as_ptr() as *const u8, dst, 64);
+        std::ptr::copy_nonoverlapping(src.0.as_ptr() as *const u8, dst, WCB);
     }
 }
 

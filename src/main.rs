@@ -143,10 +143,10 @@ impl PCache {
 /// its own person).
 #[inline(always)]
 fn person_hash(lt: &LinkTable, user: u64, h: u64) -> u64 {
-    match lt.person_of_h(user, h) {
-        Some(p) if p != user => keys::mix(p),
-        _ => h,
-    }
+    // h == mix(user) at every call, so this is mix(person) whether or not
+    // the user is linked, without a branch on the lookup result
+    debug_assert_eq!(h, keys::mix(user));
+    keys::mix(lt.person_or_self(user, h))
 }
 
 // ---------------------------------------------------------------- context
@@ -1181,8 +1181,9 @@ impl BSink<'_> {
     #[inline(always)]
     fn emit_hp(&mut self, p: Pending, person: u64) {
         let q = (person >> (64 - self.ps_bits)) as usize;
-        let i = self.s.len(q);
-        self.s.push(q, SRec { person, ts: p.ts, pay: p.pay });
+        // q < 2^ps_bits = the number of session partitions; write combining on
+        let i = unsafe { self.s.len_wc_unchecked(q) };
+        unsafe { self.s.push_unchecked(q, SRec { person, ts: p.ts, pay: p.pay }) };
         let loc = if i < self.lb.imax {
             self.tbase | ((q as u32) << self.lb.ibits) | i as u32
         } else {
@@ -1194,7 +1195,8 @@ impl BSink<'_> {
                 self.overflow = true;
             }
         } else {
-            self.a.push((p.eid >> (64 - self.pe_bits)) as usize, ARec { eid: p.eid, ingest: p.ingest, loc });
+            // the top pe_bits of the hash index the 2^pe_bits dedup partitions
+            unsafe { self.a.push_unchecked((p.eid >> (64 - self.pe_bits)) as usize, ARec { eid: p.eid, ingest: p.ingest, loc }) };
         }
     }
 
@@ -1526,15 +1528,23 @@ fn kill(loc: u32, sb: &[BOut], lb: LocBits) {
 /// identical) and marks the loser's SRec dead.
 #[inline(always)]
 fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocBits) {
-    let mut i = r.eid as usize & mask;
+    // Linear probing from a 4-slot (64-byte) group start, a group per step:
+    // the first slot holding the key or empty decides (no deletions, so a
+    // present key precedes every empty slot of its probe sequence). Tables
+    // hold a power of two >= 16 slots, so a group never crosses the end.
+    debug_assert!(mask >= 15);
+    let mut i = r.eid as usize & mask & !3;
     loop {
-        let slot = unsafe { table.get_unchecked_mut(i) };
-        if slot.eid == 0 {
-            *slot = *r;
-            return;
-        }
-        if slot.eid == r.eid {
-            if r.ingest < slot.ingest {
+        let g = unsafe { table.get_unchecked_mut(i..i + 4) };
+        let (e0, e1, e2, e3) = (g[0].eid, g[1].eid, g[2].eid, g[3].eid);
+        let m = (e0 == r.eid) as u32 | ((e1 == r.eid) as u32) << 1 | ((e2 == r.eid) as u32) << 2 | ((e3 == r.eid) as u32) << 3;
+        let z = (e0 == 0) as u32 | ((e1 == 0) as u32) << 1 | ((e2 == 0) as u32) << 2 | ((e3 == 0) as u32) << 3;
+        if m | z != 0 {
+            let j = (m | z).trailing_zeros() as usize;
+            let slot = unsafe { g.get_unchecked_mut(j) };
+            if (m >> j) & 1 == 0 {
+                *slot = *r;
+            } else if r.ingest < slot.ingest {
                 kill(slot.loc, sb, lb);
                 slot.ingest = r.ingest;
                 slot.loc = r.loc;
@@ -1543,7 +1553,7 @@ fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocB
             }
             return;
         }
-        i = (i + 1) & mask;
+        i = (i + 4) & mask;
     }
 }
 
