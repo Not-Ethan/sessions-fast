@@ -914,21 +914,29 @@ class Harness:
         (self.scratch / "cases").mkdir(parents=True, exist_ok=True)
         (self.scratch / "out").mkdir(parents=True, exist_ok=True)
 
+    def lock(self):
+        """--flock FILE: every generator / binary / reference run under flock."""
+        return ["flock", self.args.flock] if self.args.flock else []
+
     def gen(self, name, seed, events, clicks):
         d = self.scratch / "cases" / name
         shutil.rmtree(d, ignore_errors=True)
-        subprocess.run([str(GEN), "--seed", str(seed), "--events", str(events), "--clicks", str(int(clicks)),
+        subprocess.run(self.lock() + [str(self.args.gen), "--seed", str(seed), "--events", str(events), "--clicks", str(int(clicks)),
                         "--output", str(d), "--threads", "2"], check=True, capture_output=True)
         return d
 
     def run_bin(self, data, out, extra):
         env = {k: v for k, v in os.environ.items() if not k.startswith("SS_")}
-        env.update({"NCPU": "2", "SS_VERBOSE": "1"})
+        env.update({"NCPU": str(self.args.ncpu), "SS_VERBOSE": "1"})
+        # --env: applied to every run (general and dense), e.g. SS_NOAVX2=1
+        for kv in self.args.env:
+            k, _, v = kv.partition("=")
+            env[k] = v
         env.update(extra)
         shutil.rmtree(out, ignore_errors=True)
         t0 = time.time()
         try:
-            p = subprocess.run([str(self.bin), str(data), str(out)], env=env, capture_output=True, text=True,
+            p = subprocess.run(self.lock() + [str(self.bin), str(data), str(out)], env=env, capture_output=True, text=True,
                                timeout=self.args.timeout)
             rc, err = p.returncode, p.stderr
         except subprocess.TimeoutExpired:
@@ -1024,7 +1032,7 @@ class Harness:
             cols.append(f"{label}={st}{tag if label == 'd1' or not taken else ''}")
         if self.args.ref and events <= REF_MAX_EVENTS and g_rc == 0:
             t0 = time.time()
-            p = subprocess.run([sys.executable, str(REFERENCE), str(data), str(out / "ref")], capture_output=True,
+            p = subprocess.run(self.lock() + [sys.executable, str(REFERENCE), str(data), str(out / "ref")], capture_output=True,
                                text=True)
             times.append(f"ref {time.time() - t0:.1f}")
             warns = [l for l in p.stderr.splitlines() if "WARNING" in l]
@@ -1067,7 +1075,8 @@ class Harness:
             (109, 300_000, 1.0), (110, 300_000, 0.025), (111, 1_000_000, 3.0), (112, 3_000_000, 0.25),
             (113, 5_000_000, 0.25)]
         for seed, e, ratio in sets:
-            name = f"01-plain-{e // 1000}K-c{int(ratio * 1000)}"
+            seed += self.args.seed_offset
+            name = f"01-plain-{e // 1000}K-c{int(ratio * 1000)}-s{seed}"
             t0 = time.time()
             d = self.gen(name, seed, e, e * ratio)
             self.evaluate(name, d, e, time.time() - t0, note=f"seed {seed}, clicks {ratio:.1%}", mutated=False)
@@ -1260,6 +1269,11 @@ def main():
     ap.add_argument("--scratch", default=str(SCRATCH))
     ap.add_argument("--bin", default=str(BIN))
     ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--gen", default=str(GEN))
+    ap.add_argument("--env", action="append", default=[], help="KEY=VALUE for every run (repeatable)")
+    ap.add_argument("--ncpu", type=int, default=2)
+    ap.add_argument("--flock", default="", help="lock file for flock around each heavy run (shared VM)")
+    ap.add_argument("--seed-offset", type=int, default=0, help="added to case 1's seeds (new sets)")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
     if args.list:
@@ -1274,7 +1288,8 @@ def main():
         ids = list(CASES)
     h = Harness(args)
     t0 = time.time()
-    print(f"binary {h.bin} | scratch {h.scratch} | modes {args.modes} | ref {'on' if args.ref else 'off'}", flush=True)
+    print(f"binary {h.bin} | scratch {h.scratch} | modes {args.modes} | ref {'on' if args.ref else 'off'} "
+          f"| env {args.env} | ncpu {args.ncpu}", flush=True)
     for i in ids:
         try:
             CASES[i][1](h)
