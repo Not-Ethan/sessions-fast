@@ -175,13 +175,129 @@ fn prefix_xor(mut x: u64) -> u64 {
 /// exactly 2, at its first and last byte. Blocks get a violation mask; lines
 /// touching no violation (almost all) need no per-field quote check, and a
 /// field is unquoted by `start += q; end -= q` from its first byte.
-#[inline(always)]
 pub fn for_each_record_x_v2<'a, const N: usize, F: FnMut(&[&'a [u8]; N]), const AVX2: bool>(
     buf: &'a [u8],
     start: usize,
     end: usize,
-    mut f: F,
+    f: F,
 ) {
+    scan_v2::<N, _, AVX2>(buf, start, end, &mut SliceSink(f))
+}
+
+/// What the v2 scanner hands each well-formed line to: regular lines by
+/// their delimiter positions, the final unterminated line as slices.
+trait LineSink<'a, const N: usize> {
+    /// line from `ls` with the N delimiter positions `d` (relative to `r`;
+    /// d[N-1] is its newline); quote rule already checked
+    fn line(&mut self, r: &'a [u8], ls: usize, d: &[u32]);
+    /// the final line without '\n', as fields
+    fn last(&mut self, f: &[&'a [u8]; N]);
+}
+
+struct SliceSink<F>(F);
+impl<'a, const N: usize, F: FnMut(&[&'a [u8]; N])> LineSink<'a, N> for SliceSink<F> {
+    #[inline(always)]
+    fn line(&mut self, r: &'a [u8], ls: usize, d: &[u32]) {
+        line_v2::<N, F>(r, ls, d, &mut self.0);
+    }
+    #[inline(always)]
+    fn last(&mut self, f: &[&'a [u8]; N]) {
+        (self.0)(f)
+    }
+}
+
+/// A well-formed line seen through its delimiter positions: field j spans
+/// [start_j, d[j]) with start_0 = ls and start_j = d[j-1] + 1, minus one
+/// quote at each end when its first byte is a quote (the scanner checked
+/// that every quote is the first or last byte of its field, two per quoted
+/// field). Fields are computed on demand.
+#[derive(Clone, Copy)]
+pub struct Line<'a, const N: usize> {
+    p: *const u8,
+    ls: usize,
+    d: *const u32,
+    _m: std::marker::PhantomData<&'a [u8]>,
+}
+
+impl<'a, const N: usize> Line<'a, N> {
+    /// Field j (j < N), unquoted.
+    #[inline(always)]
+    pub fn field(&self, j: usize) -> &'a [u8] {
+        debug_assert!(j < N);
+        unsafe {
+            let s = if j == 0 { self.ls } else { *self.d.add(j - 1) as usize + 1 };
+            let e = *self.d.add(j) as usize;
+            // s <= e, and r[e] is this line's delimiter, so r[s] exists
+            let q = (*self.p.add(s) == b'"') as usize;
+            std::slice::from_raw_parts(self.p.add(s + q), e - s - 2 * q)
+        }
+    }
+
+    /// Address of the line's newline.
+    #[inline(always)]
+    pub fn end_addr(&self) -> usize {
+        unsafe { self.p as usize + *self.d.add(N - 1) as usize }
+    }
+
+    /// All fields as slices.
+    #[inline(always)]
+    pub fn all(&self) -> [&'a [u8]; N] {
+        std::array::from_fn(|j| self.field(j))
+    }
+}
+
+/// Fields of a line, as slices or on demand.
+pub trait Fields<'a> {
+    fn get(&self, j: usize) -> &'a [u8];
+}
+
+impl<'a, const N: usize> Fields<'a> for [&'a [u8]; N] {
+    #[inline(always)]
+    fn get(&self, j: usize) -> &'a [u8] {
+        self[j]
+    }
+}
+
+impl<'a, const N: usize> Fields<'a> for Line<'a, N> {
+    #[inline(always)]
+    fn get(&self, j: usize) -> &'a [u8] {
+        self.field(j)
+    }
+}
+
+struct LazySink<FL, FS>(FL, FS);
+impl<'a, const N: usize, FL: FnMut(&Line<'a, N>), FS: FnMut(&[&'a [u8]; N])> LineSink<'a, N> for LazySink<FL, FS> {
+    #[inline(always)]
+    fn line(&mut self, r: &'a [u8], ls: usize, d: &[u32]) {
+        (self.0)(&Line { p: r.as_ptr(), ls, d: d.as_ptr(), _m: std::marker::PhantomData });
+    }
+    #[inline(always)]
+    fn last(&mut self, f: &[&'a [u8]; N]) {
+        (self.1)(f)
+    }
+}
+
+/// Like `for_each_record_x`, but regular lines arrive as a `Line` (fields on
+/// demand); the final unterminated line, and every line under the v1
+/// scanner (SS_SCAN1), arrive as slices through `fs`. Same lines, same
+/// fields, same order as `for_each_record_x`.
+#[inline(always)]
+pub fn for_each_line_x<'a, const N: usize, FL: FnMut(&Line<'a, N>), FS: FnMut(&[&'a [u8]; N]), const AVX2: bool>(
+    buf: &'a [u8],
+    start: usize,
+    end: usize,
+    fl: FL,
+    fs: FS,
+) {
+    if USE_V1.load(std::sync::atomic::Ordering::Relaxed) {
+        for_each_record_x_v1::<N, FS, AVX2>(buf, start, end, fs)
+    } else {
+        scan_v2::<N, _, AVX2>(buf, start, end, &mut LazySink(fl, fs))
+    }
+}
+
+#[inline(always)]
+fn scan_v2<'a, const N: usize, H: LineSink<'a, N>, const AVX2: bool>(buf: &'a [u8], start: usize, end: usize, h: &mut H) {
     assert!(end <= buf.len() && end - start < (u32::MAX as usize) - 8192);
     const WBLK: usize = 64;
     const WIN: usize = WBLK * 64;
@@ -246,7 +362,7 @@ pub fn for_each_record_x_v2<'a, const N: usize, F: FnMut(&[&'a [u8]; N]), const 
             if k + N <= nd && dl[k + N - 1] as usize == le {
                 let bad = (ls < w && v_open) || (any_v != 0 && has_v(&vmask, w, ls.max(w), le + 1));
                 if !bad {
-                    line_v2::<N, F>(r, ls, &dl[k..k + N], &mut f);
+                    h.line(r, ls, &dl[k..k + N]);
                 }
                 k += N;
             } else {
@@ -267,7 +383,7 @@ pub fn for_each_record_x_v2<'a, const N: usize, F: FnMut(&[&'a [u8]; N]), const 
     if rlen > 0 && end == buf.len() && buf[end - 1] != b'\n' && carry + 1 == N {
         // final line without '\n': its N-1 commas are carried; the end closes it
         let qline = r[ls..rlen].iter().filter(|&&c| c == b'"').count() as u64;
-        line_safe::<N, F>(r, rlen, ls, &dl[..N - 1], qline, &mut f);
+        line_safe::<N, _>(r, rlen, ls, &dl[..N - 1], qline, &mut |f: &[&'a [u8]; N]| h.last(f));
     }
 }
 
@@ -470,6 +586,70 @@ pub fn next_line_start(buf: &[u8], from: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `for_each_line_x` yields the same lines and fields as
+    /// `for_each_record_x`, on random dialect-heavy text, both SIMD paths.
+    #[test]
+    fn lazy_lines_match_slices() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"ab,,\"\"\n\n7\r ";
+        #[cfg(target_arch = "x86_64")]
+        let has_avx2 = std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("bmi2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let has_avx2 = false;
+        for round in 0..400 {
+            let n = (next() % 9000) as usize;
+            let mut t: Vec<u8> = (0..n).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            if round % 3 == 0 {
+                // mostly well-formed 7-field lines, some quoted fields
+                t.clear();
+                for _ in 0..(next() % 300) {
+                    for j in 0..7 {
+                        let w = (next() % 12) as usize;
+                        let quoted = next() % 4 == 0;
+                        if quoted {
+                            t.push(b'"');
+                        }
+                        for _ in 0..w {
+                            t.push(b"xyz019-:TZ"[(next() % 10) as usize]);
+                        }
+                        if quoted {
+                            t.push(b'"');
+                        }
+                        t.push(if j == 6 { b'\n' } else { b',' });
+                    }
+                }
+                if next() % 2 == 0 {
+                    t.pop();
+                }
+            }
+            let mut want: Vec<Vec<Vec<u8>>> = Vec::new();
+            for_each_record_x::<7, _, false>(&t, 0, t.len(), |f| want.push(f.iter().map(|s| s.to_vec()).collect()));
+            for avx2 in [false, true] {
+                if avx2 && !has_avx2 {
+                    continue;
+                }
+                let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+                {
+                    let got = std::cell::RefCell::new(&mut got);
+                    let fl = |l: &Line<7>| got.borrow_mut().push((0..7).map(|j| l.field(j).to_vec()).collect());
+                    let fs = |f: &[&[u8]; 7]| got.borrow_mut().push(f.iter().map(|s| s.to_vec()).collect());
+                    if avx2 {
+                        for_each_line_x::<7, _, _, true>(&t, 0, t.len(), fl, fs);
+                    } else {
+                        for_each_line_x::<7, _, _, false>(&t, 0, t.len(), fl, fs);
+                    }
+                }
+                assert_eq!(got, want, "round {} avx2 {}", round, avx2);
+            }
+        }
+    }
 
     fn collect<const N: usize>(text: &[u8]) -> Vec<Vec<Vec<u8>>> {
         let mut out = Vec::new();

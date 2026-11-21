@@ -528,7 +528,7 @@ impl EvSink for (Parts<ERec>, u32) {
 /// Type and price of a valid event: Some(pay) for view/cart (0) or a valid
 /// purchase (price | category rank << 24).
 #[inline(always)]
-fn event_pay(ty: &[u8], price: &[u8], product: &[u8], ctx: &Ctx, wide: bool) -> Option<u32> {
+fn event_pay<'p>(ty: &[u8], price: impl FnOnce() -> &'p [u8], product: &[u8], ctx: &Ctx, wide: bool) -> Option<u32> {
     let n4 = ty.len();
     let is_purchase;
     let is_vc;
@@ -542,7 +542,7 @@ fn event_pay(ty: &[u8], price: &[u8], product: &[u8], ctx: &Ctx, wide: bool) -> 
         is_vc = ty == b"view" || ty == b"cart";
     }
     if is_purchase {
-        let price = ts::parse_price(price)?;
+        let price = ts::parse_price(price())?;
         let mut cat = if wide { unsafe { ctx.products.get_wide(product) } } else { ctx.products.get(product) } as u32;
         if cat == NONE as u32 {
             cat = ctx.unknown_cat;
@@ -558,32 +558,41 @@ fn event_pay(ty: &[u8], price: &[u8], product: &[u8], ctx: &Ctx, wide: bool) -> 
 /// One event line (event_id non-empty). With `WIDE`, 32 bytes from the start
 /// of every field must be readable.
 #[inline(always)]
-fn event_line<const WIDE: bool, S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut S) {
+fn event_line<'a, const WIDE: bool, S: EvSink, F: scan::Fields<'a>>(f: &F, f0: &'a [u8], ctx: &Ctx, sink: &mut S) {
+    // fields are taken on demand (each at most once): `f` may compute them
+    // from delimiter positions, and the price is only read for purchases
     let (ws, we) = (ctx.ws, ctx.we);
-    let ing = if WIDE && ctx.tsw { unsafe { ctx.tsp.parse_wide_f1(f[3]) } } else { ctx.tsp.parse(f[3]) };
+    let f3 = f.get(3);
+    let ing = if WIDE && ctx.tsw { unsafe { ctx.tsp.parse_wide_f1(f3) } } else { ctx.tsp.parse(f3) };
     let Some(ing) = ing else { return };
-    let eid = keys::mix(if WIDE { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) });
+    let eid = keys::mix(if WIDE { unsafe { keys::key_of_wide(f0) } } else { keys::key_of(f0) });
     let ingest = ingest_rel(ing, ctx.ws_s);
     let valid = 'v: {
-        if f[1].is_empty() || f[5].is_empty() {
+        let f1 = f.get(1);
+        if f1.is_empty() {
             break 'v None;
         }
+        let f5 = f.get(5);
+        if f5.is_empty() {
+            break 'v None;
+        }
+        let f2 = f.get(2);
         let t = if WIDE && ctx.tsh {
-            unsafe { ctx.tsp.parse_hyb(f[2]) }
+            unsafe { ctx.tsp.parse_hyb(f2) }
         } else if WIDE && ctx.tsw {
-            unsafe { ctx.tsp.parse_wide(f[2]) }
+            unsafe { ctx.tsp.parse_wide(f2) }
         } else {
-            ctx.tsp.parse(f[2])
+            ctx.tsp.parse(f2)
         };
         let Some(t) = t else { break 'v None };
         if t < ws || t >= we {
             break 'v None;
         }
-        let Some(pay) = event_pay(f[4], f[6], f[5], ctx, WIDE) else { break 'v None };
+        let Some(pay) = event_pay(f.get(4), || f.get(6), f5, ctx, WIDE) else { break 'v None };
         if ing - t > LATE {
             break 'v None;
         }
-        let user = if WIDE { unsafe { keys::key_of_wide(f[1]) } } else { keys::key_of(f[1]) };
+        let user = if WIDE { unsafe { keys::key_of_wide(f1) } } else { keys::key_of(f1) };
         Some((user, (t - ws) as u32, pay))
     };
     sink.copy(eid, ingest, valid);
@@ -592,23 +601,44 @@ fn event_line<const WIDE: bool, S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut
 #[inline(never)]
 #[cold]
 fn event_line_slow<S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut S) {
-    event_line::<false, S>(f, ctx, sink)
+    event_line::<false, S, _>(f, f[0], ctx, sink)
 }
 
 /// One chunk of events/: parse, validate, hand every copy to `sink`.
 /// `safe_end` is the end address of readable memory after `b` (>= its end).
 #[inline(always)]
 fn event_task<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
-    scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, #[inline(always)] |f| {
-        if f[0].is_empty() {
-            return;
-        }
-        if f[6].as_ptr() as usize + 32 <= safe_end {
-            event_line::<true, S>(f, ctx, sink);
-        } else {
-            event_line_slow(f, ctx, sink);
-        }
-    });
+    // The scanner calls one closure at a time; both reach the sink through
+    // this pointer (no two live references to it).
+    let sp: *mut S = sink;
+    scan::for_each_line_x::<7, _, _, AVX2>(
+        b,
+        task.start,
+        task.end,
+        #[inline(always)]
+        |l| {
+            let f0 = l.field(0);
+            if f0.is_empty() {
+                return;
+            }
+            // every field starts at or before the newline
+            if l.end_addr() + 32 <= safe_end {
+                event_line::<true, S, _>(l, f0, ctx, unsafe { &mut *sp });
+            } else {
+                event_line_slow(&l.all(), ctx, unsafe { &mut *sp });
+            }
+        },
+        |f| {
+            if f[0].is_empty() {
+                return;
+            }
+            if f[6].as_ptr() as usize + 32 <= safe_end {
+                event_line::<true, S, _>(f, f[0], ctx, unsafe { &mut *sp });
+            } else {
+                event_line_slow(f, ctx, unsafe { &mut *sp });
+            }
+        },
+    );
 }
 
 /// Receives every valid click, routed by person (partition `q`).
@@ -1528,23 +1558,15 @@ fn kill(loc: u32, sb: &[BOut], lb: LocBits) {
 /// identical) and marks the loser's SRec dead.
 #[inline(always)]
 fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocBits) {
-    // Linear probing from a 4-slot (64-byte) group start, a group per step:
-    // the first slot holding the key or empty decides (no deletions, so a
-    // present key precedes every empty slot of its probe sequence). Tables
-    // hold a power of two >= 16 slots, so a group never crosses the end.
-    debug_assert!(mask >= 15);
-    let mut i = r.eid as usize & mask & !3;
+    let mut i = r.eid as usize & mask;
     loop {
-        let g = unsafe { table.get_unchecked_mut(i..i + 4) };
-        let (e0, e1, e2, e3) = (g[0].eid, g[1].eid, g[2].eid, g[3].eid);
-        let m = (e0 == r.eid) as u32 | ((e1 == r.eid) as u32) << 1 | ((e2 == r.eid) as u32) << 2 | ((e3 == r.eid) as u32) << 3;
-        let z = (e0 == 0) as u32 | ((e1 == 0) as u32) << 1 | ((e2 == 0) as u32) << 2 | ((e3 == 0) as u32) << 3;
-        if m | z != 0 {
-            let j = (m | z).trailing_zeros() as usize;
-            let slot = unsafe { g.get_unchecked_mut(j) };
-            if (m >> j) & 1 == 0 {
-                *slot = *r;
-            } else if r.ingest < slot.ingest {
+        let slot = unsafe { table.get_unchecked_mut(i) };
+        if slot.eid == 0 {
+            *slot = *r;
+            return;
+        }
+        if slot.eid == r.eid {
+            if r.ingest < slot.ingest {
                 kill(slot.loc, sb, lb);
                 slot.ingest = r.ingest;
                 slot.loc = r.loc;
@@ -1553,7 +1575,7 @@ fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocB
             }
             return;
         }
-        i = (i + 4) & mask;
+        i = (i + 1) & mask;
     }
 }
 
@@ -2878,7 +2900,7 @@ fn ev_batch_flush<S: EvSink>(bt: &mut EvBatch, base: *const u8, ctx: &Ctx, sink:
             let mut ok = (bt.len[1][i] != 0) & (bt.len[5][i] != 0) & (t != i64::MIN) & (t >= ws) & (t < we);
             let mut pay = 0u32;
             if ok {
-                match event_pay(bfield(bt, base, 4, i), bfield(bt, base, 6, i), bfield(bt, base, 5, i), ctx, true) {
+                match event_pay(bfield(bt, base, 4, i), || bfield(bt, base, 6, i), bfield(bt, base, 5, i), ctx, true) {
                     Some(p) => pay = p,
                     None => ok = false,
                 }
