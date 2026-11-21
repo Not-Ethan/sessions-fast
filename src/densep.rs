@@ -205,14 +205,14 @@ pub fn decide(ev: &Input, ctx: &Ctx) -> Option<Dense> {
 }
 
 /// Exceptional user IDs: exact key -> id (sharded).
-struct Xmap {
+pub(crate) struct Xmap {
     shards: Vec<Mutex<HashMap<u64, u32>>>,
     next: AtomicU32,
     keys: Mutex<Vec<(u32, u64)>>,
 }
 
 impl Xmap {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Xmap { shards: (0..64).map(|_| Mutex::new(HashMap::new())).collect(), next: AtomicU32::new(0), keys: Mutex::new(Vec::new()) }
     }
     fn id(&self, k: u64) -> u32 {
@@ -226,7 +226,7 @@ impl Xmap {
         id
     }
     /// id -> key, after all interning.
-    fn key_table(&self) -> Vec<u64> {
+    pub(crate) fn key_table(&self) -> Vec<u64> {
         let n = self.next.load(Ordering::Relaxed) as usize;
         let mut t = vec![0u64; n];
         for &(id, k) in self.keys.lock().unwrap().iter() {
@@ -283,44 +283,44 @@ fn pmix(p: u32, d: &Dense, xkeys: &[u64]) -> u64 {
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-struct DE {
-    n: u32,
-    ingest: u32,
+pub(crate) struct DE {
+    pub(crate) n: u32,
+    pub(crate) ingest: u32,
     /// ts offset | VALID (0 for an invalid copy)
-    ts: u32,
+    pub(crate) ts: u32,
     /// user slot | PFLAG for a purchase (0 for an invalid copy)
-    us: u32,
+    pub(crate) us: u32,
 }
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-struct DP {
-    n: u32,
-    ingest: u32,
-    pay: u32,
-    _p: u32,
+pub(crate) struct DP {
+    pub(crate) n: u32,
+    pub(crate) ingest: u32,
+    pub(crate) pay: u32,
+    pub(crate) _p: u32,
 }
 
 /// An exceptional event copy.
 #[derive(Clone, Copy)]
-struct XE {
-    key: u64,
-    ingest: u32,
-    valid: bool,
-    us: u32,
-    ts: u32,
-    pay: u32,
+pub(crate) struct XE {
+    pub(crate) key: u64,
+    pub(crate) ingest: u32,
+    pub(crate) valid: bool,
+    pub(crate) us: u32,
+    pub(crate) ts: u32,
+    pub(crate) pay: u32,
 }
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-struct DC {
-    us: u32,
-    camp: u32,
-    ts: u32,
-    _p: u32,
-    ck: u64,
-    _q: u64,
+pub(crate) struct DC {
+    pub(crate) us: u32,
+    pub(crate) camp: u32,
+    pub(crate) ts: u32,
+    pub(crate) _p: u32,
+    pub(crate) ck: u64,
+    pub(crate) _q: u64,
 }
 
 /// An exceptional event's dedup winner with its person.
@@ -331,10 +331,10 @@ struct KE {
     pay: u32,
 }
 
-struct EvOut {
-    de: Parts<DE>,
-    dp: Parts<DP>,
-    xe: Vec<XE>,
+pub(crate) struct EvOut {
+    pub(crate) de: Parts<DE>,
+    pub(crate) dp: Parts<DP>,
+    pub(crate) xe: Vec<XE>,
 }
 
 /// The dense pipeline from links to user_daily part files; returns the
@@ -984,7 +984,7 @@ unsafe fn ev_task_avx2(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, o:
     ev_task_x::<true>(b, task, ctx, d, xm, o, safe_end)
 }
 
-fn ev_task_any(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, o: &mut EvOut, safe_end: usize) {
+pub(crate) fn ev_task_any(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, o: &mut EvOut, safe_end: usize) {
     if ctx.avx2 {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -997,7 +997,7 @@ fn ev_task_any(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, o: &mut Ev
 /// One event line: the same steps and rules as main::event_line, with the
 /// event number / user slot instead of keys.
 #[inline(always)]
-fn ev_line(f: &[&[u8]; 7], ctx: &Ctx, d: &Dense, xm: &Xmap, o: &mut EvOut, safe_end: usize) {
+pub(crate) fn ev_line(f: &[&[u8]; 7], ctx: &Ctx, d: &Dense, xm: &Xmap, o: &mut EvOut, safe_end: usize) {
     if f[0].is_empty() {
         return;
     }
@@ -1047,6 +1047,26 @@ fn ev_line(f: &[&[u8]; 7], ctx: &Ctx, d: &Dense, xm: &Xmap, o: &mut EvOut, safe_
 #[inline(always)]
 fn ev_task_x<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, o: &mut EvOut, safe_end: usize) {
     let op: *mut EvOut = o;
+    // k3 kernel (SS_K3=1): fast lines become records directly; lines in
+    // doubt go to ev_line / ev_range below
+    #[cfg(target_arch = "x86_64")]
+    if AVX2 && crate::k3::ON.load(Ordering::Relaxed) {
+        let k = crate::k3::params(ctx, d.ke, d.ku, d.bound, d.pmax);
+        let mut sink = crate::k3::EvOutSink(op, d.bshift);
+        unsafe {
+            crate::k3::ev_kernel::<_, _, _, { crate::k3::FULL }>(
+                b,
+                task.start,
+                task.end,
+                k,
+                ctx,
+                &mut sink,
+                |f| ev_line(f, ctx, d, xm, &mut *op, safe_end),
+                |from, to| ev_range(b, from, to, ctx, d, xm, &mut *op, safe_end),
+            )
+        };
+        return;
+    }
     // the two callbacks are never active at the same time
     fastev::for_each_line2::<AVX2, _, _>(
         b,
@@ -1062,7 +1082,7 @@ fn ev_task_x<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn ev_range(b: &[u8], from: usize, to: usize, ctx: &Ctx, d: &Dense, xm: &Xmap, o: &mut EvOut, safe_end: usize) {
+pub(crate) fn ev_range(b: &[u8], from: usize, to: usize, ctx: &Ctx, d: &Dense, xm: &Xmap, o: &mut EvOut, safe_end: usize) {
     scan::for_each_record_x::<7, _, false>(b, from, to, |f| ev_line(f, ctx, d, xm, o, safe_end));
 }
 
@@ -1075,7 +1095,7 @@ unsafe fn cl_task_avx2(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, v:
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cl_task_any(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut Parts<DC>, nbc: usize, safe_end: usize) {
+pub(crate) fn cl_task_any(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut Parts<DC>, nbc: usize, safe_end: usize) {
     if ctx.avx2 {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -1085,29 +1105,55 @@ fn cl_task_any(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut Pa
     cl_task_x::<false>(b, task, ctx, d, xm, v, nbc, safe_end)
 }
 
-/// One click line: the same rules as main::click_task.
+/// The click lines of one task.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn cl_task_x<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut Parts<DC>, nbc: usize, safe_end: usize) {
+    let vp: *mut Parts<DC> = v;
+    // k3 kernel (SS_K3=1): fast lines become records directly; lines in
+    // doubt go to cl_line (the rule below) / the general scanner
+    #[cfg(target_arch = "x86_64")]
+    if AVX2 && crate::k3::ON.load(Ordering::Relaxed) {
+        let k = crate::k3::params(ctx, d.ke, d.ku, d.bound, d.pmax);
+        let mut sink = crate::k3::ClSink(vp, nbc);
+        unsafe {
+            crate::k3::cl_kernel::<_, _, _>(
+                b,
+                task.start,
+                task.end,
+                k,
+                ctx,
+                &mut sink,
+                |f| cl_line(f, ctx, d, xm, &mut *vp, nbc, safe_end),
+                |from, to| scan::for_each_record_x::<4, _, false>(b, from, to, |f| cl_line(f, ctx, d, xm, &mut *vp, nbc, safe_end)),
+            )
+        };
+        return;
+    }
+    let mut line = |f: &[&[u8]; 4]| cl_line(f, ctx, d, xm, unsafe { &mut *vp }, nbc, safe_end);
+    fastev::for_each_click::<AVX2, _>(b, task.start, task.end, safe_end, &mut line);
+}
+
+/// One click line: the same rules as main::click_task.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cl_line(f: &[&[u8]; 4], ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut Parts<DC>, nbc: usize, safe_end: usize) {
     let we = ctx.we;
     let cws = ctx.ws - super::WEEK;
-    let mut line = |f: &[&[u8]; 4]| {
-        if f[0].is_empty() || f[1].is_empty() {
-            return;
-        }
-        let wide = f[3].as_ptr() as usize + 32 <= safe_end;
-        let Some(t) = ctx.tsp.parse(f[3]) else { return };
-        if t < cws || t >= we {
-            return;
-        }
-        let camp = if wide { unsafe { ctx.campaigns.get_wide(f[2]) } } else { ctx.campaigns.get(f[2]) };
-        if camp == NONE {
-            return;
-        }
-        let us = user_slot_w(f[1], d, xm, wide);
-        let ck = if wide { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) };
-        let q = ((us >> 16) as usize).min(nbc - 1);
-        v.push(q, DC { us, camp: camp as u32, ts: (t - cws) as u32, _p: 0, ck, _q: 0 });
-    };
-    fastev::for_each_click::<AVX2, _>(b, task.start, task.end, safe_end, &mut line);
+    if f[0].is_empty() || f[1].is_empty() {
+        return;
+    }
+    let wide = f[3].as_ptr() as usize + 32 <= safe_end;
+    let Some(t) = ctx.tsp.parse(f[3]) else { return };
+    if t < cws || t >= we {
+        return;
+    }
+    let camp = if wide { unsafe { ctx.campaigns.get_wide(f[2]) } } else { ctx.campaigns.get(f[2]) };
+    if camp == NONE {
+        return;
+    }
+    let us = user_slot_w(f[1], d, xm, wide);
+    let ck = if wide { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) };
+    let q = ((us >> 16) as usize).min(nbc - 1);
+    v.push(q, DC { us, camp: camp as u32, ts: (t - cws) as u32, _p: 0, ck, _q: 0 });
 }
