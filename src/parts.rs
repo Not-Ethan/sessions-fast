@@ -60,6 +60,13 @@ impl<T: Copy> Parts<T> {
         }
     }
 
+    /// Empties every partition, keeping the memory (benchmarks).
+    #[allow(dead_code)]
+    pub fn reset(&mut self) {
+        self.lens.iter_mut().for_each(|l| *l = 0);
+        self.over.iter_mut().for_each(|o| o.get_mut().clear());
+    }
+
     pub fn total(&self) -> usize {
         (0..self.lens.len()).map(|p| self.len(p)).sum()
     }

@@ -101,6 +101,8 @@ fn part(k: u64, bits: u32) -> usize {
 
 struct Ctx {
     tsp: ts::TsParser,
+    /// experiment (SS_TSW): branch-free timestamp parser on the hot path
+    tsw: bool,
     avx2: bool,
     ws: i64,
     we: i64,
@@ -429,7 +431,7 @@ fn event_pay(ty: &[u8], price: &[u8], product: &[u8], ctx: &Ctx, wide: bool) -> 
 #[inline(always)]
 fn event_line<const WIDE: bool, S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut S) {
     let (ws, we) = (ctx.ws, ctx.we);
-    let ing = if WIDE { unsafe { ctx.tsp.parse_wide_f1(f[3]) } } else { ctx.tsp.parse(f[3]) };
+    let ing = if WIDE && ctx.tsw { unsafe { ctx.tsp.parse_wide_f1(f[3]) } } else { ctx.tsp.parse(f[3]) };
     let Some(ing) = ing else { return };
     let eid = keys::mix(if WIDE { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) });
     let ingest = ingest_rel(ing, ctx.ws_s);
@@ -437,7 +439,7 @@ fn event_line<const WIDE: bool, S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut
         if f[1].is_empty() || f[5].is_empty() {
             break 'v None;
         }
-        let t = if WIDE { unsafe { ctx.tsp.parse_wide(f[2]) } } else { ctx.tsp.parse(f[2]) };
+        let t = if WIDE && ctx.tsw { unsafe { ctx.tsp.parse_wide(f[2]) } } else { ctx.tsp.parse(f[2]) };
         let Some(t) = t else { break 'v None };
         if t < ws || t >= we {
             break 'v None;
@@ -494,7 +496,7 @@ fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable,
             return;
         }
         let wide = f[3].as_ptr() as usize + 32 <= safe_end;
-        let t = if wide { unsafe { ctx.tsp.parse_wide(f[3]) } } else { ctx.tsp.parse(f[3]) };
+        let t = if wide && ctx.tsw { unsafe { ctx.tsp.parse_wide(f[3]) } } else { ctx.tsp.parse(f[3]) };
         let Some(t) = t else { return };
         if t < cws || t >= we {
             return;
@@ -776,6 +778,321 @@ fn dedup(e: &[Parts<ERec>], lt: &LinkTable, ctx: &Ctx) -> Vec<Parts<SRec>> {
     })
 }
 
+
+// ---------------------------------------------------------------- pipeline B
+//
+// Parse emits, per event copy, a 16-byte dedup record routed by event_id
+// (ARec) and, for a copy that passes validation, a 16-byte session record
+// routed by person (SRec; the person is resolved at parse, links come first).
+// Dedup then only has to find the losing copies and mark their SRec dead.
+
+/// Dedup stream record: one per parsed event copy, routed by event_id.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct ARec {
+    /// keys::mix(event_id key); never 0
+    eid: u64,
+    ingest: u32,
+    /// Location of the copy's SRec (thread | person partition | index), or
+    /// LOC_NONE if the copy is invalid.
+    loc: u32,
+}
+
+const LOC_NONE: u32 = u32::MAX;
+/// `SRec::ts` of a copy that lost dedup (real offsets are < 2^31).
+const DEAD: u32 = u32::MAX;
+
+#[derive(Clone, Copy)]
+struct LocBits {
+    qbits: u32,
+    ibits: u32,
+    /// indices must be < imax (so that no location equals LOC_NONE)
+    imax: usize,
+}
+
+impl LocBits {
+    fn new(threads: usize, ps_bits: u32) -> Option<LocBits> {
+        let tbits = ceil_log2(threads);
+        let ibits = env_usize("SS_LOCBITS").map(|b| b as u32).unwrap_or(32u32.saturating_sub(tbits + ps_bits));
+        if ibits < 1 || tbits + ps_bits + ibits > 32 {
+            return None;
+        }
+        Some(LocBits { qbits: ps_bits, ibits, imax: (1usize << ibits) - 1 })
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Pending {
+    eid: u64,
+    user: u64,
+    ingest: u32,
+    ts: u32,
+    pay: u32,
+}
+
+const BRING: usize = 16;
+
+/// One parse thread's pipeline-B output. Valid copies wait in a small ring
+/// so that the link-table slot of their user is prefetched before lookup.
+struct BSink<'a> {
+    a: Parts<ARec>,
+    s: Parts<SRec>,
+    ring: [Pending; BRING],
+    rh: usize,
+    rn: usize,
+    tbase: u32,
+    overflow: bool,
+    lt: &'a LinkTable,
+    pe_bits: u32,
+    ps_bits: u32,
+    lb: LocBits,
+}
+
+impl BSink<'_> {
+    #[inline(always)]
+    fn emit(&mut self, p: Pending) {
+        let person = self.lt.person_of(p.user);
+        let q = part(person, self.ps_bits);
+        let i = self.s.len(q);
+        self.s.push(q, SRec { person, ts: p.ts, pay: p.pay });
+        let loc = if i < self.lb.imax {
+            self.tbase | ((q as u32) << self.lb.ibits) | i as u32
+        } else {
+            self.overflow = true;
+            LOC_NONE
+        };
+        self.a.push((p.eid >> (64 - self.pe_bits)) as usize, ARec { eid: p.eid, ingest: p.ingest, loc });
+    }
+
+    fn flush(&mut self) {
+        while self.rn > 0 {
+            let p = self.ring[self.rh];
+            self.rh = (self.rh + 1) % BRING;
+            self.rn -= 1;
+            self.emit(p);
+        }
+    }
+}
+
+impl EvSink for BSink<'_> {
+    #[inline(always)]
+    fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>) {
+        match valid {
+            None => self.a.push((eid >> (64 - self.pe_bits)) as usize, ARec { eid, ingest, loc: LOC_NONE }),
+            Some((user, ts, pay)) => {
+                self.lt.prefetch(user);
+                let p = Pending { eid, user, ingest, ts, pay };
+                if self.rn == BRING {
+                    let old = self.ring[self.rh];
+                    self.ring[self.rh] = p;
+                    self.rh = (self.rh + 1) % BRING;
+                    self.emit(old);
+                } else {
+                    self.ring[(self.rh + self.rn) % BRING] = p;
+                    self.rn += 1;
+                }
+            }
+        }
+    }
+}
+
+struct BOut {
+    a: Parts<ARec>,
+    s: Parts<SRec>,
+    c: Parts<CRec>,
+    overflow: bool,
+}
+
+/// Pipeline B parse: links on all threads first, then events and clicks.
+fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> (LinkTable, Vec<BOut>) {
+    let pe = 1usize << ctx.pe_bits;
+    let ps = 1usize << ctx.ps_bits;
+    let est_lines = ev.bytes / 70 + 1;
+    let cap_a = est_lines / (ctx.threads * pe) * 3 / 2 + 64;
+    let cap_s = est_lines / (ctx.threads * ps) * 3 / 2 + 64;
+    let est_clicks = cl.bytes / 45 + 1;
+    let cap_c = est_clicks / (ctx.threads * ps) * 3 / 2 + 64;
+    let ntasks = ev.tasks.len() + cl.tasks.len();
+    let next = AtomicUsize::new(0);
+    let avx2 = ctx.avx2;
+    let nl = ctx.threads;
+    let lnext = AtomicUsize::new(0);
+    let pairs: Vec<std::sync::Mutex<Vec<(u64, u64)>>> = (0..nl).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let bar = std::sync::Barrier::new(nl);
+    let cell: std::sync::OnceLock<LinkTable> = std::sync::OnceLock::new();
+    let (f1, f2) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let outs = par(ctx.threads, |t| {
+        link_worker(t, links_in, &lnext, &pairs, &bar, &cell, &f1, &f2);
+        let lt = cell.get().unwrap();
+        let mut sink = BSink {
+            a: Parts::new(pe, cap_a),
+            s: Parts::new(ps, cap_s),
+            ring: [Pending::default(); BRING],
+            rh: 0,
+            rn: 0,
+            tbase: ((t as u64) << (lb.qbits + lb.ibits)) as u32,
+            overflow: false,
+            lt,
+            pe_bits: ctx.pe_bits,
+            ps_bits: ctx.ps_bits,
+            lb,
+        };
+        let mut c: Parts<CRec> = Parts::new(ps, cap_c);
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= ntasks {
+                break;
+            }
+            if i < ev.tasks.len() {
+                let task = ev.tasks[i];
+                let b = ev.maps[task.file as usize].bytes();
+                let safe_end = b.as_ptr() as usize + b.len();
+                if avx2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        event_task_avx2(b, task, ctx, &mut sink, safe_end)
+                    }
+                } else {
+                    event_task::<false, _>(b, task, ctx, &mut sink, safe_end)
+                }
+                sink.flush();
+            } else {
+                let task = cl.tasks[i - ev.tasks.len()];
+                let b = cl.maps[task.file as usize].bytes();
+                let safe_end = b.as_ptr() as usize + b.len();
+                if avx2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        click_task_avx2(b, task, ctx, lt, &mut c, safe_end)
+                    }
+                } else {
+                    click_task::<false>(b, task, ctx, lt, &mut c, safe_end)
+                }
+            }
+        }
+        BOut { a: sink.a, s: sink.s, c, overflow: sink.overflow }
+    });
+    (cell.into_inner().unwrap(), outs)
+}
+
+/// Records per sub-bucket targeted by the in-cache split in `dedup_b`.
+const SUB_B: usize = 8 * 1024;
+
+/// Marks the SRec at `loc` dead (no-op for LOC_NONE).
+#[inline(always)]
+fn kill(loc: u32, sb: &[BOut], lb: LocBits) {
+    if loc != LOC_NONE {
+        let t = (loc as u64 >> (lb.qbits + lb.ibits)) as usize;
+        let q = ((loc >> lb.ibits) as usize) & ((1usize << lb.qbits) - 1);
+        let i = (loc as usize) & ((1usize << lb.ibits) - 1);
+        // Each SRec belongs to exactly one event copy, whose ARec is in
+        // exactly one event_id partition, handled by one thread: no two
+        // threads ever write the same record, and nothing reads SRecs
+        // until dedup has finished.
+        unsafe { (*sb[t].s.slot(q, i)).ts = DEAD };
+    }
+}
+
+/// Inserts one copy into the dedup table: keeps the copy with the smallest
+/// ingest (on a tie, the one already there; equal-ingest copies are
+/// identical) and marks the loser's SRec dead.
+#[inline(always)]
+fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocBits) {
+    let mut i = r.eid as usize & mask;
+    loop {
+        let slot = unsafe { table.get_unchecked_mut(i) };
+        if slot.eid == 0 {
+            *slot = *r;
+            return;
+        }
+        if slot.eid == r.eid {
+            if r.ingest < slot.ingest {
+                kill(slot.loc, sb, lb);
+                slot.ingest = r.ingest;
+                slot.loc = r.loc;
+            } else {
+                kill(r.loc, sb, lb);
+            }
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) {
+    let pe = 1usize << ctx.pe_bits;
+    let mut order: Vec<(usize, usize)> = (0..pe).map(|p| (sb.iter().map(|t| t.a.len(p)).sum::<usize>(), p)).collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    let next = AtomicUsize::new(0);
+    par(ctx.threads, |_| {
+        let mut table: Vec<ARec> = Vec::new();
+        let mut scratch: Vec<ARec> = Vec::new();
+        let mut counts: Vec<usize> = Vec::new();
+        let reset = |table: &mut Vec<ARec>, n: usize| -> usize {
+            let cap = (n + n / 4 + 16).next_power_of_two();
+            table.clear();
+            table.resize(cap, ARec::default());
+            cap - 1
+        };
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&(n, p)) = order.get(i) else { break };
+            if n == 0 {
+                continue;
+            }
+            let sub_bits = ceil_log2(n.div_ceil(SUB_B)).min(12);
+            if sub_bits == 0 {
+                let mask = reset(&mut table, n);
+                for t in sb {
+                    for sl in t.a.get(p) {
+                        for r in sl {
+                            dedup_insert(&mut table, mask, r, sb, lb);
+                        }
+                    }
+                }
+                continue;
+            }
+            // split by the hash bits just below the partition bits
+            let shift = 64 - ctx.pe_bits - sub_bits;
+            let smask = (1usize << sub_bits) - 1;
+            counts.clear();
+            counts.resize((1 << sub_bits) + 1, 0);
+            for t in sb {
+                for sl in t.a.get(p) {
+                    for r in sl {
+                        counts[((r.eid >> shift) as usize & smask) + 1] += 1;
+                    }
+                }
+            }
+            for b in 0..(1 << sub_bits) {
+                counts[b + 1] += counts[b];
+            }
+            scratch.clear();
+            scratch.resize(n, ARec::default());
+            let mut cur: Vec<usize> = counts[..(1 << sub_bits)].to_vec();
+            for t in sb {
+                for sl in t.a.get(p) {
+                    for r in sl {
+                        let b = (r.eid >> shift) as usize & smask;
+                        unsafe { *scratch.get_unchecked_mut(cur[b]) = *r };
+                        cur[b] += 1;
+                    }
+                }
+            }
+            for b in 0..(1 << sub_bits) {
+                let bucket = &scratch[counts[b]..counts[b + 1]];
+                if bucket.is_empty() {
+                    continue;
+                }
+                let mask = reset(&mut table, bucket.len());
+                for r in bucket {
+                    dedup_insert(&mut table, mask, r, sb, lb);
+                }
+            }
+        }
+    });
+}
+
 // ---------------------------------------------------------------- sessions
 
 struct PMap {
@@ -946,8 +1263,8 @@ impl SState {
     fn partition(
         &mut self,
         q: usize,
-        sbufs: &[Parts<SRec>],
-        cbufs: &[Parts<CRec>],
+        sbufs: &[&Parts<SRec>],
+        cbufs: &[&Parts<CRec>],
         ctx: &Ctx,
         out: &mut SOut,
     ) {
@@ -961,6 +1278,9 @@ impl SState {
         for t in sbufs {
             for sl in t.get(q) {
                 for r in sl {
+                    if r.ts == DEAD {
+                        continue;
+                    }
                     let (idx, new) = self.map.insert(r.person);
                     if new {
                         self.persons.push(r.person);
@@ -986,6 +1306,9 @@ impl SState {
         for t in sbufs {
             for sl in t.get(q) {
                 for r in sl {
+                    if r.ts == DEAD {
+                        continue;
+                    }
                     let i = self.ridx[k] as usize;
                     let c = self.cursor[i] as usize;
                     self.ev[c] = ((r.ts as u64) << 32) | r.pay as u64;
@@ -1135,7 +1458,7 @@ impl SState {
 
 /// Sessions, attribution and aggregation per person partition; each thread then
 /// writes its own user_daily part file (overlapping with threads still busy).
-fn sessions(sbufs: &[Parts<SRec>], cbufs: &[Parts<CRec>], ctx: &Ctx, ud: &Path) -> Vec<SOut> {
+fn sessions(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: &Path) -> Vec<SOut> {
     let ps = 1usize << ctx.ps_bits;
     // biggest partitions first, for load balance (whales)
     let mut order: Vec<(usize, usize)> =
@@ -1366,12 +1689,13 @@ fn main() {
     marks.mark("mmap");
     let est_lines = events_in.bytes / 75 + 1;
     let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 8));
-    let ps_bits = env_usize("SS_PS_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 8));
+    let ps_bits = env_usize("SS_PS_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 16384).clamp(2, 10));
 
     let first_day = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - first_day + 1) as usize;
     let ctx = Ctx {
         tsp: ts::TsParser::new(ws - 10 * DAY, we + 10 * DAY),
+        tsw: std::env::var("SS_TSW").is_ok(),
         avx2: use_avx2(),
         ws,
         we,
@@ -1393,19 +1717,48 @@ fn main() {
     marks.mark("setup");
     if let Ok(stage) = std::env::var("SS_BENCH") {
         for st in stage.split(',') {
-            bench_stages(st, &events_in, &ctx);
+            bench_stages(st, &events_in, &links_in, &ctx);
         }
         std::process::exit(0);
     }
 
-    let (lt, pouts) = parse_all(&links_in, &events_in, &clicks_in, &ctx);
-    marks.mark("parse");
-
-    let (ebufs, cbufs): (Vec<Parts<ERec>>, Vec<Parts<CRec>>) = pouts.into_iter().map(|po| (po.e.0, po.c)).unzip();
-    let sbufs = dedup(&ebufs, &lt, &ctx);
-    marks.mark("dedup");
-    // Not freed: unmapping costs more than it saves; the process exits soon.
-    std::mem::forget(ebufs);
+    // Pipeline B unless disabled (SS_LEGACY) or unusable (location bits);
+    // if a location index ever overflows, B's results are discarded and the
+    // legacy pipeline runs from scratch.
+    let mut pipeline = "B";
+    let lb = if std::env::var("SS_LEGACY").is_ok() { None } else { LocBits::new(threads, ps_bits) };
+    let mut b_result = None;
+    if let Some(lb) = lb {
+        let (lt, bouts) = parse_b(&links_in, &events_in, &clicks_in, &ctx, lb);
+        marks.mark("parse");
+        if bouts.iter().any(|o| o.overflow) {
+            pipeline = "B-overflow->legacy";
+            std::mem::forget(bouts);
+            std::mem::forget(lt);
+        } else {
+            dedup_b(&bouts, &ctx, lb);
+            marks.mark("dedup");
+            b_result = Some((lt, bouts));
+        }
+    } else {
+        pipeline = "legacy";
+    }
+    let mut legacy_bufs = None;
+    if b_result.is_none() {
+        let (lt, pouts) = parse_all(&links_in, &events_in, &clicks_in, &ctx);
+        marks.mark("parse");
+        let (ebufs, cbufs): (Vec<Parts<ERec>>, Vec<Parts<CRec>>) = pouts.into_iter().map(|po| (po.e.0, po.c)).unzip();
+        let sbufs = dedup(&ebufs, &lt, &ctx);
+        marks.mark("dedup");
+        // Not freed: unmapping costs more than it saves; the process exits soon.
+        std::mem::forget(ebufs);
+        legacy_bufs = Some((lt, sbufs, cbufs));
+    }
+    let (sbufs, cbufs): (Vec<&Parts<SRec>>, Vec<&Parts<CRec>>) = match (&b_result, &legacy_bufs) {
+        (Some((_, bouts)), _) => (bouts.iter().map(|o| &o.s).collect(), bouts.iter().map(|o| &o.c).collect()),
+        (None, Some((_, sb, cb))) => (sb.iter().collect(), cb.iter().collect()),
+        _ => unreachable!(),
+    };
 
     let ud = out_dir.join("user_daily");
     let cd = out_dir.join("campaign_daily");
@@ -1440,8 +1793,9 @@ fn main() {
     if verbose {
         let rows: usize = souts.iter().map(|s| s.nrows).sum();
         eprintln!(
-            "sessions: {} | threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB",
+            "sessions: {} | pipeline={} threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB",
             marks.report(),
+            pipeline,
             threads,
             ctx.avx2,
             pe_bits,
@@ -1503,7 +1857,16 @@ fn bench_task<const AVX2: bool>(stage: &str, b: &[u8], task: Task, ctx: &Ctx, pa
             event_task::<AVX2, _>(b, task, ctx, &mut ns, end);
             acc = ns.0;
         }
-        "ev" => event_task::<AVX2, _>(b, task, ctx, parts, end),
+        "ev" | "evre" => event_task::<AVX2, _>(b, task, ctx, parts, end),
+        "push16" => {
+            // a 16-byte record per line into 256 partitions chosen by a hash
+            let mut i = task.start as u64;
+            scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
+                i = i.wrapping_add(f[3].len() as u64 + 1);
+                let h = keys::mix(i);
+                parts.0.push((h >> 56) as usize, ERec { eid: h, user: 0, ingest: 0, ts: 0, pay: 0 });
+            })
+        }
         _ => fail("unknown SS_BENCH stage"),
     }
     acc
@@ -1517,29 +1880,94 @@ unsafe fn bench_task_avx2(stage: &str, b: &[u8], task: Task, ctx: &Ctx, parts: &
 
 /// SS_BENCH=STAGE: single-threaded stage benchmark over events/, best of 3
 /// passes (the first pass also maps the pages in).
-fn bench_stages(stage: &str, ev: &Input, ctx: &Ctx) {
+fn bench_stages(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
     let est = ev.bytes / 70 + 1;
     let mut best = f64::MAX;
     let mut acc = 0u64;
     let lines: usize = ev.tasks.len();
+    if stage == "evb" || stage == "evbre" {
+        return bench_b(stage, ev, links_in, ctx);
+    }
+    let mut reused = (Parts::<ERec>::new(1 << ctx.pe_bits, est / (1 << ctx.pe_bits) * 3 / 2 + 64), ctx.pe_bits);
     for _ in 0..3 {
-        let mut parts = (Parts::<ERec>::new(1 << ctx.pe_bits, est / (1 << ctx.pe_bits) * 3 / 2 + 64), ctx.pe_bits);
+        let mut fresh;
+        let parts = if stage == "evre" {
+            reused.0.reset();
+            &mut reused
+        } else {
+            fresh = (Parts::<ERec>::new(1 << ctx.pe_bits, est / (1 << ctx.pe_bits) * 3 / 2 + 64), ctx.pe_bits);
+            &mut fresh
+        };
         let t = Instant::now();
         for task in &ev.tasks {
             let b = ev.maps[task.file as usize].bytes();
             acc = acc.wrapping_add(if ctx.avx2 {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    bench_task_avx2(stage, b, *task, ctx, &mut parts)
+                    bench_task_avx2(stage, b, *task, ctx, parts)
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 0
             } else {
-                bench_task::<false>(stage, b, *task, ctx, &mut parts)
+                bench_task::<false>(stage, b, *task, ctx, parts)
             });
         }
         best = best.min(t.elapsed().as_secs_f64() * 1e3);
         acc = acc.wrapping_add(parts.0.total() as u64);
     }
     eprintln!("bench {:6} {:8.1} ms  ({} tasks, {} MB, avx2={}, acc {})", stage, best, lines, ev.bytes >> 20, ctx.avx2, acc % 1000);
+}
+
+/// Pipeline-B parse sink (with person lookups), single thread.
+fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
+    let lb = LocBits::new(1, ctx.ps_bits).unwrap();
+    let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
+    let t0 = Instant::now();
+    let (lt, _) = parse_b(links_in, &empty, &empty, ctx, lb);
+    let link_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let pe = 1usize << ctx.pe_bits;
+    let ps = 1usize << ctx.ps_bits;
+    let est = ev.bytes / 70 + 1;
+    let mk = |lt| BSink {
+        a: Parts::new(pe, est / pe * 3 / 2 + 64),
+        s: Parts::new(ps, est / ps * 3 / 2 + 64),
+        ring: [Pending::default(); BRING],
+        rh: 0,
+        rn: 0,
+        tbase: 0,
+        overflow: false,
+        lt,
+        pe_bits: ctx.pe_bits,
+        ps_bits: ctx.ps_bits,
+        lb,
+    };
+    let mut reused = mk(&lt);
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let mut fresh;
+        let sink = if stage == "evbre" {
+            reused.a.reset();
+            reused.s.reset();
+            &mut reused
+        } else {
+            fresh = mk(&lt);
+            &mut fresh
+        };
+        let t = Instant::now();
+        for task in &ev.tasks {
+            let b = ev.maps[task.file as usize].bytes();
+            let end = b.as_ptr() as usize + b.len();
+            if ctx.avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    event_task_avx2(b, *task, ctx, sink, end)
+                }
+            } else {
+                event_task::<false, _>(b, *task, ctx, sink, end)
+            }
+            sink.flush();
+        }
+        best = best.min(t.elapsed().as_secs_f64() * 1e3);
+    }
+    eprintln!("bench {:6} {:8.1} ms  (links {:.1} ms)", stage, best, link_ms);
 }

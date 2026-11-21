@@ -39,8 +39,8 @@ for seed in $SEEDS; do
   echo "=== seed $seed: $(du -sh $D | cut -f1), $(ls $D/events | wc -l) event files"
   if has stages; then
     echo "--- single-thread stage costs (new binary, best of 3 passes)"
-    SS_BENCH=touch,scan,ts,tsw,keys,keysw,line,ev "$W/new-bin" $D $O/x 2>&1
-    SS_NOAVX2=1 SS_BENCH=scan,line "$W/new-bin" $D $O/x 2>&1 | sed 's/^/noavx2 /'
+    NCPU=1 SS_BENCH=scan,line,ev,evre,push16,evb,evbre "$W/new-bin" $D $O/x 2>&1
+    NCPU=1 SS_TSW=1 SS_BENCH=line "$W/new-bin" $D $O/x 2>&1 | sed 's/^/tsw /'
     PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
     if [ -n "$PERF" ]; then
       sudo env SS_BENCH=ev "$PERF" record -F 4999 -o /tmp/perf_ev.data "$W/prof-bin" $D $O/x 2>&1 | tail -1
@@ -56,6 +56,7 @@ for seed in $SEEDS; do
       for i in $(seq $reps); do
         nat base "$W/base-bin" $D $n
         nat new "$W/new-bin" $D $n
+        nat new-legacy "$W/new-bin" $D $n SS_LEGACY=1
       done
     done
   fi
@@ -68,6 +69,10 @@ for seed in $SEEDS; do
     python3 "$HERE/../compare.py" $O/cb $O/nat && echo "seed $seed 20M new == base: OK" || echo "seed $seed 20M new != base: MISMATCH"
     nat cmp-new-noavx2 "$W/new-bin" $D 2 SS_NOAVX2=1 > /dev/null
     python3 "$HERE/../compare.py" $O/cb $O/nat && echo "seed $seed 20M new(noavx2) == base: OK" || echo "seed $seed 20M new(noavx2) != base: MISMATCH"
+    nat cmp-new-legacy "$W/new-bin" $D 2 SS_LEGACY=1 > /dev/null
+    python3 "$HERE/../compare.py" $O/cb $O/nat && echo "seed $seed 20M new(legacy) == base: OK" || echo "seed $seed 20M new(legacy) != base: MISMATCH"
+    nat cmp-new-n8 "$W/new-bin" $D 8 > /dev/null
+    python3 "$HERE/../compare.py" $O/cb $O/nat && echo "seed $seed 20M new(ncpu8) == base: OK" || echo "seed $seed 20M new(ncpu8) != base: MISMATCH"
   fi
 done
 
@@ -81,8 +86,9 @@ fi
 
 if has fixtures; then
   echo "=== fixtures (native new binary, AVX2 and SSE paths)"
-  python3 "$HERE/../run_fixtures.py" "$HERE/../../fixtures" -- "$W/new-bin" 2>&1 | tail -2
-  SS_NOAVX2=1 python3 "$HERE/../run_fixtures.py" "$HERE/../../fixtures" -- "$W/new-bin" 2>&1 | tail -2
+  python3 "$HERE/../run_fixtures.py" "$HERE/../../fixtures" -- "$W/new-bin" 2>&1 | tail -1
+  SS_NOAVX2=1 python3 "$HERE/../run_fixtures.py" "$HERE/../../fixtures" -- "$W/new-bin" 2>&1 | tail -1
+  SS_LEGACY=1 python3 "$HERE/../run_fixtures.py" "$HERE/../../fixtures" -- "$W/new-bin" 2>&1 | tail -1
 fi
 
 if has perf; then
