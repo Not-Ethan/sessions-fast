@@ -482,10 +482,62 @@ fn link_worker(
     }
 }
 
+/// ingest_ts as an order-preserving u32 (dedup compares only these): whole
+/// seconds from window start d, in [-2^30, 2^30) (34 years) -> d + 2^31.
+/// Rarer values are "far": the first run records them and clamps them (ties
+/// possible), and if there were any, `main` runs the job again with their
+/// ranks (below: [0, 2^30), above: [3 * 2^30, 2^32)), which is exact.
 #[inline(always)]
 fn ingest_rel(ms: i64, ws_s: i64) -> u32 {
-    let s = ms.div_euclid(1000) - ws_s + (1i64 << 31);
-    s.clamp(0, u32::MAX as i64) as u32
+    let d = ms.div_euclid(1000) - ws_s;
+    if (d + (1 << 30)) as u64 >= 1u64 << 31 {
+        return ingest_far(d);
+    }
+    (d + (1i64 << 31)) as u32
+}
+
+/// Far ingest values seen (seconds from window start) and the rank tables
+/// (sorted distinct values below / above the near range).
+static INGEST_FAR: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+static INGEST_RANK: std::sync::Mutex<Option<(Vec<i64>, Vec<i64>)>> = std::sync::Mutex::new(None);
+
+#[cold]
+#[inline(never)]
+fn ingest_far(d: i64) -> u32 {
+    if let Some((lo, hi)) = &*INGEST_RANK.lock().unwrap() {
+        if d < 0 {
+            if let Ok(i) = lo.binary_search(&d) {
+                return i as u32;
+            }
+        } else if let Ok(i) = hi.binary_search(&d) {
+            return (3u32 << 30) + i as u32;
+        }
+    }
+    INGEST_FAR.lock().unwrap().push(d);
+    if d < 0 {
+        0
+    } else {
+        u32::MAX
+    }
+}
+
+/// After a run: installs the rank tables if far ingest values were seen
+/// (true: run again).
+fn ingest_far_rerun() -> bool {
+    let mut far = std::mem::take(&mut *INGEST_FAR.lock().unwrap());
+    if far.is_empty() {
+        return false;
+    }
+    far.sort_unstable();
+    far.dedup();
+    let k = far.partition_point(|&d| d < 0);
+    let (lo, hi) = (far[..k].to_vec(), far[k..].to_vec());
+    assert!(lo.len() <= 1 << 30 && hi.len() <= 1 << 30, "sessions: too many distinct far ingest_ts values");
+    let mut g = INGEST_RANK.lock().unwrap();
+    // a second pass never sees an unknown far value (same input)
+    assert!(g.is_none(), "sessions: far ingest_ts values outside the rank table");
+    *g = Some((lo, hi));
+    true
 }
 
 struct ParseOut {
@@ -2321,7 +2373,16 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .min(64);
     let verbose = std::env::var("SS_VERBOSE").is_ok();
-    let report = run(&data_dir, &out_dir, threads, verbose);
+    let mut report = run(&data_dir, &out_dir, threads, verbose);
+    if ingest_far_rerun() {
+        // exact order for far ingest_ts values: the whole job again, into
+        // clean output directories
+        let _ = std::fs::remove_dir_all(out_dir.join("user_daily"));
+        let _ = std::fs::remove_dir_all(out_dir.join("campaign_daily"));
+        report = run(&data_dir, &out_dir, threads, verbose);
+        assert!(INGEST_FAR.lock().unwrap().is_empty());
+        report.push_str(" ingest_far_rerun=1");
+    }
     if verbose {
         eprintln!("{}", report);
     }
