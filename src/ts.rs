@@ -551,6 +551,46 @@ impl TsParser {
         (ms, ok, matched)
     }
 
+    /// F1 (through the date slots) and F3 decoded side by side and selected
+    /// without a branch on the form; everything else (F2, dates without a
+    /// slot, invalid fields) goes to `parse`. Same result as `parse`.
+    ///
+    /// # Safety
+    /// 20 bytes from the start of `b` must be readable.
+    #[inline(always)]
+    pub unsafe fn parse_sel(&self, b: &[u8]) -> Option<i64> {
+        let p = b.as_ptr();
+        let n = b.len();
+        let w0 = rd(p, 0);
+        // F1: YYYY-MM-DD matches its slot exactly; T, HH:MM:SS, Z checked
+        let (d0, d1) = (*p.add(8), *p.add(9));
+        let e = self.dc.get_unchecked(dslot(d0, d1));
+        let w = rd(p, 11);
+        let bad1 = digits_bad(w, 0xFFFF_00FF_FF00_FFFF) | ((w & 0x0000_FF00_00FF_0000) ^ 0x0000_3A00_003A_0000);
+        let pp = pairs(w);
+        let (h, mi, s) = (lane(pp, 0), lane(pp, 3), lane(pp, 6));
+        let ok1 = self.use_dc
+            & (n == 20)
+            & (*p.add(19) == b'Z')
+            & (*p.add(10) == b'T')
+            & (e.pfx == w0)
+            & (e.tag == u16::from_le_bytes([d0, d1]))
+            & (bad1 == 0)
+            & (h <= 23)
+            & (mi <= 59)
+            & (s <= 59);
+        let v1 = e.ms + ((h * 60 + mi) * 60 + s) as i64 * 1000;
+        // F3: 13 digits
+        let wb = rd(p, 5);
+        let ok3 = (n == 13) & (digits_bad(w0, !0) == 0) & (digits_bad(wb, !0) == 0);
+        let v3 = (parse8(w0) * 100_000 + parse8((wb & !0xFF_FFFF) | 0x30_3030)) as i64;
+        if ok1 | ok3 {
+            Some(if ok1 { v1 } else { v3 })
+        } else {
+            self.parse(b)
+        }
+    }
+
     /// Same result as `parse_ts(b)`. F1 and 13-digit F3 are decoded together
     /// and selected by length (no branch between them); F2 and anything else
     /// take the branchy path. 32 bytes from the start of `b` must be readable.
@@ -777,6 +817,7 @@ mod tests {
             let want = parse_ts(&s);
             assert_eq!(unsafe { p.parse_wide(field) }, want, "{:?}", String::from_utf8_lossy(&s));
             assert_eq!(unsafe { p.parse_hyb(field) }, want, "{:?}", String::from_utf8_lossy(&s));
+            assert_eq!(unsafe { p.parse_sel(field) }, want, "{:?}", String::from_utf8_lossy(&s));
             assert_eq!(p.parse(field), want, "{:?}", String::from_utf8_lossy(&s));
             assert_eq!(unsafe { p.parse_wide_f1(field) }, want, "{:?}", String::from_utf8_lossy(&s));
             count += want.is_some() as u64;
