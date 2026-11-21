@@ -2033,9 +2033,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         marks.mark("write");
         souts.iter().map(|s| s.nrows).sum()
     } else {
-        let outs = sess::sessions2(&sbufs, &cbufs, &ctx, &ud);
+        let mut outs = sess::sessions2(&sbufs, &cbufs, &ctx, &ud);
         marks.mark("sessions");
-        sess::write_campaign_daily2(&cd.join("part-0.parquet"), &outs, &ctx);
+        sess::write_campaign_daily2(&cd.join("part-0.parquet"), &mut outs, &ctx);
         marks.mark("write");
         outs.iter().map(|o| o.nrows).sum()
     };
