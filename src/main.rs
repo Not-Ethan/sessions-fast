@@ -2,19 +2,20 @@
 
 mod keys;
 mod links;
+mod parts;
 mod lookup;
 mod parquet;
 mod scan;
 mod sys;
 mod ts;
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use links::LinkTable;
 use lookup::{IdTable, NONE};
+use parts::Parts;
 
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
@@ -35,21 +36,25 @@ pub fn prefetch(p: *const u8) {
 
 // ---------------------------------------------------------------- records
 
-/// One parsed event line, routed by event_id for dedup.
+/// One parsed event line, routed by event_id for dedup (28 bytes).
 #[derive(Clone, Copy, Default)]
-#[repr(C)]
+#[repr(C, packed(4))]
 struct ERec {
+    /// keys::mix(event_id key): a bijection, so equality is exact; its top bits
+    /// pick the partition and its low bits the hash-table slot.
     eid: u64,
     user: u64,
     /// ingest_ts in seconds, offset so that window_start is 2^31.
     ingest: u32,
-    /// ts - window_start in ms (valid only if `ok`).
+    /// ts - window_start in ms, | OK_BIT if this copy passes validation and
+    /// is not late (the offset is < 2^31: windows are limited to 24 days).
     ts: u32,
     /// purchase: price | category rank << 24; otherwise 0.
     pay: u32,
-    /// 1 if this copy passes validation and is not late.
-    ok: u32,
 }
+
+const OK_BIT: u32 = 1 << 31;
+const _: () = assert!(std::mem::size_of::<ERec>() == 28);
 
 /// A surviving event, routed by person.
 #[derive(Clone, Copy)]
@@ -96,6 +101,7 @@ fn part(k: u64, bits: u32) -> usize {
 
 struct Ctx {
     tsp: ts::TsParser,
+    avx2: bool,
     ws: i64,
     we: i64,
     ws_s: i64,
@@ -134,14 +140,18 @@ fn fail(msg: &str) -> ! {
     std::process::exit(2)
 }
 
-fn read_table(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let text = std::fs::read(path).unwrap_or_else(|e| fail(&format!("{}: {}", path.display(), e)));
+fn read_file(path: &Path) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_else(|e| fail(&format!("{}: {}", path.display(), e)))
+}
+
+/// Data rows of a clean 2-column CSV (header skipped), as borrowed slices.
+fn table_rows(text: &[u8]) -> Vec<(&[u8], &[u8])> {
     let mut rows = Vec::new();
     if text.is_empty() {
         return rows;
     }
-    let h = scan::next_line_start(&text, 0);
-    scan::for_each_record::<2, _>(&text, h, text.len(), |f| rows.push((f[0].to_vec(), f[1].to_vec())));
+    let h = scan::next_line_start(text, 0);
+    scan::for_each_record::<2, _>(text, h, text.len(), |f| rows.push((f[0], f[1])));
     rows
 }
 
@@ -253,54 +263,77 @@ impl Marks {
 
 // ---------------------------------------------------------------- parsing
 
-fn parse_links(input: &Input, ctx: &Ctx) -> Vec<Vec<(u64, u64)>> {
-    let next = AtomicUsize::new(0);
-    par(ctx.threads, |_| {
-        let mut v = Vec::new();
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            let Some(task) = input.tasks.get(i) else { break };
-            let b = input.maps[task.file as usize].bytes();
-            scan::for_each_record::<2, _>(b, task.start, task.end, |f| {
-                if f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                let a = keys::key_of(f[0]);
-                let c = keys::key_of(f[1]);
-                if a != c {
-                    v.push((a, c));
-                }
-            });
+/// Parses link lines of one chunk into (a, b) key pairs (self-links skipped).
+fn link_task(input: &Input, task: Task, v: &mut Vec<(u64, u64)>) {
+    let b = input.maps[task.file as usize].bytes();
+    scan::for_each_record::<2, _>(b, task.start, task.end, |f| {
+        if f[0].is_empty() || f[1].is_empty() {
+            return;
         }
-        v
-    })
-}
-
-fn build_links(pairs: &[Vec<(u64, u64)>], ctx: &Ctx) -> LinkTable {
-    let total: usize = pairs.iter().map(|v| v.len()).sum();
-    let lt = LinkTable::with_pairs(total);
-    if total == 0 {
-        return lt;
-    }
-    const BLOCK: usize = 1 << 14;
-    let mut units = Vec::new();
-    for (t, v) in pairs.iter().enumerate() {
-        let mut s = 0;
-        while s < v.len() {
-            units.push((t, s, (s + BLOCK).min(v.len())));
-            s += BLOCK;
-        }
-    }
-    let next = AtomicUsize::new(0);
-    par(ctx.threads, |_| loop {
-        let i = next.fetch_add(1, Ordering::Relaxed);
-        let Some(&(t, s, e)) = units.get(i) else { break };
-        for &(a, b) in &pairs[t][s..e] {
-            lt.link(a, b);
+        let a = keys::key_of(f[0]);
+        let c = keys::key_of(f[1]);
+        if a != c {
+            v.push((a, c));
         }
     });
-    lt.finalize(ctx.threads);
-    lt
+}
+
+/// The link work of one of `nl` link threads (thread `t`): parse links, build
+/// the table (leader), union-find, finalize. Steps are separated by `bar`.
+#[allow(clippy::too_many_arguments)]
+fn link_worker(
+    t: usize,
+    links_in: &Input,
+    lnext: &AtomicUsize,
+    pairs: &[std::sync::Mutex<Vec<(u64, u64)>>],
+    bar: &std::sync::Barrier,
+    cell: &std::sync::OnceLock<LinkTable>,
+    f1: &AtomicUsize,
+    f2: &AtomicUsize,
+) {
+    let mut v = Vec::new();
+    loop {
+        let i = lnext.fetch_add(1, Ordering::Relaxed);
+        let Some(&task) = links_in.tasks.get(i) else { break };
+        link_task(links_in, task, &mut v);
+    }
+    *pairs[t].lock().unwrap() = v;
+    bar.wait();
+    if t == 0 {
+        let total: usize = pairs.iter().map(|m| m.lock().unwrap().len()).sum();
+        let _ = cell.set(LinkTable::with_pairs(total));
+    }
+    bar.wait();
+    let lt = cell.get().unwrap();
+    {
+        let v = pairs[t].lock().unwrap();
+        const AHEAD: usize = 8;
+        for k in 0..v.len() {
+            if k + AHEAD < v.len() {
+                lt.prefetch(v[k + AHEAD].0);
+                lt.prefetch(v[k + AHEAD].1);
+            }
+            lt.link(v[k].0, v[k].1);
+        }
+    }
+    bar.wait();
+    let nb = lt.finalize_blocks();
+    loop {
+        let b = f1.fetch_add(1, Ordering::Relaxed);
+        if b >= nb {
+            break;
+        }
+        lt.finalize_roots(b);
+    }
+    bar.wait();
+    loop {
+        let b = f2.fetch_add(1, Ordering::Relaxed);
+        if b >= nb {
+            break;
+        }
+        lt.finalize_vals(b);
+    }
+    bar.wait();
 }
 
 #[inline(always)]
@@ -310,26 +343,154 @@ fn ingest_rel(ms: i64, ws_s: i64) -> u32 {
 }
 
 struct ParseOut {
-    e: Vec<Vec<ERec>>,
-    c: Vec<Vec<CRec>>,
+    e: Parts<ERec>,
+    c: Parts<CRec>,
 }
 
-fn parse_events_clicks(ev: &Input, cl: &Input, lt: &LinkTable, ctx: &Ctx) -> Vec<ParseOut> {
+/// One chunk of events/: parse, validate, route by event_id.
+#[inline(always)]
+fn event_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, e: &mut Parts<ERec>) {
+    let (ws, we) = (ctx.ws, ctx.we);
+    scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
+        if f[0].is_empty() {
+            return;
+        }
+        let Some(ing) = ctx.tsp.parse(f[3]) else { return };
+        let eid = keys::mix(keys::key_of(f[0]));
+        let mut r = ERec { eid, ingest: ingest_rel(ing, ctx.ws_s), ..Default::default() };
+        'v: {
+            if f[1].is_empty() || f[5].is_empty() {
+                break 'v;
+            }
+            let Some(t) = ctx.tsp.parse(f[2]) else { break 'v };
+            if t < ws || t >= we {
+                break 'v;
+            }
+            let ty = f[4];
+            let mut pay = 0u32;
+            if ty == b"purchase" {
+                let Some(price) = ts::parse_price(f[6]) else { break 'v };
+                let mut cat = ctx.products.get(f[5]) as u32;
+                if cat == NONE as u32 {
+                    cat = ctx.unknown_cat;
+                }
+                pay = price | (cat << 24);
+            } else if ty != b"view" && ty != b"cart" {
+                break 'v;
+            }
+            if ing - t > LATE {
+                break 'v;
+            }
+            r.user = keys::key_of(f[1]);
+            r.ts = (t - ws) as u32 | OK_BIT;
+            r.pay = pay;
+        }
+        e.push((eid >> (64 - ctx.pe_bits)) as usize, r);
+    });
+}
+
+/// One chunk of clicks/: parse, validate, resolve the person, route by person.
+#[inline(always)]
+fn click_task<const AVX2: bool>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>) {
+    let we = ctx.we;
+    let cws = ctx.ws - WEEK;
+    // Person lookups go through a small ring so the link-table slot can be
+    // prefetched a few clicks ahead.
+    const RING: usize = 16;
+    let mut ring = [CRec { person: 0, ck: 0, ts: 0, camp: 0 }; RING];
+    let mut rh = 0usize;
+    let mut rn = 0usize;
+    let emit = |c: &mut Parts<CRec>, mut r: CRec| {
+        r.person = lt.person_of(r.person);
+        c.push(part(r.person, ctx.ps_bits), r);
+    };
+    scan::for_each_record_x::<4, _, AVX2>(b, task.start, task.end, |f| {
+        if f[0].is_empty() || f[1].is_empty() {
+            return;
+        }
+        let Some(t) = ctx.tsp.parse(f[3]) else { return };
+        if t < cws || t >= we {
+            return;
+        }
+        let camp = ctx.campaigns.get(f[2]);
+        if camp == NONE {
+            return;
+        }
+        let user = keys::key_of(f[1]);
+        lt.prefetch(user);
+        // `person` holds the user key until the lookup in `emit`
+        let r = CRec { person: user, ck: keys::key_of(f[0]), ts: (t - cws) as u32, camp: camp as u32 };
+        if rn == RING {
+            emit(c, ring[rh]);
+            ring[rh] = r;
+            rh = (rh + 1) % RING;
+        } else {
+            ring[(rh + rn) % RING] = r;
+            rn += 1;
+        }
+    });
+    for k in 0..rn {
+        emit(c, ring[(rh + k) % RING]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn event_task_avx2(b: &[u8], task: Task, ctx: &Ctx, e: &mut Parts<ERec>) {
+    event_task::<true>(b, task, ctx, e)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn click_task_avx2(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut Parts<CRec>) {
+    click_task::<true>(b, task, ctx, lt, c)
+}
+
+/// AVX2 + BMI1/2 available and not disabled with SS_NOAVX2.
+fn use_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::env::var("SS_NOAVX2").is_err()
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("bmi1")
+            && std::arch::is_x86_feature_detected!("bmi2")
+            && std::arch::is_x86_feature_detected!("lzcnt")
+            && std::arch::is_x86_feature_detected!("popcnt")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Links (on up to 2 threads) overlapped with event parsing (on the rest, and
+/// on the link threads once they are done); click tasks, which need the
+/// finished link table, come last and wait for it.
+fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable, Vec<ParseOut>) {
     let pe = 1usize << ctx.pe_bits;
     let ps = 1usize << ctx.ps_bits;
     let est_lines = ev.bytes / 70 + 1;
-    let cap_e = est_lines / (ctx.threads * pe) * 5 / 4 + 16;
+    let cap_e = est_lines / (ctx.threads * pe) * 3 / 2 + 64;
     let est_clicks = cl.bytes / 45 + 1;
-    let cap_c = est_clicks / (ctx.threads * ps) * 5 / 4 + 16;
+    let cap_c = est_clicks / (ctx.threads * ps) * 3 / 2 + 64;
     let ntasks = ev.tasks.len() + cl.tasks.len();
     let next = AtomicUsize::new(0);
-    let (ws, we) = (ctx.ws, ctx.we);
-    let cws = ws - WEEK;
-    par(ctx.threads, |_| {
-        let mut out = ParseOut {
-            e: (0..pe).map(|_| Vec::with_capacity(cap_e)).collect(),
-            c: (0..ps).map(|_| Vec::with_capacity(cap_c)).collect(),
-        };
+    let avx2 = ctx.avx2;
+    let nl = ctx.threads.min(2);
+    let lnext = AtomicUsize::new(0);
+    let pairs: Vec<std::sync::Mutex<Vec<(u64, u64)>>> = (0..nl).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let bar = std::sync::Barrier::new(nl);
+    let cell: std::sync::OnceLock<LinkTable> = std::sync::OnceLock::new();
+    let (f1, f2) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let ready = std::sync::atomic::AtomicBool::new(false);
+    let outs = par(ctx.threads, |t| {
+        let mut out = ParseOut { e: Parts::new(pe, cap_e), c: Parts::new(ps, cap_c) };
+        if t < nl {
+            link_worker(t, links_in, &lnext, &pairs, &bar, &cell, &f1, &f2);
+            if t == 0 {
+                ready.store(true, Ordering::Release);
+            }
+        }
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= ntasks {
@@ -338,68 +499,34 @@ fn parse_events_clicks(ev: &Input, cl: &Input, lt: &LinkTable, ctx: &Ctx) -> Vec
             if i < ev.tasks.len() {
                 let task = ev.tasks[i];
                 let b = ev.maps[task.file as usize].bytes();
-                let e = &mut out.e;
-                scan::for_each_record::<7, _>(b, task.start, task.end, |f| {
-                    if f[0].is_empty() {
-                        return;
+                if avx2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        event_task_avx2(b, task, ctx, &mut out.e)
                     }
-                    let Some(ing) = ctx.tsp.parse(f[3]) else { return };
-                    let eid = keys::key_of(f[0]);
-                    let mut r = ERec { eid, ingest: ingest_rel(ing, ctx.ws_s), ..Default::default() };
-                    'v: {
-                        if f[1].is_empty() || f[5].is_empty() {
-                            break 'v;
-                        }
-                        let Some(t) = ctx.tsp.parse(f[2]) else { break 'v };
-                        if t < ws || t >= we {
-                            break 'v;
-                        }
-                        let ty = f[4];
-                        let mut pay = 0u32;
-                        if ty == b"purchase" {
-                            let Some(price) = ts::parse_price(f[6]) else { break 'v };
-                            let mut cat = ctx.products.get(f[5]) as u32;
-                            if cat == NONE as u32 {
-                                cat = ctx.unknown_cat;
-                            }
-                            pay = price | (cat << 24);
-                        } else if ty != b"view" && ty != b"cart" {
-                            break 'v;
-                        }
-                        if ing - t > LATE {
-                            break 'v;
-                        }
-                        r.user = keys::key_of(f[1]);
-                        r.ts = (t - ws) as u32;
-                        r.pay = pay;
-                        r.ok = 1;
-                    }
-                    e[part(eid, ctx.pe_bits)].push(r);
-                });
+                } else {
+                    event_task::<false>(b, task, ctx, &mut out.e)
+                }
             } else {
+                while !ready.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                let lt = cell.get().unwrap();
                 let task = cl.tasks[i - ev.tasks.len()];
                 let b = cl.maps[task.file as usize].bytes();
-                let c = &mut out.c;
-                scan::for_each_record::<4, _>(b, task.start, task.end, |f| {
-                    if f[0].is_empty() || f[1].is_empty() {
-                        return;
+                if avx2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        click_task_avx2(b, task, ctx, lt, &mut out.c)
                     }
-                    let Some(t) = ctx.tsp.parse(f[3]) else { return };
-                    if t < cws || t >= we {
-                        return;
-                    }
-                    let camp = ctx.campaigns.get(f[2]);
-                    if camp == NONE {
-                        return;
-                    }
-                    let ck = keys::key_of(f[0]);
-                    let person = lt.person_of(keys::key_of(f[1]));
-                    c[part(person, ctx.ps_bits)].push(CRec { person, ck, ts: (t - cws) as u32, camp: camp as u32 });
-                });
+                } else {
+                    click_task::<false>(b, task, ctx, lt, &mut out.c)
+                }
             }
         }
         out
-    })
+    });
+    (cell.into_inner().unwrap(), outs)
 }
 
 // ---------------------------------------------------------------- dedup
@@ -411,61 +538,119 @@ struct Slot {
     idx: u32,
 }
 
-const IDX_BITS: u32 = 26;
 
-fn dedup(e: &[Vec<Vec<ERec>>], lt: &LinkTable, ctx: &Ctx) -> Vec<Vec<Vec<SRec>>> {
-    let pe = 1usize << ctx.pe_bits;
-    let ps = 1usize << ctx.ps_bits;
-    let total: usize = e.iter().map(|t| t.iter().map(|v| v.len()).sum::<usize>()).sum();
-    let cap_s = total / (ctx.threads * ps) * 5 / 4 + 16;
-    let next = AtomicUsize::new(0);
-    par(ctx.threads, |_| {
-        let mut out: Vec<Vec<SRec>> = (0..ps).map(|_| Vec::with_capacity(cap_s)).collect();
-        let mut table: Vec<Slot> = Vec::new();
-        let mut kept: Vec<(u64, u32, u32)> = Vec::new();
+/// Dedup one bucket of records (all copies of an event_id are in the same
+/// bucket): keeps the copy with the smallest ingest (ties: any, the copies are
+/// identical) and appends the kept copies that passed validation to `kept`.
+#[inline(always)]
+fn dedup_bucket(recs: &[ERec], table: &mut Vec<Slot>, kept: &mut Vec<(u64, u32, u32)>) {
+    let n = recs.len();
+    if n == 0 {
+        return;
+    }
+    let cap = (n + n / 4 + 16).next_power_of_two();
+    let mask = cap - 1;
+    table.clear();
+    table.resize(cap, Slot::default());
+    for (j, r) in recs.iter().enumerate() {
+        let mut i = r.eid as usize & mask;
         loop {
-            let p = next.fetch_add(1, Ordering::Relaxed);
-            if p >= pe {
+            let s = &mut table[i];
+            if s.eid == 0 {
+                *s = Slot { eid: r.eid, ingest: r.ingest, idx: j as u32 };
                 break;
             }
-            let n: usize = e.iter().map(|t| t[p].len()).sum();
+            if s.eid == r.eid {
+                if r.ingest < s.ingest {
+                    s.ingest = r.ingest;
+                    s.idx = j as u32;
+                }
+                break;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+    for s in table.iter() {
+        if s.eid != 0 {
+            let r = recs[s.idx as usize];
+            if r.ts & OK_BIT != 0 {
+                kept.push((r.user, r.ts & !OK_BIT, r.pay));
+            }
+        }
+    }
+}
+
+/// Records per sub-bucket targeted by the in-cache split in `dedup`.
+const SUB_TARGET: usize = 24 * 1024;
+
+fn dedup(e: &[Parts<ERec>], lt: &LinkTable, ctx: &Ctx) -> Vec<Parts<SRec>> {
+    let pe = 1usize << ctx.pe_bits;
+    let ps = 1usize << ctx.ps_bits;
+    let total: usize = e.iter().map(|t| t.total()).sum();
+    let cap_s = total / (ctx.threads * ps) * 3 / 2 + 64;
+    // biggest partitions first
+    let mut order: Vec<(usize, usize)> = (0..pe).map(|p| (e.iter().map(|t| t.len(p)).sum::<usize>(), p)).collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    let next = AtomicUsize::new(0);
+    par(ctx.threads, |_| {
+        let mut out: Parts<SRec> = Parts::new(ps, cap_s);
+        let mut table: Vec<Slot> = Vec::new();
+        let mut kept: Vec<(u64, u32, u32)> = Vec::new();
+        let mut scratch: Vec<ERec> = Vec::new();
+        let mut counts: Vec<usize> = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&(n, p)) = order.get(i) else { break };
             if n == 0 {
                 continue;
             }
-            let cap = (2 * n).next_power_of_two().max(16);
-            let mask = cap - 1;
-            table.clear();
-            table.resize(cap, Slot::default());
-            for (t, te) in e.iter().enumerate() {
-                let v = &te[p];
-                assert!(v.len() < (1 << IDX_BITS));
-                for (j, r) in v.iter().enumerate() {
-                    let idx = ((t as u32) << IDX_BITS) | j as u32;
-                    let mut i = keys::mix(r.eid) as usize & mask;
-                    loop {
-                        let s = &mut table[i];
-                        if s.eid == 0 {
-                            *s = Slot { eid: r.eid, ingest: r.ingest, idx };
-                            break;
+            kept.clear();
+            let sub_bits = ceil_log2(n.div_ceil(SUB_TARGET)).min(12);
+            if sub_bits == 0 {
+                let mut slices = e.iter().flat_map(|t| t.get(p)).filter(|sl| !sl.is_empty());
+                let first = slices.next().unwrap();
+                if slices.next().is_none() {
+                    dedup_bucket(first, &mut table, &mut kept);
+                } else {
+                    scratch.clear();
+                    for t in e {
+                        for sl in t.get(p) {
+                            scratch.extend_from_slice(sl);
                         }
-                        if s.eid == r.eid {
-                            if r.ingest < s.ingest {
-                                s.ingest = r.ingest;
-                                s.idx = idx;
-                            }
-                            break;
+                    }
+                    dedup_bucket(&scratch, &mut table, &mut kept);
+                }
+            } else {
+                // split by the hash bits just below the partition bits
+                let shift = 64 - ctx.pe_bits - sub_bits;
+                let smask = (1usize << sub_bits) - 1;
+                counts.clear();
+                counts.resize((1 << sub_bits) + 1, 0);
+                for t in e {
+                    for sl in t.get(p) {
+                        for r in sl {
+                            counts[((r.eid >> shift) as usize & smask) + 1] += 1;
                         }
-                        i = (i + 1) & mask;
                     }
                 }
-            }
-            kept.clear();
-            for s in table.iter() {
-                if s.eid != 0 {
-                    let r = &e[(s.idx >> IDX_BITS) as usize][p][(s.idx & ((1 << IDX_BITS) - 1)) as usize];
-                    if r.ok != 0 {
-                        kept.push((r.user, r.ts, r.pay));
+                for b in 0..(1 << sub_bits) {
+                    counts[b + 1] += counts[b];
+                }
+                scratch.clear();
+                scratch.reserve(n);
+                unsafe { scratch.set_len(n) };
+                let mut cur: Vec<usize> = counts[..(1 << sub_bits)].to_vec();
+                for t in e {
+                    for sl in t.get(p) {
+                        for r in sl {
+                            let b = (r.eid >> shift) as usize & smask;
+                            unsafe { *scratch.get_unchecked_mut(cur[b]) = *r };
+                            cur[b] += 1;
+                        }
                     }
+                }
+                for b in 0..(1 << sub_bits) {
+                    dedup_bucket(&scratch[counts[b]..counts[b + 1]], &mut table, &mut kept);
                 }
             }
             const AHEAD: usize = 16;
@@ -475,7 +660,7 @@ fn dedup(e: &[Vec<Vec<ERec>>], lt: &LinkTable, ctx: &Ctx) -> Vec<Vec<Vec<SRec>>>
                 }
                 let (user, ts, pay) = kept[k];
                 let person = lt.person_of(user);
-                out[part(person, ctx.ps_bits)].push(SRec { person, ts, pay });
+                out.push(part(person, ctx.ps_bits), SRec { person, ts, pay });
             }
         }
         out
@@ -564,6 +749,7 @@ impl PMap {
 
 struct SOut {
     rows: Vec<URow>,
+    nrows: usize,
     /// [(ncamp + 1) * ndays] of (sessions, purchasing, revenue); index ncamp = organic.
     cred: Vec<[u64; 3]>,
     /// [ncamp * ndays] assisted sessions.
@@ -651,12 +837,12 @@ impl SState {
     fn partition(
         &mut self,
         q: usize,
-        sbufs: &[Vec<Vec<SRec>>],
-        pouts: &[ParseOut],
+        sbufs: &[Parts<SRec>],
+        cbufs: &[Parts<CRec>],
         ctx: &Ctx,
         out: &mut SOut,
     ) {
-        let n: usize = sbufs.iter().map(|t| t[q].len()).sum();
+        let n: usize = sbufs.iter().map(|t| t.len(q)).sum();
         if n == 0 {
             return;
         }
@@ -664,12 +850,14 @@ impl SState {
         self.persons.clear();
         self.ridx.clear();
         for t in sbufs {
-            for r in &t[q] {
-                let (idx, new) = self.map.insert(r.person);
-                if new {
-                    self.persons.push(r.person);
+            for sl in t.get(q) {
+                for r in sl {
+                    let (idx, new) = self.map.insert(r.person);
+                    if new {
+                        self.persons.push(r.person);
+                    }
+                    self.ridx.push(idx);
                 }
-                self.ridx.push(idx);
             }
         }
         let np = self.persons.len();
@@ -687,26 +875,30 @@ impl SState {
         self.ev.resize(n, 0);
         let mut k = 0;
         for t in sbufs {
-            for r in &t[q] {
-                let i = self.ridx[k] as usize;
-                let c = self.cursor[i] as usize;
-                self.ev[c] = ((r.ts as u64) << 32) | r.pay as u64;
-                self.cursor[i] += 1;
-                k += 1;
+            for sl in t.get(q) {
+                for r in sl {
+                    let i = self.ridx[k] as usize;
+                    let c = self.cursor[i] as usize;
+                    self.ev[c] = ((r.ts as u64) << 32) | r.pay as u64;
+                    self.cursor[i] += 1;
+                    k += 1;
+                }
             }
         }
         // clicks of these persons
         self.cidx.clear();
         self.cstart.clear();
         self.cstart.resize(np + 1, 0);
-        for po in pouts {
-            for c in &po.c[q] {
-                match self.map.get(c.person) {
-                    Some(i) => {
-                        self.cidx.push(i);
-                        self.cstart[i as usize + 1] += 1;
+        for t in cbufs {
+            for sl in t.get(q) {
+                for c in sl {
+                    match self.map.get(c.person) {
+                        Some(i) => {
+                            self.cidx.push(i);
+                            self.cstart[i as usize + 1] += 1;
+                        }
+                        None => self.cidx.push(u32::MAX),
                     }
-                    None => self.cidx.push(u32::MAX),
                 }
             }
         }
@@ -719,14 +911,16 @@ impl SState {
         self.clicks.clear();
         self.clicks.resize(nc, Click { ts: 0, camp: 0, ck: 0 });
         let mut k = 0;
-        for po in pouts {
-            for c in &po.c[q] {
-                let i = self.cidx[k];
-                k += 1;
-                if i != u32::MAX {
-                    let pos = self.cursor[i as usize] as usize;
-                    self.clicks[pos] = Click { ts: c.ts, camp: c.camp, ck: c.ck };
-                    self.cursor[i as usize] += 1;
+        for t in cbufs {
+            for sl in t.get(q) {
+                for c in sl {
+                    let i = self.cidx[k];
+                    k += 1;
+                    if i != u32::MAX {
+                        let pos = self.cursor[i as usize] as usize;
+                        self.clicks[pos] = Click { ts: c.ts, camp: c.camp, ck: c.ck };
+                        self.cursor[i as usize] += 1;
+                    }
                 }
             }
         }
@@ -830,25 +1024,33 @@ impl SState {
     }
 }
 
-fn sessions(sbufs: &[Vec<Vec<SRec>>], pouts: &[ParseOut], ctx: &Ctx) -> Vec<SOut> {
+/// Sessions, attribution and aggregation per person partition; each thread then
+/// writes its own user_daily part file (overlapping with threads still busy).
+fn sessions(sbufs: &[Parts<SRec>], cbufs: &[Parts<CRec>], ctx: &Ctx, ud: &Path) -> Vec<SOut> {
     let ps = 1usize << ctx.ps_bits;
     // biggest partitions first, for load balance (whales)
     let mut order: Vec<(usize, usize)> =
-        (0..ps).map(|q| (sbufs.iter().map(|t| t[q].len()).sum::<usize>(), q)).collect();
+        (0..ps).map(|q| (sbufs.iter().map(|t| t.len(q)).sum::<usize>(), q)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
-    par(ctx.threads, |_| {
+    par(ctx.threads, |t| {
         let mut st = SState::new(ctx);
         let mut out = SOut {
             rows: Vec::new(),
+            nrows: 0,
             cred: vec![[0; 3]; (ctx.ncamp + 1) * ctx.ndays],
             assist: vec![0; ctx.ncamp * ctx.ndays],
         };
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(&(_, q)) = order.get(i) else { break };
-            st.partition(q, sbufs, pouts, ctx, &mut out);
+            st.partition(q, sbufs, cbufs, ctx, &mut out);
         }
+        if t == 0 || !out.rows.is_empty() {
+            write_user_daily(&ud.join(format!("part-{}.parquet", t)), &out.rows, ctx);
+        }
+        out.nrows = out.rows.len();
+        out.rows = Vec::new();
         out
     })
 }
@@ -857,13 +1059,13 @@ fn sessions(sbufs: &[Vec<Vec<SRec>>], pouts: &[ParseOut], ctx: &Ctx) -> Vec<SOut
 
 fn write_user_daily(path: &Path, rows: &[URow], ctx: &Ctx) {
     let n = rows.len();
-    let mut ubytes = Vec::with_capacity(n * 10);
+    let mut ubytes = Vec::with_capacity(n * 10 + 16);
     let mut uends = Vec::with_capacity(n);
     let mut days = Vec::with_capacity(n);
     let mut sess = Vec::with_capacity(n);
     let mut evs = Vec::with_capacity(n);
     let mut revs = Vec::with_capacity(n);
-    let mut cbytes = Vec::with_capacity(n * 4);
+    let mut cbytes = Vec::with_capacity(n * 8 + 16);
     let mut cends = Vec::with_capacity(n);
     let mut cvalid = Vec::with_capacity(n);
     for r in rows {
@@ -1003,42 +1205,68 @@ fn main() {
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).unwrap_or_else(|e| fail(&format!("manifest: {}", e)));
     let ws = ts::parse_ts(manifest_value(&manifest, "window_start").as_bytes()).unwrap_or_else(|| fail("bad window_start"));
     let we = ts::parse_ts(manifest_value(&manifest, "window_end").as_bytes()).unwrap_or_else(|| fail("bad window_end"));
-    if we <= ws || we - ws + WEEK > u32::MAX as i64 - WEEK {
-        fail("unsupported window length");
+    if we <= ws || we - ws >= (1i64 << 31) {
+        fail("unsupported window length (over 24 days)");
     }
-    let prows = read_table(&data_dir.join("products.csv"));
-    let mut cats: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
-    for (_, c) in &prows {
-        cats.insert(c.clone(), 0);
+    let ptext = read_file(&data_dir.join("products.csv"));
+    let prows = table_rows(&ptext);
+    // categories: distinct names (few), then ranked byte-wise
+    let mut cat_list: Vec<&[u8]> = Vec::new();
+    let mut prow_cat: Vec<u32> = Vec::with_capacity(prows.len());
+    let mut last: Option<(&[u8], u32)> = None;
+    for &(_, c) in &prows {
+        let idx = match last {
+            Some((lc, li)) if lc == c => li,
+            _ => {
+                let i = match cat_list.iter().position(|&x| x == c) {
+                    Some(i) => i as u32,
+                    None => {
+                        cat_list.push(c);
+                        if cat_list.len() > 255 {
+                            fail("more than 255 categories is not supported");
+                        }
+                        (cat_list.len() - 1) as u32
+                    }
+                };
+                last = Some((c, i));
+                i
+            }
+        };
+        prow_cat.push(idx);
     }
-    cats.insert(b"unknown".to_vec(), 0);
-    if cats.len() > 256 {
-        fail("more than 255 categories is not supported");
+    if !cat_list.iter().any(|&c| c == b"unknown") {
+        cat_list.push(b"unknown");
     }
-    let cat_names: Vec<Vec<u8>> = cats.keys().cloned().collect();
-    for (i, v) in cats.values_mut().enumerate() {
-        *v = i as u32;
+    let mut sorted: Vec<(&[u8], usize)> = cat_list.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+    sorted.sort();
+    let mut rank_of = vec![0u32; cat_list.len()];
+    for (r, &(_, i)) in sorted.iter().enumerate() {
+        rank_of[i] = r as u32;
     }
-    let unknown_cat = cats[&b"unknown"[..]];
-    let pentries: Vec<(Vec<u8>, u16)> = prows.iter().map(|(p, c)| (p.clone(), cats[c] as u16)).collect();
-    let crows = read_table(&data_dir.join("campaigns.csv"));
+    let cat_names: Vec<Vec<u8>> = sorted.iter().map(|(c, _)| c.to_vec()).collect();
+    let unknown_cat = sorted.iter().position(|(c, _)| *c == b"unknown").unwrap() as u32;
+    let pentries: Vec<(&[u8], u16)> = prows.iter().zip(&prow_cat).map(|(&(p, _), &ci)| (p, rank_of[ci as usize] as u16)).collect();
+    let ctext = read_file(&data_dir.join("campaigns.csv"));
+    let crows = table_rows(&ctext);
     if crows.len() >= NONE as usize {
         fail("too many campaigns");
     }
-    let centries: Vec<(Vec<u8>, u16)> = crows.iter().enumerate().map(|(i, (c, _))| (c.clone(), i as u16)).collect();
-
+    let centries: Vec<(&[u8], u16)> = crows.iter().enumerate().map(|(i, &(c, _))| (c, i as u16)).collect();
+    marks.mark("lookups");
     let chunk = env_usize("SS_CHUNK").unwrap_or(2 << 20);
     let links_in = load_input(&data_dir.join("links"), chunk);
     let events_in = load_input(&data_dir.join("events"), chunk);
     let clicks_in = load_input(&data_dir.join("clicks"), chunk);
+    marks.mark("mmap");
     let est_lines = events_in.bytes / 75 + 1;
-    let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 16384).clamp(2, 12));
-    let ps_bits = env_usize("SS_PS_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 16384).clamp(2, 12));
+    let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 8));
+    let ps_bits = env_usize("SS_PS_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 8));
 
     let first_day = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - first_day + 1) as usize;
     let ctx = Ctx {
         tsp: ts::TsParser::new(ws - 10 * DAY, we + 10 * DAY),
+        avx2: use_avx2(),
         ws,
         we,
         ws_s: ws.div_euclid(1000),
@@ -1049,8 +1277,8 @@ fn main() {
         unknown_cat,
         cat_names,
         campaigns: IdTable::build(&centries),
-        camp_ids: crows.iter().map(|r| r.0.clone()).collect(),
-        camp_channels: crows.iter().map(|r| r.1.clone()).collect(),
+        camp_ids: crows.iter().map(|r| r.0.to_vec()).collect(),
+        camp_channels: crows.iter().map(|r| r.1.to_vec()).collect(),
         ncamp: crows.len(),
         pe_bits,
         ps_bits,
@@ -1058,48 +1286,31 @@ fn main() {
     };
     marks.mark("setup");
 
-    let pairs = parse_links(&links_in, &ctx);
-    marks.mark("links-parse");
-    let lt = build_links(&pairs, &ctx);
-    drop(pairs);
-    marks.mark("links-uf");
-
-    let pouts = parse_events_clicks(&events_in, &clicks_in, &lt, &ctx);
+    let (lt, pouts) = parse_all(&links_in, &events_in, &clicks_in, &ctx);
     marks.mark("parse");
 
-    let ebufs: Vec<Vec<Vec<ERec>>> = pouts.iter().map(|_| Vec::new()).collect();
-    let mut pouts = pouts;
-    let mut ebufs = ebufs;
-    for (po, eb) in pouts.iter_mut().zip(ebufs.iter_mut()) {
-        *eb = std::mem::take(&mut po.e);
-    }
+    let (ebufs, cbufs): (Vec<Parts<ERec>>, Vec<Parts<CRec>>) = pouts.into_iter().map(|po| (po.e, po.c)).unzip();
     let sbufs = dedup(&ebufs, &lt, &ctx);
     marks.mark("dedup");
-    drop(ebufs);
-    marks.mark("free");
-
-    let souts = sessions(&sbufs, &pouts, &ctx);
-    marks.mark("sessions");
+    // Not freed: unmapping costs more than it saves; the process exits soon.
+    std::mem::forget(ebufs);
 
     let ud = out_dir.join("user_daily");
     let cd = out_dir.join("campaign_daily");
     std::fs::create_dir_all(&ud).unwrap_or_else(|e| fail(&format!("{}: {}", ud.display(), e)));
     std::fs::create_dir_all(&cd).unwrap_or_else(|e| fail(&format!("{}: {}", cd.display(), e)));
-    par(threads + 1, |t| {
-        if t == threads {
-            write_campaign_daily(&cd.join("part-0.parquet"), &souts, &ctx);
-        } else if t == 0 || !souts[t].rows.is_empty() {
-            write_user_daily(&ud.join(format!("part-{}.parquet", t)), &souts[t].rows, &ctx);
-        }
-    });
+    let souts = sessions(&sbufs, &cbufs, &ctx, &ud);
+    marks.mark("sessions");
+    write_campaign_daily(&cd.join("part-0.parquet"), &souts, &ctx);
     marks.mark("write");
 
     if verbose {
-        let rows: usize = souts.iter().map(|s| s.rows.len()).sum();
+        let rows: usize = souts.iter().map(|s| s.nrows).sum();
         eprintln!(
-            "sessions: {} | threads={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB",
+            "sessions: {} | threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} peak_rss={}MB",
             marks.report(),
             threads,
+            ctx.avx2,
             pe_bits,
             ps_bits,
             rows,
@@ -1158,11 +1369,11 @@ fn bench(stage: &str, data: &Path) {
                     let t = tsp.parse(f[2]).unwrap_or(0);
                     let e = keys::key_of(f[0]);
                     let u = keys::key_of(f[1]);
-                    let r = ERec { eid: e, user: u, ingest: ingest_rel(i, ws), ts: t as u32, pay: f[4].len() as u32, ok: 1 };
+                    let r = ERec { eid: e, user: u, ingest: ingest_rel(i, ws), ts: t as u32, pay: f[4].len() as u32 };
                     if stage == "push" {
                         parts[part(e, pbits)].push(r);
                     } else {
-                        acc += r.eid ^ r.user ^ r.ts as u64 ^ r.ingest as u64;
+                        acc += { r.eid } ^ { r.user } ^ { r.ts } as u64 ^ { r.ingest } as u64;
                     }
                 }),
                 _ => fail("unknown stage"),

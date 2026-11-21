@@ -103,10 +103,11 @@ pub fn decode_into(k: u64, out: &mut Vec<u8>) {
     }
     let n = (k & 0xF) as usize;
     let codes = k >> 4;
-    for i in 0..n {
-        let code = (codes >> (6 * (9 - i))) & 63;
-        out.push(ALPHABET[code as usize]);
+    let mut buf = [0u8; 10];
+    for (i, c) in buf.iter_mut().enumerate() {
+        *c = ALPHABET[((codes >> (6 * (9 - i))) & 63) as usize];
     }
+    out.extend_from_slice(&buf[..n]);
 }
 
 pub fn decode(k: u64) -> Vec<u8> {

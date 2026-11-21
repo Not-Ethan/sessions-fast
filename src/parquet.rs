@@ -114,6 +114,32 @@ impl Thrift {
     }
 }
 
+/// Appends fixed-width integers in little-endian byte order.
+fn extend_le<T: Copy + ToLe>(out: &mut Vec<u8>, values: &[T]) {
+    if cfg!(target_endian = "little") {
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values)) };
+        out.extend_from_slice(bytes);
+    } else {
+        for &v in values {
+            v.put_le(out);
+        }
+    }
+}
+
+trait ToLe {
+    fn put_le(self, out: &mut Vec<u8>);
+}
+impl ToLe for i32 {
+    fn put_le(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_le_bytes());
+    }
+}
+impl ToLe for i64 {
+    fn put_le(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
 fn varint_len(mut v: u64) -> usize {
     let mut n = 1;
     while v >= 0x80 {
@@ -219,16 +245,8 @@ pub fn write_file(path: &Path, nrows: usize, cols: &[Column]) -> io::Result<()> 
                         prev = e;
                     }
                 }
-                Data::I32 { values, .. } => {
-                    for &v in values.iter() {
-                        out.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
-                Data::I64 { values } => {
-                    for &v in values.iter() {
-                        out.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
+                Data::I32 { values, .. } => extend_le(&mut out, values),
+                Data::I64 { values } => extend_le(&mut out, values),
             }
             assert_eq!(out.len() - body_start, data_len, "page size mismatch for {}", c.name);
             let _ = optional;

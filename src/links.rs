@@ -4,24 +4,28 @@
 //! component's root is its byte-wise smallest ID: the person's name.
 
 use crate::keys;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub struct LinkTable {
     /// [key, val] per slot. During union-find val = parent slot + 1 (0 = root);
-    /// after `finalize` val = the person key (root's key).
-    slots: Vec<[AtomicU64; 2]>,
+    /// after `finalize` val = the person key (root's key). Lives in a zeroed,
+    /// huge-page-backed arena (random probes, so TLB reach matters).
+    slots: &'static [[AtomicU64; 2]],
+    /// Scratch for `finalize_roots` / `finalize_vals`.
+    root_of: &'static [AtomicU32],
     mask: usize,
 }
 
-fn zeroed_slots(n: usize) -> Vec<[AtomicU64; 2]> {
-    let v: Vec<[u64; 2]> = vec![[0u64; 2]; n];
-    let mut v = std::mem::ManuallyDrop::new(v);
-    unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut [AtomicU64; 2], v.len(), v.capacity()) }
+pub const FINALIZE_BLOCK: usize = 1 << 16;
+
+fn zeroed_slots(n: usize) -> &'static [[AtomicU64; 2]] {
+    let p = crate::sys::alloc_arena(n * 16) as *const [AtomicU64; 2];
+    unsafe { std::slice::from_raw_parts(p, n) }
 }
 
 impl LinkTable {
     pub fn empty() -> Self {
-        LinkTable { slots: Vec::new(), mask: 0 }
+        LinkTable { slots: &[], root_of: &[], mask: 0 }
     }
 
     pub fn with_pairs(total_pairs: usize) -> Self {
@@ -29,7 +33,8 @@ impl LinkTable {
             return Self::empty();
         }
         let cap = (total_pairs * 5 / 2 + 16).next_power_of_two();
-        LinkTable { slots: zeroed_slots(cap), mask: cap - 1 }
+        let root_of = unsafe { std::slice::from_raw_parts(crate::sys::alloc_arena(cap * 4) as *const AtomicU32, cap) };
+        LinkTable { slots: zeroed_slots(cap), root_of, mask: cap - 1 }
     }
 
     #[inline(always)]
@@ -107,53 +112,31 @@ impl LinkTable {
         }
     }
 
-    /// After all links: replaces parents by person keys. Runs on `threads` threads.
-    pub fn finalize(&self, threads: usize) {
-        if self.slots.is_empty() {
-            return;
-        }
+    /// Number of finalize blocks.
+    pub fn finalize_blocks(&self) -> usize {
+        self.slots.len().div_ceil(FINALIZE_BLOCK)
+    }
+
+    /// Finalize, step 1 (after all links): root slot of every occupied slot in
+    /// block `b`. Blocks may run on any threads, concurrently.
+    pub fn finalize_roots(&self, b: usize) {
         let n = self.slots.len();
-        let block = 1 << 16;
-        let nblocks = n.div_ceil(block);
-        let mut root_of = vec![0u32; n];
-        {
-            let next = AtomicUsize::new(0);
-            let ptr = root_of.as_mut_ptr() as usize;
-            std::thread::scope(|s| {
-                for _ in 0..threads {
-                    s.spawn(|| loop {
-                        let b = next.fetch_add(1, Ordering::Relaxed);
-                        if b >= nblocks {
-                            break;
-                        }
-                        for i in b * block..((b + 1) * block).min(n) {
-                            if self.key(i) != 0 {
-                                let r = self.find(i) as u32;
-                                unsafe { *(ptr as *mut u32).add(i) = r };
-                            }
-                        }
-                    });
-                }
-            });
+        for i in b * FINALIZE_BLOCK..((b + 1) * FINALIZE_BLOCK).min(n) {
+            if self.key(i) != 0 {
+                self.root_of[i].store(self.find(i) as u32, Ordering::Relaxed);
+            }
         }
-        {
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads {
-                    s.spawn(|| loop {
-                        let b = next.fetch_add(1, Ordering::Relaxed);
-                        if b >= nblocks {
-                            break;
-                        }
-                        for i in b * block..((b + 1) * block).min(n) {
-                            if self.key(i) != 0 {
-                                let rk = self.key(root_of[i] as usize);
-                                self.slots[i][1].store(rk, Ordering::Relaxed);
-                            }
-                        }
-                    });
-                }
-            });
+    }
+
+    /// Finalize, step 2 (after every block finished step 1): each occupied
+    /// slot's value becomes its person key.
+    pub fn finalize_vals(&self, b: usize) {
+        let n = self.slots.len();
+        for i in b * FINALIZE_BLOCK..((b + 1) * FINALIZE_BLOCK).min(n) {
+            if self.key(i) != 0 {
+                let rk = self.key(self.root_of[i].load(Ordering::Relaxed) as usize);
+                self.slots[i][1].store(rk, Ordering::Relaxed);
+            }
         }
     }
 

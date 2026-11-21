@@ -33,21 +33,20 @@ fn canonical_number(s: &[u8]) -> Option<usize> {
 }
 
 impl IdTable {
-    pub fn build(entries: &[(Vec<u8>, u16)]) -> IdTable {
-        let mut map = HashMap::with_capacity(entries.len());
-        for (k, v) in entries {
-            map.insert(k.clone(), *v);
-        }
+    pub fn build<K: AsRef<[u8]>>(entries: &[(K, u16)]) -> IdTable {
+        let mut map = HashMap::new();
         // Detect PREFIX + canonical decimal for every key.
         let mut use_direct = !entries.is_empty();
         let mut prefix: Vec<u8> = Vec::new();
         if let Some((first, _)) = entries.first() {
+            let first = first.as_ref();
             let plen = first.iter().position(|c| c.is_ascii_digit()).unwrap_or(first.len());
             prefix = first[..plen].to_vec();
         }
         let mut maxn = 0usize;
         if use_direct {
             for (k, _) in entries {
+                let k = k.as_ref();
                 if !k.starts_with(&prefix) {
                     use_direct = false;
                     break;
@@ -65,8 +64,13 @@ impl IdTable {
         if use_direct {
             direct = vec![NONE; maxn + 1];
             for (k, v) in entries {
-                let n = canonical_number(&k[prefix.len()..]).unwrap();
+                let n = canonical_number(&k.as_ref()[prefix.len()..]).unwrap();
                 direct[n] = *v;
+            }
+        } else {
+            map.reserve(entries.len());
+            for (k, v) in entries {
+                map.insert(k.as_ref().to_vec(), *v);
             }
         }
         IdTable { prefix, direct, map, use_direct }

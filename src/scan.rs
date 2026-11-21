@@ -23,6 +23,23 @@ unsafe fn simd_masks(p: *const u8) -> (u64, u64, u64) {
     (c, n, q)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn simd_masks_avx2(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let m = |v: __m256i, ch: u8| -> u64 {
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(ch as i8))) as u32 as u64
+    };
+    (
+        m(a, b',') | (m(b, b',') << 32),
+        m(a, b'\n') | (m(b, b'\n') << 32),
+        m(a, b'"') | (m(b, b'"') << 32),
+    )
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn simd_masks(p: *const u8) -> (u64, u64, u64) {
@@ -67,16 +84,27 @@ unsafe fn simd_masks(p: *const u8) -> (u64, u64, u64) {
     (c, n, q)
 }
 
+#[inline(always)]
+unsafe fn simd_masks_x<const AVX2: bool>(p: *const u8) -> (u64, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if AVX2 {
+            return simd_masks_avx2(p);
+        }
+    }
+    simd_masks(p)
+}
+
 /// Masks of the 64 bytes at `pos`, with bits at or beyond `end` cleared.
 #[inline(always)]
-fn masks(buf: &[u8], pos: usize, end: usize) -> (u64, u64, u64) {
+fn masks<const AVX2: bool>(buf: &[u8], pos: usize, end: usize) -> (u64, u64, u64) {
     let (c, n, q) = if pos + 64 <= buf.len() {
-        unsafe { simd_masks(buf.as_ptr().add(pos)) }
+        unsafe { simd_masks_x::<AVX2>(buf.as_ptr().add(pos)) }
     } else {
         let mut tmp = [0u8; 64];
         let k = buf.len() - pos;
         tmp[..k].copy_from_slice(&buf[pos..]);
-        unsafe { simd_masks(tmp.as_ptr()) }
+        unsafe { simd_masks_x::<AVX2>(tmp.as_ptr()) }
     };
     let rem = end - pos;
     if rem < 64 {
@@ -101,7 +129,19 @@ fn masks(buf: &[u8], pos: usize, end: usize) -> (u64, u64, u64) {
 /// delimiters and of all newlines flattened into arrays by fixed-width
 /// unrolled loops; (2) one iteration per line, branch-free field slicing.
 #[inline(always)]
-pub fn for_each_record<const N: usize, F: FnMut(&[&[u8]; N])>(buf: &[u8], start: usize, end: usize, mut f: F) {
+pub fn for_each_record<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], start: usize, end: usize, f: F) {
+    for_each_record_x::<N, F, false>(buf, start, end, f)
+}
+
+/// `for_each_record`, with AVX2 masks when `AVX2` (the caller must run with
+/// AVX2 enabled, e.g. inside a `#[target_feature(enable = "avx2")]` function).
+#[inline(always)]
+pub fn for_each_record_x<'a, const N: usize, F: FnMut(&[&'a [u8]; N]), const AVX2: bool>(
+    buf: &'a [u8],
+    start: usize,
+    end: usize,
+    mut f: F,
+) {
     assert!(end <= buf.len() && end - start < (u32::MAX as usize) - 8192);
     const WBLK: usize = 64;
     const WIN: usize = WBLK * 64;
@@ -124,7 +164,7 @@ pub fn for_each_record<const N: usize, F: FnMut(&[&[u8]; N])>(buf: &[u8], start:
         let mut nn = 0usize;
         for b in 0..nblk {
             let p = w + 64 * b;
-            let (cm, nl, qm) = masks(buf, start + p, start + wend);
+            let (cm, nl, qm) = masks::<AVX2>(buf, start + p, start + wend);
             qmask[b] = qm;
             qpre[b + 1] = qpre[b] + qm.count_ones();
             flatten8(&mut dl, &mut nd, cm | nl, p as u32);
@@ -199,8 +239,8 @@ fn flatten4(out: &mut [u32], n: &mut usize, mut m: u64, base: u32) {
 /// One line whose N delimiter positions (relative to `r`) are in `d`; every
 /// d[j] is a real delimiter position inside `r`, so r[s] and r[e - 1] exist.
 #[inline(always)]
-fn line<const N: usize, F: FnMut(&[&[u8]; N])>(r: &[u8], ls: usize, d: &[u32], qline: u64, f: &mut F) {
-    let mut fs: [&[u8]; N] = [&[]; N];
+fn line<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(r: &'a [u8], ls: usize, d: &[u32], qline: u64, f: &mut F) {
+    let mut fs: [&'a [u8]; N] = [&[]; N];
     let mut s = ls;
     let mut nq = 0u64;
     let mut bad = false;
@@ -223,8 +263,8 @@ fn line<const N: usize, F: FnMut(&[&[u8]; N])>(r: &[u8], ls: usize, d: &[u32], q
 }
 
 /// Same as `line` for the final unterminated line: the last field ends at `rlen`.
-fn line_safe<const N: usize, F: FnMut(&[&[u8]; N])>(r: &[u8], rlen: usize, ls: usize, commas: &[u32], qline: u64, f: &mut F) {
-    let mut fs: [&[u8]; N] = [&[]; N];
+fn line_safe<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(r: &'a [u8], rlen: usize, ls: usize, commas: &[u32], qline: u64, f: &mut F) {
+    let mut fs: [&'a [u8]; N] = [&[]; N];
     let mut s = ls;
     let mut nq = 0u64;
     for j in 0..N {

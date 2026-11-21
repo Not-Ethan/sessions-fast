@@ -254,6 +254,14 @@ impl TsParser {
             if b[19] == b'Z' {
                 return self.civil(b);
             }
+        } else if n == 13 {
+            let wa = load8(b, 0);
+            let wb = load8(b, 5);
+            if digits_ok(wa, !0) && digits_ok(wb, !0) {
+                let tail = (wb & !0xFF_FFFF) | 0x30_3030;
+                return Some((parse8(wa) * 100_000 + parse8(tail)) as i64);
+            }
+            return None;
         } else if n == 25 {
             let sign = b[19];
             if (sign == b'+' || sign == b'-') && b[22] == b':' {
@@ -270,14 +278,6 @@ impl TsParser {
                 let off = (oh * 60 + om) as i64 * 60_000;
                 return Some(if sign == b'+' { base - off } else { base + off });
             }
-        } else if n == 13 {
-            let wa = load8(b, 0);
-            let wb = load8(b, 5);
-            if digits_ok(wa, !0) && digits_ok(wb, !0) {
-                let tail = (wb & !0xFF_FFFF) | 0x30_3030;
-                return Some((parse8(wa) * 100_000 + parse8(tail)) as i64);
-            }
-            return None;
         }
         parse_ts(b)
     }

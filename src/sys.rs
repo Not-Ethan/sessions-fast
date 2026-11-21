@@ -9,12 +9,10 @@ use std::path::Path;
 extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
-    fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
 }
 
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
-const MADV_WILLNEED: i32 = 3;
 
 pub struct Mmap {
     ptr: *const u8,
@@ -34,9 +32,6 @@ impl Mmap {
         let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
         if p as isize == -1 {
             return Err(io::Error::last_os_error());
-        }
-        unsafe {
-            madvise(p, len, MADV_WILLNEED);
         }
         Ok(Mmap { ptr: p as *const u8, len })
     }
@@ -94,4 +89,33 @@ pub fn peak_rss_mb() -> u64 {
     } else {
         v >> 10
     }
+}
+
+extern "C" {
+    fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+const MAP_ANON_FLAGS: i32 = 0x20 | 0x4000; // MAP_ANONYMOUS | MAP_NORESERVE
+#[cfg(not(target_os = "linux"))]
+const MAP_ANON_FLAGS: i32 = 0x1000 | 0x40; // MAP_ANON | MAP_NORESERVE (macOS)
+const PROT_RW: i32 = 1 | 2;
+
+/// Zeroed anonymous memory reserved lazily (only touched pages are resident),
+/// backed by transparent huge pages on Linux when the kernel allows it.
+/// Never unmapped: it lives until process exit.
+pub fn alloc_arena(bytes: usize) -> *mut u8 {
+    let bytes = bytes.max(4096);
+    let p = unsafe { mmap(std::ptr::null_mut(), bytes, PROT_RW, MAP_PRIVATE | MAP_ANON_FLAGS, -1, 0) };
+    if p as isize == -1 {
+        eprintln!("sessions: mmap of {} bytes failed: {}", bytes, io::Error::last_os_error());
+        std::process::exit(3);
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        madvise(p, bytes, 14); // MADV_HUGEPAGE
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = madvise;
+    p as *mut u8
 }

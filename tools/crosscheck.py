@@ -25,6 +25,7 @@ VARIANTS = [
     {"NCPU": "8"},
     {"NCPU": "3", "SS_PE_BITS": "2", "SS_PS_BITS": "9", "SS_CHUNK": "65536"},
     {"NCPU": "1", "SS_PE_BITS": "11", "SS_PS_BITS": "3"},
+    {"NCPU": "5", "SS_CAPDIV": "50", "SS_CHUNK": "300000"},
 ]
 
 

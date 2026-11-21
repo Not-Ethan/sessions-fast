@@ -7,8 +7,9 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # Static binary (glibc, crt-static), no runtime dependencies. x86-64-v2 is the
-# baseline (SSE4.2/POPCNT, every x86 server since 2009); no AVX2/AVX-512 is
-# required, so no illegal-instruction risk on any scorer CPU.
+# baseline (SSE4.2/POPCNT, every x86 server since 2009). The CSV parsing loop
+# is also compiled for AVX2+BMI1/2 and selected at run time only when CPUID
+# reports those features, so there is no illegal-instruction risk on any CPU.
 RUN set -eux; \
     case "${TARGETARCH:-amd64}" in \
       amd64) T=x86_64-unknown-linux-gnu; F="-C target-cpu=x86-64-v2" ;; \
