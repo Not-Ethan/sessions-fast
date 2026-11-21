@@ -32,11 +32,11 @@ const W: u32 = crate::GAP;
 
 /// A click in bucket order.
 #[derive(Clone, Copy)]
-struct Cl {
-    person: u64,
-    ck: u64,
-    ts: u32,
-    camp: u32,
+pub(crate) struct Cl {
+    pub(crate) person: u64,
+    pub(crate) ck: u64,
+    pub(crate) ts: u32,
+    pub(crate) camp: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -740,6 +740,38 @@ impl St {
 /// window length (at most 24 days: 1152 slots, 18 bitmap words).
 const SLOTS_ALL: usize = 2432;
 const _: () = assert!(((u32::MAX / W) as usize) < SLOTS_ALL && SLOTS_ALL % 64 == 0 && SLOTS_ALL / 64 <= 64);
+
+/// One thread's per-person sessions state for the dense pipeline (dense.rs):
+/// the same exact per-person routine as `sessions2`, fed one person at a
+/// time (all its surviving events and all its clicks).
+pub(crate) struct PersonSess(St);
+
+impl PersonSess {
+    pub(crate) fn new(ctx: &Ctx, est_rows: usize) -> Self {
+        PersonSess(St::new(ctx, est_rows, 64, 64))
+    }
+
+    /// One person: `p` = keys::mix(person key); `es` all its surviving
+    /// events (any order, person = p), `cs` all its clicks (person = p).
+    #[inline]
+    pub(crate) fn person(&mut self, p: u64, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
+        self.0.person(p, es, cs, ctx)
+    }
+
+    /// Writes this thread's user_daily part (thread 0 always) and returns
+    /// its campaign accumulators, as `sessions2` does.
+    pub(crate) fn finish(mut self, ud: &Path, t: usize) -> Out2 {
+        let st = &mut self.0;
+        if t == 0 || st.cols.n > 0 {
+            st.acc.start();
+            st.write(&ud.join(format!("part-{}.parquet", t)));
+            st.acc.lap(P_WRITE);
+        }
+        st.acc.commit();
+        st.out.nrows = st.cols.n;
+        std::mem::replace(&mut st.out, Out2 { nrows: 0, cred: Vec::new(), assist: Vec::new() })
+    }
+}
 
 /// Sessions, attribution and aggregation per person partition; each thread
 /// then writes its own user_daily part file.

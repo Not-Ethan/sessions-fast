@@ -8,6 +8,7 @@ mod parquet;
 mod prof;
 mod cbench;
 mod dense;
+mod densep;
 mod fastev;
 mod sess;
 mod scan;
@@ -2475,6 +2476,22 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     // Pipeline B unless disabled (SS_LEGACY) or unusable (location bits);
     // if a location index ever overflows, B's results are discarded and the
     // legacy pipeline runs from scratch.
+    // dense pipeline (densep.rs) when SS_DENSE asks for it and the input
+    // has the generator's ID structure; else the general pipeline below
+    if let Some(d) = densep::decide(&events_in, &ctx) {
+        let ud = out_dir.join("user_daily");
+        let cd = out_dir.join("campaign_daily");
+        std::fs::create_dir_all(&ud).unwrap_or_else(|e| fail(&format!("{}: {}", ud.display(), e)));
+        std::fs::create_dir_all(&cd).unwrap_or_else(|e| fail(&format!("{}: {}", cd.display(), e)));
+        let mut outs = densep::run(&links_in, &events_in, &clicks_in, &ctx, d, &ud, &mut marks);
+        sess::write_campaign_daily2(&cd.join("part-0.parquet"), &mut outs, &ctx);
+        marks.mark("write");
+        if verbose {
+            let rows: usize = outs.iter().map(|o| o.nrows).sum();
+            return format!("sessions: {} | pipeline=dense threads={} user_rows={} peak_rss={}MB", marks.report(), threads, rows, sys::peak_rss_mb());
+        }
+        return String::new();
+    }
     let mut pipeline = "B";
     let lb = if std::env::var("SS_LEGACY").is_ok() { None } else { LocBits::new(threads, ps_bits) };
     let mut b_result = None;

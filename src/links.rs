@@ -247,6 +247,18 @@ impl LinkTable {
         }
     }
 
+    /// Calls `f(key, person key)` for every occupied slot in block `b`
+    /// (blocks as for `finalize_vals`), after finalize.
+    pub fn entries(&self, b: usize, mut f: impl FnMut(u64, u64)) {
+        let n = self.slots.len();
+        for i in b * FINALIZE_BLOCK..((b + 1) * FINALIZE_BLOCK).min(n) {
+            let k = self.slots[i][0].load(Ordering::Relaxed);
+            if k != 0 {
+                f(k, self.val_key(self.slots[i][1].load(Ordering::Relaxed)));
+            }
+        }
+    }
+
     /// The person key held in a finalized slot value.
     #[inline(always)]
     fn val_key(&self, v: u64) -> u64 {
