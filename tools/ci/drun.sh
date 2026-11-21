@@ -5,7 +5,7 @@
 # and the program's SS_VERBOSE line.
 set -u
 LABEL=$1; IMAGE=$2; DATA=$3; OUT=$4; shift 4
-CPUS=${CPUS:-4}; MEM=${MEM:-14g}; NCPU=${NCPU:-$CPUS}
+CPUS=${CPUS:-$(nproc)}; MEM=${MEM:-5g}; NCPU=${NCPU:-$CPUS}
 rm -rf "$OUT"; mkdir -p "$OUT"; chmod 777 "$OUT"
 SCR=$(mktemp -d); chmod 777 "$SCR"
 ENVS=()
@@ -22,6 +22,7 @@ docker run --name "$NAME" \
   -e NCPU="$NCPU" -e MEM_GB="${MEM%g}" -e SS_VERBOSE=1 "${ENVS[@]}" \
   "$IMAGE" > /tmp/drun_out.txt 2> /tmp/drun_err.txt
 RC=$?
+[ $RC -ne 0 ] && { echo "docker run failed rc=$RC"; tail -5 /tmp/drun_err.txt; }
 T1=$(date +%s%N)
 INS=$(docker inspect -f '{{.State.StartedAt}} {{.State.FinishedAt}}' "$NAME")
 docker rm "$NAME" > /dev/null

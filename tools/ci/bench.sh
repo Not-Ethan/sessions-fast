@@ -32,12 +32,13 @@ fi
 
 warmup "$D20"
 if has warm; then
-  echo "=== warm page cache, scorer flags, CPUS=${CPUS:-4}"
+  echo "=== warm page cache, scorer flags, CPUS=$(nproc)"
   for img in base new; do
     for i in $(seq $REPS); do bash "$DR" "warm-$img" ss-$img "$D20" $O/$img; done
   done
-  echo "--- NCPU=8 on 4 CPUs (oversubscribed)"
-  for i in 1 2 3; do NCPU=8 bash "$DR" "warm-new-ncpu8" ss-new "$D20" $O/new; done
+  echo "--- NCPU=4 and 8 on $(nproc) CPUs (oversubscribed)"
+  for i in 1 2; do NCPU=4 bash "$DR" "warm-new-ncpu4" ss-new "$D20" $O/new; done
+  for i in 1 2; do NCPU=8 bash "$DR" "warm-new-ncpu8" ss-new "$D20" $O/new; done
 fi
 
 if has cold; then
@@ -68,7 +69,7 @@ if has native; then
   echo "=== native (no container), warm"
   for b in base new; do
     for i in 1 2 3; do
-      rm -rf $O/nat; T0=$(date +%s%N)
+      sudo rm -rf $O/nat; T0=$(date +%s%N)
       SS_VERBOSE=1 NCPU=4 "$W/$b-bin" "$D20" $O/nat 2> /tmp/nat_err.txt
       T1=$(date +%s%N)
       echo "NATIVE $b wall=$(( (T1 - T0) / 1000000 ))ms $(grep -o 'total=[0-9.]*ms' /tmp/nat_err.txt) $(grep -o 'unix_end_ns=[0-9]*' /tmp/nat_err.txt | sed "s/unix_end_ns=//;s/^/end->exit=/" | awk -v t1=$T1 -F= '{printf "end->exit=%.1fms", (t1-$2)/1e6}')"
@@ -82,11 +83,11 @@ if has perf; then
   PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
   if [ -n "$PERF" ] && [ -x "$W/prof-bin" ]; then
     for n in 1 4; do
-      rm -rf $O/nat
+      sudo rm -rf $O/nat
       sudo env NCPU=$n SS_VERBOSE=1 "$PERF" stat -e task-clock,context-switches,cpu-migrations,page-faults,cycles,instructions,cache-misses,branch-misses \
         "$W/prof-bin" "$D20" $O/nat 2>&1 | tail -25
     done
-    rm -rf $O/nat
+    sudo rm -rf $O/nat
     sudo env NCPU=4 "$PERF" record -F 2999 -g -o /tmp/perf.data "$W/prof-bin" "$D20" $O/nat 2>&1 | tail -3
     sudo "$PERF" report -i /tmp/perf.data --stdio --no-children --sort symbol 2>/dev/null | grep -v "^$" | grep -E "^ +[0-9]" | head -60
     echo "--- by dso"
