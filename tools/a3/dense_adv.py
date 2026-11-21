@@ -1005,7 +1005,7 @@ class Harness:
             prep += time.time() - t0
             if prob:
                 fails.append(f"ILLEGAL INPUT (harness bug): {prob}")
-        g_rc, g_err, g_t = self.run_bin(data, out / "general", {})
+        g_rc, g_err, g_t = self.run_bin(data, out / "general", {"SS_DENSE": "0"})
         times.append(f"gen {g_t:.2f}")
         if g_rc != 0:
             fails.append(f"general exit {g_rc}")
@@ -1153,7 +1153,7 @@ class Harness:
         for c in cases:
             data = FIXTURES / c / "input"
             out = self.scratch / "out" / f"fx-{c}"
-            g = self.run_bin(data, out / "general", {})
+            g = self.run_bin(data, out / "general", {"SS_DENSE": "0"})
             ok_all = g[0] == 0
             for label, env in self.modes:
                 rc, err, _ = self.run_bin(data, out / label, env)

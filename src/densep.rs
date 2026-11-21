@@ -1,5 +1,5 @@
-//! Dense pipeline (SS_DENSE=1; SS_DENSE=force skips the size and density
-//! checks, for tests). Uses the generator's ID structure (dense.rs) for
+//! Dense pipeline (default; SS_DENSE=0 = general pipeline, SS_DENSE=force
+//! skips the size and density checks, for tests). Uses the generator's ID structure (dense.rs) for
 //! speed only; every result is the general pipeline's by construction:
 //!
 //! * IDs: a canonical event ID decodes + unscrambles to its event number n
@@ -114,8 +114,10 @@ pub fn stats() -> String {
 /// Decides between the dense and the general pipeline before any heavy
 /// work: None = general.
 pub fn decide(ev: &Input, ctx: &Ctx) -> Option<Dense> {
+    // SS_DENSE: unset or "1" = dense when the checks below pass, "0" =
+    // general, "force" = dense on any input (tests)
     let mode = std::env::var("SS_DENSE").unwrap_or_default();
-    if mode != "1" && mode != "force" {
+    if mode == "0" {
         return None;
     }
     let force = mode == "force";

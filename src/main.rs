@@ -2537,8 +2537,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     // Pipeline B unless disabled (SS_LEGACY) or unusable (location bits);
     // if a location index ever overflows, B's results are discarded and the
     // legacy pipeline runs from scratch.
-    // dense pipeline (densep.rs) when SS_DENSE asks for it and the input
-    // has the generator's ID structure; else the general pipeline below
+    // dense pipeline (densep.rs) unless SS_DENSE=0, when the input is big
+    // enough and has the generator's ID structure; else the general pipeline
     if let Some(d) = densep::decide(&events_in, &ctx) {
         let ud = out_dir.join("user_daily");
         let cd = out_dir.join("campaign_daily");
