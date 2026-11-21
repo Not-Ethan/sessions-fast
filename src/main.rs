@@ -941,7 +941,13 @@ struct BSink<'a> {
     lb: LocBits,
     /// benchmark only: skip the person lookup (person = user)
     nolookup: bool,
+    /// benchmark only: no ring and no lookup
+    direct: bool,
     cache: PCache,
+    /// queue + bulk lookups (default; SS_RING=1 selects the ring instead)
+    use_bulk: bool,
+    bulk: [Pending; BULK_CAP],
+    bn: usize,
 }
 
 impl BSink<'_> {
@@ -975,8 +981,30 @@ impl BSink<'_> {
             self.rn -= 1;
             self.emit(p);
         }
+        let n = self.bn;
+        for k in 0..n {
+            let p = self.bulk[k];
+            self.emit(p);
+        }
+        self.bn = 0;
+    }
+
+    /// Bulk mode: resolves and emits the oldest BULK_RUN queued copies (their
+    /// link-table slots were prefetched at least BULK_CAP - BULK_RUN copies
+    /// ago) and moves the rest to the front.
+    #[inline(never)]
+    fn bulk_run(&mut self) {
+        for k in 0..BULK_RUN {
+            let p = self.bulk[k];
+            self.emit(p);
+        }
+        self.bulk.copy_within(BULK_RUN..BULK_CAP, 0);
+        self.bn = BULK_CAP - BULK_RUN;
     }
 }
+
+const BULK_CAP: usize = 48;
+const BULK_RUN: usize = 32;
 
 impl EvSink for BSink<'_> {
     #[inline(always)]
@@ -990,7 +1018,20 @@ impl EvSink for BSink<'_> {
                     self.emit_hp(p, hp);
                     return;
                 }
+                if self.direct {
+                    // benchmark only: no ring, no lookup
+                    self.emit_hp(p, h);
+                    return;
+                }
                 self.lt.prefetch_h(h);
+                if self.use_bulk {
+                    self.bulk[self.bn] = p;
+                    self.bn += 1;
+                    if self.bn == BULK_CAP {
+                        self.bulk_run();
+                    }
+                    return;
+                }
                 if self.rn == BRING {
                     let old = self.ring[self.rh];
                     self.ring[self.rh] = p;
@@ -1046,6 +1087,9 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
             ring: [Pending::default(); BRING],
             rh: 0,
             rn: 0,
+            use_bulk: std::env::var("SS_RING").is_err(),
+            bulk: [Pending::default(); BULK_CAP],
+            bn: 0,
             tbase: ((t as u64) << (lb.qbits + lb.ibits)) as u32,
             overflow: false,
             lt,
@@ -1053,6 +1097,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits) -> 
             ps_bits: ctx.ps_bits,
             lb,
             nolookup: false,
+            direct: false,
             cache: PCache::new(),
         };
         let mut c: Parts<CRec> = Parts::with_wc(ps, cap_c, true);
@@ -1151,12 +1196,17 @@ fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocB
     }
 }
 
+/// Threads for a phase: SS_<NAME>_THREADS overrides (experiments), else all.
+fn phase_threads(name: &str, ctx: &Ctx) -> usize {
+    env_usize(&format!("SS_{}_THREADS", name)).filter(|&n| n > 0).unwrap_or(ctx.threads).min(ctx.threads.max(1))
+}
+
 fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) {
     let pe = 1usize << ctx.pe_bits;
     let mut order: Vec<(usize, usize)> = (0..pe).map(|p| (sb.iter().map(|t| t.a.len(p)).sum::<usize>(), p)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
-    par(ctx.threads, |_| {
+    par(phase_threads("DEDUP", ctx), |_| {
         let mut table: Vec<ARec> = Vec::new();
         let mut scratch: Vec<ARec> = Vec::new();
         let mut counts: Vec<usize> = Vec::new();
@@ -1835,7 +1885,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let clicks_in = load_input(&data_dir.join("clicks"), chunk);
     marks.mark("mmap");
     let est_lines = events_in.bytes / 75 + 1;
-    let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 10));
+    let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 12));
     let ps_bits = env_usize("SS_PS_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 16384).clamp(2, 10));
 
     let first_day = ws.div_euclid(DAY);
@@ -2294,8 +2344,10 @@ fn decomp_task<const AVX2: bool>(stage: u32, b: &[u8], task: Task, ctx: &Ctx, si
     let mut acc = 0u64;
     let end = b.as_ptr() as usize + b.len();
     match stage {
-        // split only
-        0 => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| acc += f[3].len() as u64),
+        // split only (all seven fields consumed)
+        0 => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
+            acc = acc.wrapping_add(f.iter().fold(0u64, |a, x| a.wrapping_mul(31).wrapping_add(x.len() as u64 ^ x.as_ptr() as u64)))
+        }),
         // + event id, + user id, + ts, + ingest
         1..=4 => scan::for_each_record_x::<7, _, AVX2>(b, task.start, task.end, |f| {
             if f[6].as_ptr() as usize + 32 > end || f[0].is_empty() || f[1].is_empty() {
@@ -2346,8 +2398,8 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
     let pe = 1usize << ctx.pe_bits;
     let ps = 1usize << ctx.ps_bits;
     let est = ev.bytes / 72 + 1;
-    let names = ["split", "+event_id", "+user_id", "+ts", "+ingest", "+type/product/price/valid", "+scatter(no lookup)", "+person lookup"];
-    for stage in 0..8u32 {
+    let names = ["split", "+event_id", "+user_id", "+ts", "+ingest", "+type/product/price/valid", "+scatter(no lookup)", "+person lookup", "(stage 5)+scatter direct, no ring"];
+    for stage in 0..9u32 {
         for &nt in &[1usize, ctx.threads] {
             let mut best = (f64::MAX, 0f64);
             for _ in 0..3 {
@@ -2361,6 +2413,9 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
                         ring: [Pending::default(); BRING],
                         rh: 0,
                         rn: 0,
+                        use_bulk: std::env::var("SS_BULK").is_ok(),
+                        bulk: [Pending::default(); BULK_CAP],
+                        bn: 0,
                         tbase: ((ti as u64) << (lb.qbits + lb.ibits)) as u32,
                         overflow: false,
                         lt: &lt,
@@ -2368,6 +2423,7 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
                         ps_bits: ctx.ps_bits,
                         lb,
                         nolookup: stage == 6,
+                        direct: stage == 8,
                         cache: PCache::new(),
                     };
                     let mut a = 0u64;
@@ -2541,6 +2597,9 @@ fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
         ring: [Pending::default(); BRING],
         rh: 0,
         rn: 0,
+        use_bulk: std::env::var("SS_BULK").is_ok(),
+        bulk: [Pending::default(); BULK_CAP],
+        bn: 0,
         tbase: 0,
         overflow: false,
         lt,
@@ -2548,6 +2607,7 @@ fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
         ps_bits: ctx.ps_bits,
         lb,
         nolookup: std::env::var("SS_BENCH_NOLOOKUP").is_ok(),
+        direct: false,
         cache: PCache::new(),
     };
     let mut reused = mk(&lt);
