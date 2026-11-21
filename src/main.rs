@@ -7,6 +7,7 @@ mod lookup;
 mod parquet;
 mod prof;
 mod cbench;
+mod fastev;
 mod sess;
 mod scan;
 mod sys;
@@ -606,8 +607,18 @@ fn event_line_slow<S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut S) {
 
 /// One chunk of events/: parse, validate, hand every copy to `sink`.
 /// `safe_end` is the end address of readable memory after `b` (>= its end).
+/// The line-local fast splitter (fastev.rs) when enabled, else the scanner.
 #[inline(always)]
 fn event_task<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
+    if fastev::ON.load(Ordering::Relaxed) {
+        return fastev::event_task_fast::<AVX2, S>(b, task, ctx, sink, safe_end);
+    }
+    event_task_scan::<AVX2, S>(b, task, ctx, sink, safe_end)
+}
+
+/// `event_task` on the general scanner.
+#[inline(always)]
+fn event_task_scan<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
     // The scanner calls one closure at a time; both reach the sink through
     // this pointer (no two live references to it).
     let sp: *mut S = sink;
@@ -718,6 +729,23 @@ fn click_task<const AVX2: bool, C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn event_task_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, e: &mut S, safe_end: usize) {
     event_task::<true, S>(b, task, ctx, e, safe_end)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn event_task_scan_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, e: &mut S, safe_end: usize) {
+    event_task_scan::<true, S>(b, task, ctx, e, safe_end)
+}
+
+/// `event_task_scan` with run-time SIMD dispatch.
+fn event_task_scan_any<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
+    if ctx.avx2 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            return event_task_scan_avx2(b, task, ctx, sink, safe_end);
+        }
+    }
+    event_task_scan::<false, S>(b, task, ctx, sink, safe_end)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2370,6 +2398,14 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         threads,
     };
     marks.mark("setup");
+    // event lines through the line-local fast splitter (SS_FASTEV=1), with
+    // SS_FASTK interleaved cursors per task
+    fastev::ON.store(std::env::var("SS_FASTEV").map_or(false, |v| v == "1"), Ordering::Relaxed);
+    fastev::CURSORS.store(env_usize("SS_FASTK").unwrap_or(1).clamp(1, 4), Ordering::Relaxed);
+    if std::env::var("SS_EVCHECK").is_ok() {
+        fastev::check(&events_in, &ctx);
+        std::process::exit(0);
+    }
     if std::env::var("SS_DECOMP").is_ok() {
         decomp_bench(&events_in, &links_in, &ctx);
         std::process::exit(0);
@@ -3259,12 +3295,42 @@ fn decomp_task<const AVX2: bool>(stage: u32, b: &[u8], task: Task, ctx: &Ctx, si
         // + type / product / price / validation (full line logic, null sink)
         5 => {
             let mut ns = NullSink(0);
-            event_task::<AVX2, _>(b, task, ctx, &mut ns, end);
+            event_task_scan::<AVX2, _>(b, task, ctx, &mut ns, end);
             acc = ns.0;
         }
         // + record scatter (dedup + session records, no person lookup), + lookup
         6..=8 => {
-            event_task::<AVX2, _>(b, task, ctx, sink, end);
+            event_task_scan::<AVX2, _>(b, task, ctx, sink, end);
+            sink.flush();
+        }
+        // fast splitter: 17 split, 18 +event id, 19 +user id, 20 +ts, 21 +ingest
+        // (as stages 0-4), 22 +type/product/price/valid (null sink), 23
+        // +scatter (no lookup), 24 +lookup (as stages 5-7)
+        17 => fastev::for_each_line::<AVX2, _>(b, task.start, task.end, end, fastev::CURSORS.load(Ordering::Relaxed), |f| {
+            acc = acc.wrapping_add(f.iter().fold(0u64, |a, x| a.wrapping_mul(31).wrapping_add(x.len() as u64 ^ x.as_ptr() as u64)))
+        }),
+        18..=21 => fastev::for_each_line::<AVX2, _>(b, task.start, task.end, end, fastev::CURSORS.load(Ordering::Relaxed), |f| {
+            if f[6].as_ptr() as usize + 32 > end || f[0].is_empty() || f[1].is_empty() {
+                return;
+            }
+            acc = acc.wrapping_add(keys::mix(unsafe { keys::key_of_wide(f[0]) }));
+            if stage >= 19 {
+                acc = acc.wrapping_add(unsafe { keys::key_of_wide(f[1]) });
+            }
+            if stage >= 20 {
+                acc = acc.wrapping_add(ctx.tsp.parse(f[2]).unwrap_or(0) as u64);
+            }
+            if stage >= 21 {
+                acc = acc.wrapping_add(ctx.tsp.parse(f[3]).unwrap_or(0) as u64);
+            }
+        }),
+        22 => {
+            let mut ns = NullSink(0);
+            fastev::event_task_fast::<AVX2, _>(b, task, ctx, &mut ns, end);
+            acc = ns.0;
+        }
+        23 | 24 => {
+            fastev::event_task_fast::<AVX2, _>(b, task, ctx, sink, end);
             sink.flush();
         }
         // batched: 9 split, 10 +ingest, 11 +eid, 12 +ts, 13 +valid/pay, 14 +user,
@@ -3327,11 +3393,19 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
         "B: +user_id column",
         "B: +scatter(no lookup)",
         "B: +person lookup",
+        "F: split",
+        "F: +event_id",
+        "F: +user_id",
+        "F: +ts",
+        "F: +ingest",
+        "F: +type/product/price/valid",
+        "F: +scatter(no lookup)",
+        "F: +person lookup",
     ];
     let stages: Vec<u32> = std::env::var("SS_DECOMP_STAGES")
         .ok()
         .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
-        .unwrap_or_else(|| (0..17).collect());
+        .unwrap_or_else(|| (0..25).collect());
     let prefault = std::env::var("SS_DECOMP_PREFAULT").is_ok();
     static PREF_NS: AtomicU64 = AtomicU64::new(0);
     for stage in stages {
@@ -3358,7 +3432,7 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
                         pe_bits: ctx.pe_bits,
                         ps_bits: ctx.ps_bits,
                         lb,
-                        nolookup: stage == 6 || stage == 15,
+                        nolookup: stage == 6 || stage == 15 || stage == 23,
                         direct: stage == 8,
                         cache: PCache::new(),
                         gt: None,
