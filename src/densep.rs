@@ -43,6 +43,8 @@ const BSHIFT: u32 = 16;
 const BSIZE: usize = 1 << BSHIFT;
 const VALID: u32 = 1 << 31;
 const PFLAG: u32 = 1 << 31;
+/// Winners per prefetch block in placement.
+const PF_BLOCK: usize = 16;
 
 /// Keys and bounds of a dense run.
 #[derive(Clone, Copy)]
@@ -359,9 +361,12 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     let klen: Vec<AtomicUsize> = (0..nb).map(|_| AtomicUsize::new(0)).collect();
     let nextb = AtomicUsize::new(0);
     super::par(threads, |_| {
-        let mut slot = vec![0u32; BSIZE];
-        let mut g: Vec<DE> = Vec::new();
-        let mut gp: Vec<DP> = Vec::new();
+        // slot i: the winning copy of event number (bucket base + i); its
+        // `n` field is reused for the purchase amount (0 until the purchase
+        // record is seen); occ: occupied slots
+        let mut slot = vec![DE::default(); BSIZE];
+        let mut occ = vec![0u64; BSIZE / 64];
+        let mut blk: Vec<(u32, u32, u32)> = Vec::with_capacity(PF_BLOCK);
         loop {
             let bi = nextb.fetch_add(1, Ordering::Relaxed);
             if bi >= nb {
@@ -370,47 +375,76 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             if boff[bi + 1] == boff[bi] {
                 continue;
             }
-            g.truncate(0);
-            gp.truncate(0);
             for o in &evo {
                 for sl in o.de.get(bi) {
-                    g.extend_from_slice(sl);
+                    for r in sl.iter() {
+                        let i = r.n as usize & (BSIZE - 1);
+                        let w = &mut occ[i >> 6];
+                        let m = 1u64 << (i & 63);
+                        // ties: equal-ingest copies are identical (rules),
+                        // keep the first
+                        if *w & m == 0 {
+                            *w |= m;
+                            slot[i] = DE { n: 0, ..*r };
+                        } else if r.ingest < slot[i].ingest {
+                            slot[i] = DE { n: 0, ..*r };
+                        }
+                    }
                 }
+            }
+            // purchase amounts of winning purchase copies (a purchase record
+            // with the winner's ingest is a copy identical to the winner)
+            for o in &evo {
                 for sl in o.dp.get(bi) {
-                    gp.extend_from_slice(sl);
+                    for r in sl.iter() {
+                        let i = r.n as usize & (BSIZE - 1);
+                        assert!(occ[i >> 6] & (1u64 << (i & 63)) != 0, "dense: purchase record without event");
+                        let w = &mut slot[i];
+                        if w.ingest == r.ingest && w.us & PFLAG != 0 {
+                            w.n = r.pay;
+                        }
+                    }
                 }
             }
-            for (i, r) in g.iter().enumerate() {
-                let s = &mut slot[r.n as usize & (BSIZE - 1)];
-                // ties: equal-ingest copies are identical, keep the first
-                if *s == 0 || r.ingest < g[*s as usize - 1].ingest {
-                    *s = i as u32 + 1;
-                }
-            }
-            gp.sort_unstable_by_key(|r| ((r.n as u64) << 32) | r.ingest as u64);
             // this bucket's region: boff[bi]..boff[bi + 1], written only here
             let out = unsafe { std::slice::from_raw_parts_mut((kptr as *mut SRec).add(boff[bi]), boff[bi + 1] - boff[bi]) };
             let mut k = 0usize;
-            for s in slot.iter_mut() {
-                if *s == 0 {
-                    continue;
+            // valid winners in number order, in blocks: prefetch the
+            // blocks' root-table entries, then resolve
+            let mut flush = |blk: &mut Vec<(u32, u32, u32)>, k: &mut usize| {
+                for &(us, ts, pay) in blk.iter() {
+                    out[*k] = SRec { person: person(us) as u64, ts, pay };
+                    *k += 1;
                 }
-                let r = g[*s as usize - 1];
-                *s = 0;
-                if r.ts & VALID == 0 {
-                    continue;
+                blk.clear();
+            };
+            for wi in 0..BSIZE / 64 {
+                let mut w = occ[wi];
+                occ[wi] = 0;
+                while w != 0 {
+                    let i = wi * 64 + w.trailing_zeros() as usize;
+                    w &= w - 1;
+                    let r = slot[i];
+                    if r.ts & VALID == 0 {
+                        continue;
+                    }
+                    let pay = if r.us & PFLAG != 0 {
+                        assert!(r.n != 0, "dense: purchase record missing");
+                        r.n
+                    } else {
+                        0
+                    };
+                    let us = r.us & !PFLAG;
+                    if (us as usize) < xbase {
+                        super::prefetch(&proot[us as usize] as *const AtomicU32 as *const u8);
+                    }
+                    blk.push((us, r.ts & !VALID, pay));
+                    if blk.len() == PF_BLOCK {
+                        flush(&mut blk, &mut k);
+                    }
                 }
-                let pay = if r.us & PFLAG != 0 {
-                    let key = ((r.n as u64) << 32) | r.ingest as u64;
-                    let j = gp.partition_point(|x| (((x.n as u64) << 32) | x.ingest as u64) < key);
-                    assert!(j < gp.len() && gp[j].n == r.n && gp[j].ingest == r.ingest, "dense: purchase record missing");
-                    gp[j].pay
-                } else {
-                    0
-                };
-                out[k] = SRec { person: person(r.us & !PFLAG) as u64, ts: r.ts & !VALID, pay };
-                k += 1;
             }
+            flush(&mut blk, &mut k);
             klen[bi].store(k, Ordering::Relaxed);
         }
     });
@@ -480,6 +514,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
             out
         })
     };
+    marks.mark("d.group1");
     let mut coff = vec![0usize; nbp + 1];
     for pb in 0..nbp {
         coff[pb + 1] = coff[pb] + cl2.iter().map(|o| o.len(pb)).sum::<usize>();
@@ -501,9 +536,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                 // regions written only by this bucket's iteration
                 let off = unsafe { std::slice::from_raw_parts_mut((iaddr as *mut u32).add(pb * 65537), 65537) };
                 let dst = unsafe { std::slice::from_raw_parts_mut((caddr as *mut Cl).add(coff[pb]), coff[pb + 1] - coff[pb]) };
-                for v in off.iter_mut() {
-                    *v = 0;
-                }
+                // (fresh arena memory: already zero)
                 for o in &cl2 {
                     for sl in o.get(pb) {
                         for c in sl.iter() {
@@ -701,6 +734,36 @@ fn arena_mut<T>(n: usize) -> &'static mut [T] {
 }
 
 // ---------------------------------------------------------------- parse tasks
+//
+// KERNEL INTERFACE (the two call sites in `run`, one per line kind):
+//
+//   ev_task_any(b, task, ctx, d, xm, &mut EvOut, safe_end)
+//   cl_task_any(b, task, ctx, d, xm, &mut Parts<DC>, nbc, safe_end)
+//
+// `b` the whole mapped file, `task` the byte range [start, end) of whole
+// lines (task.start at a line start), `safe_end` = b.as_ptr() + b.len()
+// (reads up to there are allowed). The per-line rules are ev_line /
+// the closure in cl_task_x; a replacement kernel must produce, for every
+// line, exactly what they produce (order inside a bucket is free):
+//
+// events (EvOut), for each line with a non-empty event_id and a parsable
+//   ingest time (other lines: nothing):
+//   - n = event number (unscramble(decode36(event_id), d.ke)); if
+//     n >= d.bound (or the ID is not canonical: n = u64::MAX) ->
+//     o.xe.push(XE { key: keys::key_of(event_id), ingest, valid, us, ts,
+//     pay }) (us/ts/pay 0 when not valid);
+//   - else into bucket n >> BSHIFT of o.de: valid copy DE { n, ingest,
+//     ts: ts | VALID, us: user_slot | (PFLAG if pay != 0) }, invalid copy
+//     DE { n, ingest, ts: 0, us: 0 }; a valid purchase also pushes
+//     DP { n, ingest, pay } into the same bucket of o.dp.
+//   valid = user and product non-empty, ts parsable and in [ws, we),
+//   event_pay accepts, ingest - ts <= LATE (main::event_line's rules).
+// clicks (Parts<DC>), for each line with non-empty click_id and user_id,
+//   ts parsable in [ws - WEEK, we), known campaign: DC { us: user_slot,
+//   camp, ts: ts - (ws - WEEK), ck: keys::key_of(click_id) } into bucket
+//   min(us >> 16, nbc - 1).
+// user_slot(user_id) = user_slot_w: exact for every string (exceptional
+// IDs are interned in `xm`).
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
