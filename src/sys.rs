@@ -17,6 +17,7 @@ const MAP_PRIVATE: i32 = 2;
 pub struct Mmap {
     ptr: *const u8,
     len: usize,
+    file: Option<File>,
 }
 
 unsafe impl Send for Mmap {}
@@ -27,13 +28,25 @@ impl Mmap {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
         if len == 0 {
-            return Ok(Mmap { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 });
+            return Ok(Mmap { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0, file: None });
         }
         let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
         if p as isize == -1 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Mmap { ptr: p as *const u8, len })
+        Ok(Mmap { ptr: p as *const u8, len, file: Some(file) })
+    }
+
+    /// Reads `buf.len()` bytes at offset `off` of the file with pread.
+    pub fn read_at(&self, buf: &mut [u8], off: usize) {
+        use std::os::unix::fs::FileExt;
+        if buf.is_empty() {
+            return;
+        }
+        if let Err(e) = self.file.as_ref().unwrap().read_exact_at(buf, off as u64) {
+            eprintln!("sessions: read failed: {}", e);
+            std::process::exit(3);
+        }
     }
 
     #[inline(always)]
@@ -77,6 +90,26 @@ pub fn thread_cpu_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// Wall clock (CLOCK_REALTIME) in ns since the Unix epoch.
+pub fn unix_ns() -> u64 {
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        clock_gettime(0, &mut ts);
+    }
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Process resource usage: (user ms, sys ms, minor faults, major faults,
+/// voluntary context switches, involuntary context switches).
+pub fn rusage() -> (f64, f64, i64, i64, i64, i64) {
+    let mut ru = [0i64; 18];
+    unsafe {
+        getrusage(0, &mut ru);
+    }
+    let ms = |s: i64, us: i64| s as f64 * 1e3 + us as f64 / 1e3;
+    (ms(ru[0], ru[1]), ms(ru[2], ru[3]), ru[8], ru[9], ru[16], ru[17])
+}
+
 /// Peak resident set size of the process, in MB.
 pub fn peak_rss_mb() -> u64 {
     let mut ru = [0i64; 18];
@@ -112,10 +145,29 @@ pub fn alloc_arena(bytes: usize) -> *mut u8 {
         std::process::exit(3);
     }
     #[cfg(target_os = "linux")]
-    unsafe {
-        madvise(p, bytes, 14); // MADV_HUGEPAGE
+    if !NOHUGE.load(std::sync::atomic::Ordering::Relaxed) {
+        unsafe {
+            madvise(p, bytes, 14); // MADV_HUGEPAGE
+        }
     }
     #[cfg(not(target_os = "linux"))]
     let _ = madvise;
+    ARENAS.lock().unwrap().push((p as usize, bytes));
     p as *mut u8
+}
+
+/// Experiment switch (SS_NOHUGE): no MADV_HUGEPAGE on arenas.
+pub static NOHUGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ARENAS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Every arena as (address, length).
+pub fn arenas() -> Vec<(usize, usize)> {
+    ARENAS.lock().unwrap().clone()
+}
+
+/// Releases the pages of [addr, addr + len) (MADV_DONTNEED).
+pub fn release(addr: usize, len: usize) {
+    unsafe {
+        madvise(addr as *mut c_void, len, 4);
+    }
 }

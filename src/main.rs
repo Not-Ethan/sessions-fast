@@ -234,13 +234,21 @@ fn par<R: Send>(threads: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
 struct Marks {
     t0: Instant,
     prev: Instant,
-    items: Vec<(&'static str, f64, f64, f64)>,
+    /// Wall clock at main() entry (ns since the epoch), for measuring exec and
+    /// teardown latency from outside the process.
+    unix0: u64,
+    verbose: bool,
+    /// minor faults at the previous mark (verbose only)
+    flt: i64,
+    items: Vec<(&'static str, f64, f64, f64, i64)>,
 }
 
 impl Marks {
-    fn new() -> Self {
+    fn new(verbose: bool) -> Self {
+        let unix0 = sys::unix_ns();
         let t = Instant::now();
-        Marks { t0: t, prev: t, items: Vec::new() }
+        let flt = if verbose { sys::rusage().2 } else { 0 };
+        Marks { t0: t, prev: t, unix0, verbose, flt, items: Vec::new() }
     }
     fn mark(&mut self, name: &'static str) {
         if std::env::var("SS_STOP").map_or(false, |v| v == name) {
@@ -249,14 +257,32 @@ impl Marks {
         let now = Instant::now();
         let cpu = PHASE_CPU_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
         let mx = PHASE_MAX_NS.swap(0, Ordering::Relaxed) as f64 / 1e6;
-        self.items.push((name, (now - self.prev).as_secs_f64() * 1e3, cpu, mx));
+        let mut df = 0;
+        if self.verbose {
+            let f = sys::rusage().2;
+            df = f - self.flt;
+            self.flt = f;
+        }
+        self.items.push((name, (now - self.prev).as_secs_f64() * 1e3, cpu, mx, df));
         self.prev = now;
     }
     fn report(&self) -> String {
         let mut s = format!("total={:.1}ms |", self.t0.elapsed().as_secs_f64() * 1e3);
-        for (n, w, c, m) in &self.items {
-            s.push_str(&format!(" {}={:.1}ms(cpu {:.0}/max {:.0})", n, w, c, m));
+        for (n, w, c, m, f) in &self.items {
+            s.push_str(&format!(" {}={:.1}ms(cpu {:.0}/max {:.0} flt {})", n, w, c, m, f));
         }
+        let (ut, st, minf, majf, nvcsw, nivcsw) = sys::rusage();
+        s.push_str(&format!(
+            " | rusage user={:.0}ms sys={:.0}ms minflt={} majflt={} vcsw={} ivcsw={} | unix_start_ns={} unix_end_ns={}",
+            ut,
+            st,
+            minf,
+            majf,
+            nvcsw,
+            nivcsw,
+            self.unix0,
+            sys::unix_ns()
+        ));
         s
     }
 }
@@ -483,8 +509,13 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
     let cell: std::sync::OnceLock<LinkTable> = std::sync::OnceLock::new();
     let (f1, f2) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let ready = std::sync::atomic::AtomicBool::new(false);
+    // Experiment (SS_READ): pread each chunk into a per-thread buffer instead
+    // of reading the file mapping.
+    let use_read = std::env::var("SS_READ").is_ok();
+    let max_task = ev.tasks.iter().chain(cl.tasks.iter()).map(|t| t.end - t.start).max().unwrap_or(0);
     let outs = par(ctx.threads, |t| {
         let mut out = ParseOut { e: Parts::new(pe, cap_e), c: Parts::new(ps, cap_c) };
+        let mut rbuf: Vec<u8> = if use_read { vec![0u8; max_task] } else { Vec::new() };
         if t < nl {
             link_worker(t, links_in, &lnext, &pairs, &bar, &cell, &f1, &f2);
             if t == 0 {
@@ -497,8 +528,14 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
                 break;
             }
             if i < ev.tasks.len() {
-                let task = ev.tasks[i];
-                let b = ev.maps[task.file as usize].bytes();
+                let mut task = ev.tasks[i];
+                let mut b = ev.maps[task.file as usize].bytes();
+                if use_read {
+                    let n = task.end - task.start;
+                    ev.maps[task.file as usize].read_at(&mut rbuf[..n], task.start);
+                    b = &rbuf[..n];
+                    task = Task { file: task.file, start: 0, end: n };
+                }
                 if avx2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
@@ -512,8 +549,14 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
                     std::thread::yield_now();
                 }
                 let lt = cell.get().unwrap();
-                let task = cl.tasks[i - ev.tasks.len()];
-                let b = cl.maps[task.file as usize].bytes();
+                let mut task = cl.tasks[i - ev.tasks.len()];
+                let mut b = cl.maps[task.file as usize].bytes();
+                if use_read {
+                    let n = task.end - task.start;
+                    cl.maps[task.file as usize].read_at(&mut rbuf[..n], task.start);
+                    b = &rbuf[..n];
+                    task = Task { file: task.file, start: 0, end: n };
+                }
                 if avx2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
@@ -1199,7 +1242,8 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .min(64);
     let verbose = std::env::var("SS_VERBOSE").is_ok();
-    let mut marks = Marks::new();
+    sys::NOHUGE.store(std::env::var("SS_NOHUGE").is_ok(), Ordering::Relaxed);
+    let mut marks = Marks::new(verbose);
 
     // manifest + lookups
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).unwrap_or_else(|e| fail(&format!("manifest: {}", e)));
@@ -1303,6 +1347,27 @@ fn main() {
     marks.mark("sessions");
     write_campaign_daily(&cd.join("part-0.parquet"), &souts, &ctx);
     marks.mark("write");
+    if std::env::var("SS_FREE").is_ok() {
+        // Experiment: release arena pages on all threads (MADV_DONTNEED takes
+        // the mmap lock shared) so that the kernel's single-threaded exit
+        // teardown has less to free.
+        let mut pieces = Vec::new();
+        for (a, l) in sys::arenas() {
+            let mut o = 0;
+            while o < l {
+                let n = (l - o).min(64 << 20);
+                pieces.push((a + o, n));
+                o += n;
+            }
+        }
+        let nx = AtomicUsize::new(0);
+        par(threads, |_| loop {
+            let i = nx.fetch_add(1, Ordering::Relaxed);
+            let Some(&(a, l)) = pieces.get(i) else { break };
+            sys::release(a, l);
+        });
+        marks.mark("free");
+    }
 
     if verbose {
         let rows: usize = souts.iter().map(|s| s.nrows).sum();
