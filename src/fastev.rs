@@ -38,6 +38,9 @@ pub static CURSORS: AtomicUsize = AtomicUsize::new(1);
 pub static DEC: AtomicBool = AtomicBool::new(false);
 /// With DEC: event ts through `ts_sel` (SS_FASTSEL=1).
 pub static SEL: AtomicBool = AtomicBool::new(false);
+/// With DEC and AVX2: event_id and user_id packed together (`pack2_avx2`,
+/// SS_FASTPK=1).
+pub static PK: AtomicBool = AtomicBool::new(false);
 
 /// Lines handed to the general scanner by `slow_line` (statistics).
 pub static SLOW: AtomicUsize = AtomicUsize::new(0);
@@ -544,20 +547,77 @@ fn ts_sel(tsp: &ts::TsParser, days: &Days, b: &[u8]) -> Option<i64> {
     }
 }
 
+/// `keys::pack_wide` of two strings at once, one per 128-bit lane: the same
+/// operations lane by lane, so the same keys. 16 bytes from the start of
+/// each must be readable.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn pack2_avx2(a: &[u8], b: &[u8]) -> (Option<u64>, Option<u64>) {
+    use std::arch::x86_64::*;
+    let (na, nb) = (a.len(), b.len());
+    let v = _mm256_inserti128_si256::<1>(
+        _mm256_castsi128_si256(_mm_loadu_si128(a.as_ptr() as *const __m128i)),
+        _mm_loadu_si128(b.as_ptr() as *const __m128i),
+    );
+    let idx = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let nv = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_set1_epi8(na as i8)), _mm_set1_epi8(nb as i8));
+    let inlen = _mm256_cmpgt_epi8(nv, idx);
+    let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), _mm256_set1_epi8(0x0F));
+    let lo = _mm256_and_si256(v, _mm256_set1_epi8(0x0F));
+    let lut_hi = _mm256_setr_epi8(0, 0, 1, 2, 4, 8, 4, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 4, 16, 0, 0, 0, 0, 0, 0, 0, 0);
+    let lut_lo = _mm256_setr_epi8(
+        26, 30, 30, 30, 30, 30, 30, 30, 30, 30, 28, 4, 4, 5, 4, 12, 26, 30, 30, 30, 30, 30, 30, 30, 30, 30, 28, 4, 4, 5, 4, 12,
+    );
+    let cls = _mm256_and_si256(_mm256_shuffle_epi8(lut_hi, hi), _mm256_shuffle_epi8(lut_lo, lo));
+    let invalid = _mm256_and_si256(_mm256_cmpeq_epi8(cls, _mm256_setzero_si256()), inlen);
+    let off = _mm256_shuffle_epi8(
+        _mm256_setr_epi8(
+            0, 0, -0x2D, -0x2F, -0x36, -0x36, -0x3B, -0x3B, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -0x2D, -0x2F, -0x36, -0x36, -0x3B, -0x3B, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ),
+        hi,
+    );
+    let us = _mm256_and_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(0x5F)), _mm256_set1_epi8(-4));
+    let codes = _mm256_and_si256(_mm256_add_epi8(_mm256_add_epi8(v, off), us), inlen);
+    let t = _mm256_maddubs_epi16(codes, _mm256_set1_epi16(0x0140));
+    let u = _mm256_madd_epi16(t, _mm256_set1_epi32(0x0001_1000));
+    let l = |x: i32| x as u32 as u64;
+    let (l0, l1, l2) = (l(_mm256_extract_epi32::<0>(u)), l(_mm256_extract_epi32::<1>(u)), l(_mm256_extract_epi32::<2>(u)));
+    let (l4, l5, l6) = (l(_mm256_extract_epi32::<4>(u)), l(_mm256_extract_epi32::<5>(u)), l(_mm256_extract_epi32::<6>(u)));
+    let ka = (((l0 << 36) | (l1 << 12) | (l2 >> 12)) << 4) | na as u64;
+    let kb = (((l4 << 36) | (l5 << 12) | (l6 >> 12)) << 4) | nb as u64;
+    let mm = _mm256_movemask_epi8(invalid) as u32;
+    let oka = ((mm & 0xFFFF) == 0) & (na.wrapping_sub(1) < 10);
+    let okb = ((mm >> 16) == 0) & (nb.wrapping_sub(1) < 10);
+    (if oka { Some(ka) } else { None }, if okb { Some(kb) } else { None })
+}
+
 /// `event_line::<true>` for a fast-path line (f[0] non-empty, 32 readable
-/// bytes from every field start), with `ts_fast` for both timestamps. Same
-/// steps, same order, same results.
+/// bytes from every field start), with `ts_fast` for both timestamps
+/// (`ts_sel` for ts if `sel`) and, if `pk` (AVX2 only), both IDs packed
+/// together. Same steps, same order, same results.
 #[inline(always)]
-fn event_fast<S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, days: &Days, sink: &mut S) {
+fn event_fast<const AVX2: bool, S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, days: &Days, sink: &mut S, sel: bool, pk: bool) {
     let (ws, we) = (ctx.ws, ctx.we);
     let Some(ing) = ts_fast(&ctx.tsp, days, f[3]) else { return };
-    let eid = keys::mix(unsafe { keys::key_of_wide(f[0]) });
+    #[allow(unused_mut)]
+    let (mut ka, mut kb) = (None, None);
+    #[cfg(target_arch = "x86_64")]
+    if AVX2 && pk {
+        (ka, kb) = unsafe { pack2_avx2(f[0], f[1]) };
+    }
+    let _ = pk;
+    let eid = keys::mix(match ka {
+        Some(k) => k,
+        None => unsafe { keys::key_of_wide(f[0]) },
+    });
     let ingest = ingest_rel(ing, ctx.ws_s);
     let valid = 'v: {
         if f[1].is_empty() || f[5].is_empty() {
             break 'v None;
         }
-        let t = if SEL.load(Ordering::Relaxed) { ts_sel(&ctx.tsp, days, f[2]) } else { ts_fast(&ctx.tsp, days, f[2]) };
+        let t = if sel { ts_sel(&ctx.tsp, days, f[2]) } else { ts_fast(&ctx.tsp, days, f[2]) };
         let Some(t) = t else { break 'v None };
         if t < ws || t >= we {
             break 'v None;
@@ -566,7 +626,10 @@ fn event_fast<S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, days: &Days, sink: &mut S) {
         if ing - t > LATE {
             break 'v None;
         }
-        let user = unsafe { keys::key_of_wide(f[1]) };
+        let user = match kb {
+            Some(k) => k,
+            None => unsafe { keys::key_of_wide(f[1]) },
+        };
         Some((user, (t - ws) as u32, pay))
     };
     sink.copy(eid, ingest, valid);
@@ -622,6 +685,7 @@ fn event_task_dec<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, 
     // the box lives in this thread's slot until a later task with another
     // window replaces it; this task is done with it by then
     let days = unsafe { &*days };
+    let (sel, pk) = (SEL.load(Ordering::Relaxed), PK.load(Ordering::Relaxed));
     let sp: *mut S = sink;
     for_each_line2::<AVX2, _, _>(
         b,
@@ -632,7 +696,7 @@ fn event_task_dec<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, 
         #[inline(always)]
         |f| {
             if !f[0].is_empty() {
-                event_fast(f, ctx, days, unsafe { &mut *sp });
+                event_fast::<AVX2, S>(f, ctx, days, unsafe { &mut *sp }, sel, pk);
             }
         },
         |f| {
@@ -684,6 +748,7 @@ pub fn check(ev: &super::Input, ctx: &Ctx) {
     let saved = CURSORS.load(Ordering::Relaxed);
     let saved_dec = DEC.load(Ordering::Relaxed);
     let saved_sel = SEL.load(Ordering::Relaxed);
+    let saved_pk = PK.load(Ordering::Relaxed);
     let mut lines = 0usize;
     let mut copies = 0usize;
     for task in &ev.tasks {
@@ -693,10 +758,13 @@ pub fn check(ev: &super::Input, ctx: &Ctx) {
         super::event_task_scan_any(b, *task, ctx, &mut want, safe_end);
         lines += b[task.start..task.end].iter().filter(|&&c| c == b'\n').count();
         copies += want.0.len();
-        for (k, dec, sel) in [(1, false, false), (2, false, false), (1, true, false), (2, true, false), (1, true, true)] {
+        for (k, dec, sel, pk) in
+            [(1, false, false, false), (2, false, false, false), (1, true, false, false), (2, true, false, false), (1, true, true, false), (1, true, false, true), (2, true, true, true)]
+        {
             CURSORS.store(k, Ordering::Relaxed);
             DEC.store(dec, Ordering::Relaxed);
             SEL.store(sel, Ordering::Relaxed);
+            PK.store(pk, Ordering::Relaxed);
             let mut got = RecSink::default();
             task_fast_any(b, *task, ctx, &mut got, safe_end);
             let same = if k == 1 {
@@ -709,7 +777,7 @@ pub fn check(ev: &super::Input, ctx: &Ctx) {
                 a == w
             };
             if !same {
-                eprintln!("evcheck: MISMATCH file {} [{}, {}) cursors {} dec {} sel {} ({} vs {} copies)", task.file, task.start, task.end, k, dec, sel, got.0.len(), want.0.len());
+                eprintln!("evcheck: MISMATCH file {} [{}, {}) cursors {} dec {} sel {} pk {} ({} vs {} copies)", task.file, task.start, task.end, k, dec, sel, pk, got.0.len(), want.0.len());
                 std::process::exit(1);
             }
         }
@@ -717,13 +785,14 @@ pub fn check(ev: &super::Input, ctx: &Ctx) {
     CURSORS.store(saved, Ordering::Relaxed);
     DEC.store(saved_dec, Ordering::Relaxed);
     SEL.store(saved_sel, Ordering::Relaxed);
+    PK.store(saved_pk, Ordering::Relaxed);
     eprintln!(
-        "evcheck: OK {} tasks, {} lines, {} copies identical (cursors 1-2, event_line and event_fast, avx2={}); {} lines took the general path",
+        "evcheck: OK {} tasks, {} lines, {} copies identical (cursors 1-2, event_line and event_fast variants, avx2={}); {} lines took the general path",
         ev.tasks.len(),
         lines,
         copies,
         ctx.avx2,
-        SLOW.load(Ordering::Relaxed) / 5
+        SLOW.load(Ordering::Relaxed) / 7
     );
 }
 
@@ -1009,6 +1078,45 @@ mod tests {
             }
         }
         assert!(hits > 100_000, "{}", hits);
+    }
+
+    /// `pack2_avx2` gives `keys::pack` of each string, whatever follows it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pack2_matches_pack() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut r = rng(0x9AC2);
+        let alpha: &[u8] = b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        let one = |r: &mut dyn FnMut() -> u64| -> Vec<u8> {
+            let n = (r() % 14) as usize;
+            (0..n)
+                .map(|_| {
+                    let x = r();
+                    match x % 8 {
+                        0 => (x >> 8) as u8,
+                        1 => alpha[((x >> 8) % 64) as usize].wrapping_add(((x >> 16) % 3) as u8).wrapping_sub(1),
+                        _ => alpha[((x >> 8) % 64) as usize],
+                    }
+                })
+                .collect()
+        };
+        let mut ok = 0u64;
+        for round in 0..2_000_000u64 {
+            let a = one(&mut r);
+            let b = one(&mut r);
+            let mut buf = a.clone();
+            buf.extend((0..20).map(|_| if round % 2 == 0 { (r() & 0xFF) as u8 } else { alpha[(r() % 64) as usize] }));
+            let off = buf.len();
+            buf.extend_from_slice(&b);
+            buf.extend((0..20).map(|_| (r() & 0xFF) as u8));
+            let (ka, kb) = unsafe { pack2_avx2(&buf[..a.len()], &buf[off..off + b.len()]) };
+            assert_eq!(ka, keys::pack(&a), "{:?}", a);
+            assert_eq!(kb, keys::pack(&b), "{:?}", b);
+            ok += ka.is_some() as u64;
+        }
+        assert!(ok > 500_000, "{}", ok);
     }
 
     /// Every single-byte change of a well-formed line, at every position,
