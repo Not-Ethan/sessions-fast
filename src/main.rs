@@ -774,7 +774,7 @@ fn click_task<const AVX2: bool, C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &
         }
         let user = if wide { unsafe { keys::key_of_wide(f[1]) } } else { keys::key_of(f[1]) };
         let h = keys::mix(user);
-        let ck = keys::click_ref(task.file, b.as_ptr(), f[0]);
+        let ck = keys::click_key(task.file, b.as_ptr(), f[0], wide);
         if let Some(hp) = cache.get(user, h) {
             c.push_click((hp >> (64 - ctx.ps_bits)) as usize, CRec { person: hp, ck, ts: (t - cws) as u32, camp: camp as u32, _pad: 0 });
             return;

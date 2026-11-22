@@ -794,40 +794,45 @@ fn stack_string(k: u64, out: &mut [u8; 33]) -> usize {
     }
 }
 
-// ---------------------------------------------------------------- click references
+// ---------------------------------------------------------------- click keys
 //
 // A click_id is only ever compared, byte-wise, to break a tie between two
-// clicks with the same ts, which is rare. So clicks carry a reference to the
-// click_id's bytes in the input instead of a key: (file, length, offset) of
-// the unquoted field in the click file mapping, which stays mapped for the
-// whole run (pages dropped after parsing are read back from the file). A tie
-// compares the bytes themselves: exact for every shape, quoted or not. Fields
-// that do not fit the encoding are copied to a side table (file 4095).
+// clicks with the same ts. A click_id that packs (keys::pack: at most 10
+// bytes of the 64-symbol alphabet) is carried as its packed key (low 4 bits
+// 1..=10, numeric order = byte order, equal iff the strings are equal).
+// Any other click_id (the 33-byte hex form, odd shapes) is carried as a
+// reference to its bytes in the input: ((file, length, offset) << 4, low 4
+// bits 0) into the click file mapping, which stays mapped for the whole run
+// (pages dropped after parsing are read back from the file); fields that do
+// not fit the encoding are copied to a side table (file 1023). Such click IDs
+// are never hashed or logged. A comparison involving a reference compares the
+// bytes: exact for every shape, quoted or not.
 
 /// (base address, length) of every click file mapping of the current run.
-static CMAPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static CMAPS_PTR: std::sync::atomic::AtomicPtr<Vec<(usize, usize)>> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static CSIDE: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-const CREF_SIDE: u64 = 4095;
+const CREF_SIDE: u64 = 1023;
 
 /// The click file mappings of this run (main::run, before the clicks are parsed).
 pub fn set_click_maps(maps: Vec<(usize, usize)>) {
-    let mut g = CMAPS.lock().unwrap();
-    *g = maps;
-    // a leaked snapshot for lock-free reads (a few per run)
-    let p = Box::into_raw(Box::new(g.clone()));
+    // a leaked snapshot for lock-free reads
+    let p = Box::into_raw(Box::new(maps));
     CMAPS_PTR.store(std::hint::black_box(p), AO::Release);
     CSIDE.lock().unwrap().clear();
 }
 
-/// The reference of click_id field `f` (non-empty) of click file `file`,
-/// whose mapping starts at `base`.
+/// The click key of click_id field `f` (non-empty) of click file `file`,
+/// whose mapping starts at `base`; `wide`: 16 bytes from `f` are readable.
 #[inline(always)]
-pub fn click_ref(file: u32, base: *const u8, f: &[u8]) -> u64 {
+pub fn click_key(file: u32, base: *const u8, f: &[u8], wide: bool) -> u64 {
+    let k = if wide { unsafe { pack_wide(f) } } else { pack(f) };
+    if let Some(k) = k {
+        return k;
+    }
     let off = f.as_ptr() as usize - base as usize;
     let len = f.len();
-    if (file as u64) < CREF_SIDE && len < 4096 && (off as u64) < (1 << 40) {
-        ((file as u64) << 52) | ((len as u64) << 40) | off as u64
+    if (file as u64) < CREF_SIDE && len < 1024 && (off as u64) < (1 << 40) {
+        (((file as u64) << 50) | ((len as u64) << 40) | off as u64) << 4
     } else {
         click_ref_side(f)
     }
@@ -838,32 +843,47 @@ pub fn click_ref(file: u32, base: *const u8, f: &[u8]) -> u64 {
 fn click_ref_side(f: &[u8]) -> u64 {
     let mut g = CSIDE.lock().unwrap();
     g.push(f.to_vec());
-    (CREF_SIDE << 52) | (g.len() as u64 - 1)
+    ((CREF_SIDE << 50) | (g.len() as u64 - 1)) << 4
 }
 
-/// Byte-wise order of the click_ids behind two references.
-#[cold]
+/// Byte-wise order of the click_ids behind two click keys.
+#[inline(always)]
 pub fn click_cmp(a: u64, b: u64) -> Ordering {
     if a == b {
         return Ordering::Equal;
     }
-    let side = CSIDE.lock().unwrap();
+    if (a & 0xF != 0) & (b & 0xF != 0) {
+        // both packed
+        return a.cmp(&b);
+    }
+    click_cmp_bytes(a, b)
+}
+
+#[cold]
+#[inline(never)]
+fn click_cmp_bytes(a: u64, b: u64) -> Ordering {
     let maps = unsafe { &*CMAPS_PTR.load(AO::Acquire) };
-    let bytes = |h: u64| -> &[u8] {
-        let file = h >> 52;
-        if file == CREF_SIDE {
-            let s: &[u8] = &side[(h & ((1 << 52) - 1)) as usize];
-            // the side table outlives this call (cleared only at the next run)
-            unsafe { std::slice::from_raw_parts(s.as_ptr(), s.len()) }
-        } else {
-            let (base, mlen) = maps[file as usize];
-            let len = ((h >> 40) & 4095) as usize;
-            let off = (h & ((1 << 40) - 1)) as usize;
-            assert!(off + len <= mlen, "click reference outside its file");
-            unsafe { std::slice::from_raw_parts((base + off) as *const u8, len) }
+    let side = CSIDE.lock().unwrap();
+    let (mut ba, mut bb) = ([0u8; 33], [0u8; 33]);
+    let bytes = |h: u64, buf: &mut [u8; 33]| -> Vec<u8> {
+        if h & 0xF != 0 {
+            let n = stack_string(h, buf);
+            return buf[..n].to_vec();
         }
+        let r = h >> 4;
+        let file = r >> 50;
+        if file == CREF_SIDE {
+            return side[(r & ((1 << 50) - 1)) as usize].clone();
+        }
+        let (base, mlen) = maps[file as usize];
+        let len = ((r >> 40) & 1023) as usize;
+        let off = (r & ((1 << 40) - 1)) as usize;
+        assert!(off + len <= mlen, "click reference outside its file");
+        unsafe { std::slice::from_raw_parts((base + off) as *const u8, len) }.to_vec()
     };
-    bytes(a).cmp(bytes(b))
+    let x = bytes(a, &mut ba);
+    let y = bytes(b, &mut bb);
+    x.cmp(&y)
 }
 
 /// A well-mixed 64-bit hash of a key (splitmix64 finalizer, a bijection).
@@ -1118,12 +1138,13 @@ mod tests {
             buf.extend_from_slice(b"\",\n");
         }
         set_click_maps(vec![(buf.as_ptr() as usize, buf.len())]);
-        let refs: Vec<u64> = pos.iter().map(|&(o, n)| click_ref(0, buf.as_ptr(), &buf[o..o + n])).collect();
-        // a file index beyond the encoding goes to the side table
-        let side = click_ref(5000, buf.as_ptr(), &buf[pos[0].0..pos[0].0 + pos[0].1]);
+        let refs: Vec<u64> = pos.iter().map(|&(o, n)| click_key(0, buf.as_ptr(), &buf[o..o + n], false)).collect();
+        // a file index beyond the encoding goes to the side table (a short
+        // id is packed: use a long one)
+        let side = click_key(5000, buf.as_ptr(), &buf[pos[4].0..pos[4].0 + pos[4].1], false);
         for i in 0..refs.len() {
             let si = &buf[pos[i].0..pos[i].0 + pos[i].1];
-            assert_eq!(click_cmp(refs[i], side), si.cmp(&ids[0][..]));
+            assert_eq!(click_cmp(refs[i], side), si.cmp(&ids[2][..]));
             for j in 0..refs.len() {
                 let sj = &buf[pos[j].0..pos[j].0 + pos[j].1];
                 assert_eq!(click_cmp(refs[i], refs[j]), si.cmp(sj), "{} {}", i, j);
