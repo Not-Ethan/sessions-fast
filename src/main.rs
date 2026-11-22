@@ -2926,10 +2926,11 @@ fn main() {
     if std::env::var("SS_DIAG").is_ok() {
         diag(&data_dir);
     }
-    let threads = env_usize("NCPU")
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
-        .min(64);
+    // NCPU, but never more threads than the CPUs this process may run on
+    // (available_parallelism honours affinity and the cgroup quota): more
+    // runnable threads than the quota would be throttled
+    let avail = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let threads = env_usize("NCPU").filter(|&n| n > 0).unwrap_or(avail).min(avail).min(64);
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     keys::long_settings();
     let mut report = run(&data_dir, &out_dir, threads, verbose);
