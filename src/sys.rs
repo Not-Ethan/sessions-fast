@@ -170,6 +170,21 @@ pub fn alloc_arena(bytes: usize) -> *mut u8 {
     p as *mut u8
 }
 
+/// Experiment (SS_POPW=1): parse arenas are populated for writing in one
+/// call by the thread that owns them (MADV_POPULATE_WRITE, Linux 5.14+)
+/// instead of one fault per page in the hot loop.
+pub static POPW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Populates [addr, addr + len) for writing (errors ignored).
+pub fn populate_write(addr: usize, len: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        madvise(addr as *mut c_void, len, 23);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (addr, len);
+}
+
 thread_local! {
     static LABEL: std::cell::Cell<&'static str> = const { std::cell::Cell::new("other") };
 }

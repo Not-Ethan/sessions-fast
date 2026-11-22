@@ -60,6 +60,9 @@ impl<T: Copy> Parts<T> {
         }
         let bytes = nparts * cap * std::mem::size_of::<T>();
         let arena = crate::sys::alloc_arena(bytes) as *mut T;
+        if wc && crate::sys::POPW.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::sys::populate_write(arena as usize, bytes);
+        }
         Parts {
             arena,
             cap,
