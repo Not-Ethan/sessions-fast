@@ -2532,6 +2532,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     fastev::ON.store(std::env::var("SS_FASTEV").map_or(true, |v| v != "0"), Ordering::Relaxed);
     // click lines through the one-window splitter unless SS_CLICKFAST=0
     fastev::CLICKS.store(std::env::var("SS_CLICKFAST").map_or(true, |v| v != "0"), Ordering::Relaxed);
+    // software prefetch distance of the line splitters (SS_PFDIST bytes, 0 = off)
+    if let Some(d) = env_usize("SS_PFDIST") {
+        fastev::PF_DIST.store(d, Ordering::Relaxed);
+    }
     // 128-byte splitters for lines with long IDs unless SS_WIDECUT=0
     fastev::WIDE.store(std::env::var("SS_WIDECUT").map_or(true, |v| v != "0"), Ordering::Relaxed);
     if std::env::var("SS_CLICKCHECK").is_ok() {

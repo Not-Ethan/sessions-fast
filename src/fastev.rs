@@ -48,6 +48,9 @@ pub static CWIDE_N: AtomicUsize = AtomicUsize::new(0);
 /// SLOW / CSLOW are counted only while set (the checks): a shared counter
 /// bumped by every thread for every slow line costs far more than the line.
 pub static COUNT_SLOW: AtomicBool = AtomicBool::new(false);
+/// Software prefetch distance (bytes ahead of the current line) for the
+/// line splitters; 0 = none (SS_PFDIST, default 1024).
+pub static PF_DIST: AtomicUsize = AtomicUsize::new(1024);
 /// The 128-byte splitters for lines the 64-byte windows cannot cut (long
 /// IDs, scorer version 5) unless SS_WIDECUT=0.
 pub static WIDE: AtomicBool = AtomicBool::new(true);
@@ -401,10 +404,16 @@ pub fn for_each_line2<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FR: FnMut
     let lim_w = b.len().saturating_sub(MARGIN_W);
     let wide = WIDE.load(Ordering::Relaxed) && b.len() >= MARGIN_W;
     let base = b.as_ptr();
+    let pf = PF_DIST.load(Ordering::Relaxed);
+    // prefetch addresses stay inside b (a prefetch never faults, but keep it tidy)
+    let pf_lim = (base as usize + b.len()).saturating_sub(64);
     let mut off = start;
     while off < end && off <= lim {
         unsafe {
             let p = base.add(off);
+            if pf != 0 {
+                super::prefetch((p as usize + pf).min(pf_lim) as *const u8);
+            }
             let c = cut::<AVX2>(p);
             if c.ok {
                 ff(&fields(p, &c));
@@ -538,10 +547,15 @@ pub fn for_each_click<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 4])>(b: &'a [u8
     let lim_w = b.len().saturating_sub(MARGIN_CW);
     let wide = WIDE.load(Ordering::Relaxed) && b.len() >= MARGIN_CW;
     let base = b.as_ptr();
+    let pf = PF_DIST.load(Ordering::Relaxed);
+    let pf_lim = (base as usize + b.len()).saturating_sub(64);
     let mut off = start;
     while off < end && off <= lim {
         unsafe {
             let p = base.add(off);
+            if pf != 0 {
+                super::prefetch((p as usize + pf).min(pf_lim) as *const u8);
+            }
             let c = cut4::<AVX2>(p);
             if c.ok {
                 f(&fields4(p, &c));
