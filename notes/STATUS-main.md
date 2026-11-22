@@ -1,16 +1,15 @@
 # STATUS of the main engineer (branch ss-opt4, worktree .claude/worktrees/opt4)
 
-Updated: Sun 05:00 ET.
+Updated: Sun 05:20 ET.
 
 ## Now
-- Tags: ss-milestone-18 = 1651a22 (real scorer 0.9154 s), ss-milestone-19 = c870b9c (0.8278 s).
-- m20 candidate = c7c5560: m19 + #8 (e7b9c10) + #10 (d143e10) + #9 reverted (no gain, orchestrator) +
-  7fa2005 (one AVX2 probe: links.rs calls k5::probe_view) + 6b2a0c5 (overflow-line statistic per Parts,
-  not a contended global atomic; line_over was 1.6% of perf samples). #18 to be added when confirmed.
-- m21 candidate = 2d599cd lean sink (panel row 5; SS_LEAN=0 = BSink) + 9a0a833 (SS_SUBB experiment).
-- Queued on ss-bench (sess1.sh): images x9/x10/x11, PGO experiment (pgo.sh: instrumented v3, trained on
-  dev5+e7, images ss-pgo-on/off), then a quiet mirrored timing session m19|m20|m21|lean0|subb32k|pgo.
-- #6-B rejected (orchestrator). Row 7 (table layout) waits for the orchestrator's engine-design note.
+- Tags: ss-milestone-18 = 1651a22 (real 0.9154 s), ss-milestone-19 = c870b9c (real 0.8278 s).
+- m20 candidate = 0ed00d5: c7c5560 (m19 + #8 + #10 + #9 reverted + probe dedup + overflow counter) +
+  2d599cd lean sink + 9a0a833 SS_SUBB switch + ea78806 #18 general path + k4-v2e (a7c1171..5a230de) +
+  0ed00d5 SUB_B 32768. Image ss-a3-x12; ~/xgate20.sh x12 running (log ~/xgate_x12.log). Tag when it passes.
+- PGO: measured slower (e60 +26 ms, e23 +5.7 ms): rejected.
+- Next: row 7 (table layout) after the orchestrator's engine note; q-r 3b7f029 / 87966c4 and ss-q 649e137
+  when the orchestrator confirms.
 
 ## Measured (ss-bench, a3-m17 = cdadcff, SS_VERBOSE + SS_MEMACCT, one run each)
 - e23: user-ID log 3.35M entries / 184K distinct long IDs; event-ID log 2.69M entries; long verify
@@ -35,6 +34,10 @@ Updated: Sun 05:00 ET.
 - m19 (x7) vs m18 (x3), 6 rounds: e60 2290.2 vs 2508.8 (-218.6, -8.7%); SS_K4=0 2464.4; SS_K5=0 2377.7;
   SS_SCALARPROBE=1 2305.7. e23 815.8 vs 881.5 (-65.8, -7.5%); K4=0 866.0; K5=0 838.4; scalar probe 813.5.
 - Cachegrind dev5 1 thread Rust 1.100: m17 v2 1.402 G; m18 v3 1.378 G; +TLS 1.369 G; +AVX2 probe 1.3405 G.
+
+- Session 1 (quiet, mirrored, 8 samples each): e60 m19 2287.2, m20(c7c5560) 2182.4, m21(2d599cd)
+  2130.4, m21 SS_LEAN=0 2180.8, m21 SS_SUBB=32768 2100.2, pgo-on 2213.9, pgo-off 2187.9.
+  e23 m19 810.5, m20 785.7, m21 763.5, m21 LEAN=0 780.8, pgo-on 786.8, pgo-off 781.1.
 
 ## Known slow-but-exact paths (do not "fix" the order)
 - Click IDs that do not pack are references (file, length, offset) into the click file mapping. The
