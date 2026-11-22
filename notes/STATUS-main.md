@@ -9,8 +9,9 @@ Updated: Sun 07:05 ET (local clock).
   k6-v2 (K6_DEFAULT true, 8d3232f) + probe select 9fdf3fb. ss-bench mirrored: e60 1946.4 vs x18 2015.8
   (-69.4), e23 717.0 vs 740.0 (-23.0); SS_K6=0 1990.8 / 731.0.
 - x18 = 62babc5 (m21 + release guard) passed xgate22: 91 lines MATCH/OK (fallback).
-- m23 candidate work: 738047c link union root order by 8-byte prefixes (SS_LINKPREF=0 off); sess10.sh
-  on ss-bench: tests, outputs, mirrored timing rc1 | x20 | x20 LINKPREF=0.
+- m23 candidate: 63ebd99 + 738047c link union root order by 8-byte prefixes (SS_LINKPREF=0 off): exact
+  (64/64 v3 tests, dev5/e23/e60 MATCH); vs rc1 ABBA e60 1944.0 vs 1958.7 (-14.6, 12 samples), e23 716.5
+  vs 714.8 (+1.7 noise, 20 samples); inside one image LINKPREF on vs off: e60 -14.8, e23 -13.
 - Finalize prefetch d659217 reverted (no effect).
 - The public mirror of the top cluster carries an opt-out notice on every source file: not read, not used,
   not credited (orchestrator withdrew the instruction).
