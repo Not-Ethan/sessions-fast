@@ -662,19 +662,32 @@ impl St {
             }
             self.stamp_id += 1;
             let sid = self.stamp_id;
+            // latest ts; `mixed`: clicks at that ts name more than one campaign
             let mut best = usize::MAX;
+            let mut mixed = false;
             for (k, c) in pc.iter().enumerate() {
                 if c.ts >= lo && c.ts as u64 <= hi {
-                    if best == usize::MAX
-                        || c.ts > pc[best].ts
-                        || (c.ts == pc[best].ts && keys::click_cmp(c.ck, pc[best].ck) == CmpOrd::Less)
-                    {
+                    if best == usize::MAX || c.ts > pc[best].ts {
                         best = k;
+                        mixed = false;
+                    } else if c.ts == pc[best].ts && c.camp != pc[best].camp {
+                        mixed = true;
                     }
                     let ci = c.camp as usize;
                     if self.stamp[ci] != sid {
                         self.stamp[ci] = sid;
                         self.out.assist[ci * ndays + s.day as usize] += 1;
+                    }
+                }
+            }
+            // the credit is the campaign of the smallest click_id among the
+            // clicks at the latest ts: only when they name more than one
+            // campaign do the ids have to be compared (rare)
+            if mixed {
+                let t = pc[best].ts;
+                for (k, c) in pc.iter().enumerate() {
+                    if c.ts == t && k != best && keys::click_cmp(c.ck, pc[best].ck) == CmpOrd::Less {
+                        best = k;
                     }
                 }
             }
@@ -707,11 +720,19 @@ impl St {
                 // latest ts; among equal ts the smallest click_id
                 let tmax = pc[add - 1].ts;
                 let mut best = add - 1;
+                // the clicks at tmax: ids compared only if they name more
+                // than one campaign (the credit is the campaign)
                 let mut k = add - 1;
+                let mut mixed = false;
                 while k > rem && pc[k - 1].ts == tmax {
                     k -= 1;
-                    if keys::click_cmp(pc[k].ck, pc[best].ck) == CmpOrd::Less {
-                        best = k;
+                    mixed |= pc[k].camp != pc[best].camp;
+                }
+                if mixed {
+                    for j in k..add - 1 {
+                        if keys::click_cmp(pc[j].ck, pc[best].ck) == CmpOrd::Less {
+                            best = j;
+                        }
                     }
                 }
                 pc[best].camp as usize
