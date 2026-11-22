@@ -1,16 +1,17 @@
 # STATUS of the main engineer (branch ss-opt4, worktree .claude/worktrees/opt4)
 
-Updated: Sun 07:10 ET.
+Updated: Sun 07:05 ET (local clock).
 
 ## Now
 - Tags: m18 = 1651a22 (0.9154 s), m19 = c870b9c (0.8278 s), m20 = 0ed00d5 (0.7904 s),
-  m21 = 86d13ad (gate xgate21: 92 MATCH/OK lines, nothing else).
-- m22 material on ss-opt4: d659217 (link finalize prefetch, SS_LINKPF=0 off; timing sess7: x16 | x17 |
-  x17 LINKPF=0) + 653fdf6 (input release decided once: off unless input > memory limit / 3; SS_RELEASE=1/0,
-  SS_RELEASE_BYTES threshold) + k6-v2 (event splitter, K6_DEFAULT = true) when its hash arrives.
-  Gate script ~/xgate22.sh on ss-bench (adds RELEASE_BYTES=1, RELEASE=0, K6=0, LINKPF=0, K6CHECK).
-- Rejected tonight (numbers in Measured): #6-B inline, PGO, decode-table single probe, click deferral
-  (both modes), SS_KEEPMEM (s1 engineer), #9 (quick-wins).
+  m21 = 86d13ad (0.7813 s), ss-m22-rc1 = 9fdf3fb (orchestrator gating on ss-gate).
+- rc1 = m21 + release guard 653fdf6 + NCPU clamp 3981ec2 + k5-v4 cd68e89 + 7e214f6 (mixed buckets) +
+  k6-v2 (K6_DEFAULT true, 8d3232f) + probe select 9fdf3fb. ss-bench mirrored: e60 1946.4 vs x18 2015.8
+  (-69.4), e23 717.0 vs 740.0 (-23.0); SS_K6=0 1990.8 / 731.0.
+- x18 = 62babc5 (m21 + release guard) passed xgate22: 91 lines MATCH/OK (fallback).
+- m23 candidate work: 738047c link union root order by 8-byte prefixes (SS_LINKPREF=0 off); sess10.sh
+  on ss-bench: tests, outputs, mirrored timing rc1 | x20 | x20 LINKPREF=0.
+- Finalize prefetch d659217 reverted (no effect).
 - The public mirror of the top cluster carries an opt-out notice on every source file: not read, not used,
   not credited (orchestrator withdrew the instruction).
 
