@@ -2477,6 +2477,20 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         name_session_slots();
     }
 
+    // the input mappings and their chunk lists on three helper threads while
+    // this one reads the manifest and builds the lookups
+    let chunk = env_usize("SS_CHUNK").unwrap_or(2 << 20);
+    // links are small (about 1/20 of the events): smaller chunks balance
+    // the link parse over the threads (SS_LCHUNK overrides)
+    let lchunk = env_usize("SS_LCHUNK").unwrap_or(chunk / 8).max(1);
+    // click tasks run last in the parse phase: half-size chunks shorten the
+    // tail where threads wait for the slowest (join idle 14-24 -> 6-8
+    // thread-ms on the twin, d7; SS_CCHUNK overrides)
+    let cchunk = env_usize("SS_CCHUNK").unwrap_or(chunk / 2).max(1);
+    let (dl, de, dc) = (data_dir.join("links"), data_dir.join("events"), data_dir.join("clicks"));
+    let hl = std::thread::spawn(move || load_input(&dl, lchunk));
+    let he = std::thread::spawn(move || load_input(&de, chunk));
+    let hc = std::thread::spawn(move || load_input(&dc, cchunk));
     // manifest + lookups
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).unwrap_or_else(|e| fail(&format!("manifest: {}", e)));
     let ws = ts::parse_ts(manifest_value(&manifest, "window_start").as_bytes()).unwrap_or_else(|| fail("bad window_start"));
@@ -2529,15 +2543,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     }
     let centries: Vec<(&[u8], u16)> = crows.iter().enumerate().map(|(i, &(c, _))| (c, i as u16)).collect();
     marks.mark("lookups");
-    let chunk = env_usize("SS_CHUNK").unwrap_or(2 << 20);
-    // links are small (about 1/20 of the events): smaller chunks balance
-    // the link parse over the threads (SS_LCHUNK overrides)
-    let links_in = load_input(&data_dir.join("links"), env_usize("SS_LCHUNK").unwrap_or(chunk / 8).max(1));
-    let events_in = load_input(&data_dir.join("events"), chunk);
-    // click tasks run last in the parse phase: half-size chunks shorten the
-    // tail where threads wait for the slowest (join idle 14-24 -> 6-8
-    // thread-ms on the twin, d7; SS_CCHUNK overrides)
-    let clicks_in = load_input(&data_dir.join("clicks"), env_usize("SS_CCHUNK").unwrap_or(chunk / 2).max(1));
+    let links_in = hl.join().unwrap_or_else(|_| fail("loading links failed"));
+    let events_in = he.join().unwrap_or_else(|_| fail("loading events failed"));
+    let clicks_in = hc.join().unwrap_or_else(|_| fail("loading clicks failed"));
     // clicks carry references to their click_id bytes (keys::click_ref)
     keys::set_click_maps(clicks_in.maps.iter().map(|m| (m.bytes().as_ptr() as usize, m.bytes().len())).collect());
     marks.mark("mmap");
