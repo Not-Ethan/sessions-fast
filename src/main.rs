@@ -8,6 +8,9 @@ mod parquet;
 mod prof;
 mod cbench;
 mod fastev;
+mod k5;
+#[cfg(test)]
+mod k5test;
 mod sess;
 mod scan;
 mod sys;
@@ -2670,6 +2673,16 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     }
     if std::env::var("SS_CDECOMP").is_ok() {
         cbench::click_decomp(&clicks_in, &links_in, &ctx);
+        std::process::exit(0);
+    }
+    // click lines through the fused kernel (k5.rs; AVX2 only) if SS_K5=1
+    k5::ON.store(ctx.avx2 && std::env::var("SS_K5").map_or(k5::DEFAULT, |v| v != "0"), Ordering::Relaxed);
+    if std::env::var("SS_K5BENCH").is_ok() {
+        k5::bench(&clicks_in, &links_in, &ctx);
+        std::process::exit(0);
+    }
+    if std::env::var("SS_K5CHECK").is_ok() {
+        k5::check(&links_in, &clicks_in, &ctx);
         std::process::exit(0);
     }
     if std::env::var("SS_FLOOR").is_ok() {
