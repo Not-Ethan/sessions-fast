@@ -231,9 +231,11 @@ impl LinkTable {
     /// Joins two IDs. Safe to call from many threads at once.
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn link(&self, a: u64, b: u64, pa: u64, pb: u64, alloc: &mut IdxAlloc) {
-        let da = self.insert(a, pa, alloc);
-        let db = self.insert(b, pb, alloc);
+    /// (Tests: every ID gets prefix 0, so roots are ordered by keys::cmp
+    /// alone; a table must not mix this with `insert_pair`'s prefixes.)
+    pub fn link(&self, a: u64, b: u64, alloc: &mut IdxAlloc) {
+        let da = self.insert(a, 0, alloc);
+        let db = self.insert(b, 0, alloc);
         if da != db {
             self.union(da, db);
         }
