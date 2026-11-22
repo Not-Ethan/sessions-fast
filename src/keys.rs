@@ -33,6 +33,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering as AO};
 use std::sync::Mutex;
 
+use crate::parts::Parts;
+
 const ALPHABET: &[u8; 64] = b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
 const INVALID: u8 = 0x80;
 
@@ -192,13 +194,17 @@ static LONG_OFF: AtomicBool = AtomicBool::new(false);
 /// Hash bits kept (SS_LONGBITS, tests: few bits force collisions), <= 60.
 static LONG_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
 static COLLISION: AtomicBool = AtomicBool::new(false);
-/// Initial capacity of a thread's log (entries; `set_log_hint`).
+/// Capacity of a thread's log (entries; `set_log_hints`): first for the link
+/// phase, then (after the first verification) for the rest.
 static LOG_HINT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1024);
+static LOG_HINT_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1024);
 
-/// Expected long IDs per worker thread (sizing only): a thread's log starts
-/// with this capacity instead of growing by doubling (copies, page faults).
-pub fn set_log_hint(n: usize) {
-    LOG_HINT.store(n.clamp(1024, 1 << 26), AO::Relaxed);
+/// Expected long IDs per worker thread while parsing links, and while
+/// parsing events and clicks (sizing only: logs are partitioned arenas, and
+/// an arena much larger than its log would be zeroed for nothing).
+pub fn set_log_hints(links: usize, rest: usize) {
+    LOG_HINT.store(links.clamp(1024, 1 << 26), AO::Relaxed);
+    LOG_HINT_NEXT.store(rest.clamp(1024, 1 << 26), AO::Relaxed);
 }
 
 /// One logged long ID: key, first byte, the 32 hex digits as two u64.
@@ -210,21 +216,36 @@ struct LEnt {
     lo: u64,
 }
 
+/// Log partitions: a thread's log is split by the key's top TAB_BITS bits
+/// as it is written, so the check needs no scatter pass.
+const TAB_BITS: u32 = 8;
+const NPART: usize = 1 << TAB_BITS;
+
 thread_local! {
-    static LOG: std::cell::RefCell<Vec<LEnt>> = const { std::cell::RefCell::new(Vec::new()) };
+    static LOG: std::cell::RefCell<Option<Parts<LEnt>>> = const { std::cell::RefCell::new(None) };
 }
 /// Logs of finished threads (`flush_thread`).
-static LOGS: Mutex<Vec<Vec<LEnt>>> = Mutex::new(Vec::new());
+static LOGS: Mutex<Vec<Parts<LEnt>>> = Mutex::new(Vec::new());
 
-/// The decode table of long keys: entries sorted by key in 4096 partitions
-/// by the key's top 12 bits; partition p holds arr[start[p] .. start[p] + n[p]].
+/// One partition of the decode table: the distinct long IDs of the partition
+/// and an open-addressing index over them (entry index + 1; 0 = empty).
+struct PartTab {
+    ents: Vec<LEnt>,
+    idx: Vec<u32>,
+    mask: usize,
+}
+/// The decode table of long keys, NPART partitions by the key's top bits.
 struct LongTab {
-    arr: Vec<LEnt>,
-    start: Vec<usize>,
-    n: Vec<usize>,
+    parts: Vec<PartTab>,
 }
 static TAB: std::sync::atomic::AtomicPtr<LongTab> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-const TAB_BITS: u32 = 12;
+
+/// Slot of a key in a partition index (bits below the partition bits; the
+/// key's low 4 bits are the tag).
+#[inline(always)]
+fn slot_of(k: u64, mask: usize) -> usize {
+    ((k >> 4) as usize) & mask
+}
 
 /// Settings from the environment (SS_LONGBITS, SS_LONGOFF); call once at start.
 pub fn long_settings() {
@@ -301,10 +322,8 @@ fn long_key(pre: u8, hi: u64, lo: u64) -> u64 {
     let key = (h << 4) | 0xE;
     LOG.with(|l| {
         let mut l = l.borrow_mut();
-        if l.capacity() == 0 {
-            l.reserve(LOG_HINT.load(AO::Relaxed));
-        }
-        l.push(LEnt { key, pre: pre as u64, hi, lo })
+        let p = l.get_or_insert_with(|| Parts::with_wc(NPART, LOG_HINT.load(AO::Relaxed) / NPART * 5 / 4 + 64, true));
+        unsafe { p.push_unchecked((key >> (64 - TAB_BITS)) as usize, LEnt { key, pre: pre as u64, hi, lo }) };
     });
     key
 }
@@ -317,9 +336,11 @@ pub fn is_long(k: u64) -> bool {
 /// Moves this thread's log of long IDs to the shared list (main::par calls
 /// it at the end of every worker; also before a verification).
 pub fn flush_thread() {
-    let v = LOG.with(|l| std::mem::take(&mut *l.borrow_mut()));
-    if !v.is_empty() {
-        LOGS.lock().unwrap().push(v);
+    if let Some(mut v) = LOG.with(|l| l.borrow_mut().take()) {
+        v.finish();
+        if v.total() > 0 {
+            LOGS.lock().unwrap().push(v);
+        }
     }
 }
 
@@ -331,7 +352,7 @@ pub fn collision() -> bool {
 /// Before a rerun after a collision: next seed (or the interner after
 /// LONG_TRIES seeds), logs and tables cleared. Returns the attempt number.
 pub fn reset_longs(attempt: u64) {
-    LOG.with(|l| l.borrow_mut().clear());
+    LOG.with(|l| *l.borrow_mut() = None);
     LOGS.lock().unwrap().clear();
     TAB.store(std::ptr::null_mut(), AO::Release);
     COLLISION.store(false, AO::Relaxed);
@@ -348,6 +369,7 @@ pub fn reset_longs(attempt: u64) {
 pub fn verify_longs(threads: usize) -> usize {
     let t0 = std::time::Instant::now();
     let d = verify_longs_inner(threads);
+    LOG_HINT.store(LOG_HINT_NEXT.load(AO::Relaxed), AO::Relaxed);
     VERIFY_NS.fetch_add(t0.elapsed().as_nanos() as u64, AO::Relaxed);
     d
 }
@@ -369,103 +391,69 @@ pub fn long_stats() -> String {
 }
 
 fn verify_longs_inner(threads: usize) -> usize {
-    let par = |f: &(dyn Fn(usize) + Sync)| {
-        crate::par(threads, f);
-    };
     flush_thread();
     let lists = LOGS.lock().unwrap();
-    let total: usize = lists.iter().map(|v| v.len()).sum();
+    let total: usize = lists.iter().map(|v| v.total()).sum();
     LONG_ENTRIES.store(total as u64, AO::Relaxed);
     if total == 0 {
         return 0;
     }
-    let np = 1usize << TAB_BITS;
-    let part = |k: u64| (k >> (64 - TAB_BITS)) as usize;
-    let nl = lists.len();
-    // counts per (list, partition), then offsets
-    let mut cnt = vec![0usize; nl * np];
-    {
-        let cp = cnt.as_mut_ptr() as usize;
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        par(&|_| loop {
-            let l = next.fetch_add(1, AO::Relaxed);
-            if l >= nl {
-                break;
-            }
-            let c = unsafe { std::slice::from_raw_parts_mut((cp as *mut usize).add(l * np), np) };
-            for e in &lists[l] {
-                c[part(e.key)] += 1;
-            }
-        });
-    }
-    let mut start = vec![0usize; np + 1];
-    let mut off = vec![0usize; nl * np];
-    let mut run = 0usize;
-    for p in 0..np {
-        start[p] = run;
-        for l in 0..nl {
-            off[l * np + p] = run;
-            run += cnt[l * np + p];
-        }
-    }
-    start[np] = run;
-    let mut arr: Vec<LEnt> = Vec::with_capacity(total);
-    let ap = arr.as_mut_ptr() as usize;
-    {
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let offp = off.as_mut_ptr() as usize;
-        par(&|_| loop {
-            let l = next.fetch_add(1, AO::Relaxed);
-            if l >= nl {
-                break;
-            }
-            let o = unsafe { std::slice::from_raw_parts_mut((offp as *mut usize).add(l * np), np) };
-            for e in &lists[l] {
-                let p = part(e.key);
-                unsafe { (ap as *mut LEnt).add(o[p]).write(*e) };
-                o[p] += 1;
-            }
-        });
-        unsafe { arr.set_len(total) };
-    }
-    drop(lists);
-    // per partition: sort, check, keep the distinct entries at its start
-    let mut n = vec![0usize; np];
+    // per partition (all threads' logs): an open-addressing index keyed by
+    // the key; an equal key with a different value is a collision
     let coll = AtomicBool::new(false);
-    {
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let np_ = n.as_mut_ptr() as usize;
-        let startr = &start;
-        par(&|_| loop {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done: Mutex<Vec<(usize, PartTab)>> = Mutex::new(Vec::with_capacity(NPART));
+    crate::par(threads, |_| {
+        let mut mine = Vec::new();
+        loop {
             let p = next.fetch_add(1, AO::Relaxed);
-            if p >= np {
+            if p >= NPART {
                 break;
             }
-            let s = unsafe { std::slice::from_raw_parts_mut((ap as *mut LEnt).add(startr[p]), startr[p + 1] - startr[p]) };
-            // by key only; within a run of equal keys every entry must equal
-            // the run's first (the kept one), else two IDs share the key
-            s.sort_unstable_by_key(|e| e.key);
-            let mut k = 0usize;
-            for i in 0..s.len() {
-                if k > 0 && s[k - 1].key == s[i].key {
-                    if s[k - 1] != s[i] {
-                        coll.store(true, AO::Relaxed);
+            let n: usize = lists.iter().map(|v| v.len(p)).sum();
+            let size = (2 * n).next_power_of_two().max(16);
+            let mask = size - 1;
+            let mut idx = vec![0u32; size];
+            let mut ents: Vec<LEnt> = Vec::with_capacity(n);
+            let mut bad = false;
+            for v in lists.iter() {
+                for sl in v.get(p) {
+                    for e in sl.iter() {
+                        let mut s = slot_of(e.key, mask);
+                        loop {
+                            let i = idx[s];
+                            if i == 0 {
+                                ents.push(*e);
+                                idx[s] = ents.len() as u32;
+                                break;
+                            }
+                            let f = &ents[i as usize - 1];
+                            if f.key == e.key {
+                                bad |= f != e;
+                                break;
+                            }
+                            s = (s + 1) & mask;
+                        }
                     }
-                    continue;
                 }
-                s[k] = s[i];
-                k += 1;
             }
-            unsafe { *(np_ as *mut usize).add(p) = k };
-        });
-    }
+            if bad {
+                coll.store(true, AO::Relaxed);
+            }
+            mine.push((p, PartTab { ents, idx, mask }));
+        }
+        done.lock().unwrap().append(&mut mine);
+    });
+    drop(lists);
     if coll.load(AO::Relaxed) {
         COLLISION.store(true, AO::Relaxed);
     }
-    let distinct = n.iter().sum();
+    let mut done = done.into_inner().unwrap();
+    done.sort_unstable_by_key(|d| d.0);
+    let parts: Vec<PartTab> = done.into_iter().map(|d| d.1).collect();
+    let distinct = parts.iter().map(|t| t.ents.len()).sum();
     LONG_DISTINCT.store(distinct as u64, AO::Relaxed);
-    let tab = Box::new(LongTab { arr, start, n });
-    TAB.store(Box::into_raw(tab), AO::Release);
+    TAB.store(Box::into_raw(Box::new(LongTab { parts })), AO::Release);
     distinct
 }
 
@@ -474,11 +462,17 @@ fn long_value(k: u64) -> (u64, u64, u64) {
     let t = TAB.load(AO::Acquire);
     assert!(!t.is_null(), "long key without a decode table");
     let t = unsafe { &*t };
-    let p = (k >> (64 - TAB_BITS)) as usize;
-    let s = &t.arr[t.start[p]..t.start[p] + t.n[p]];
-    let i = s.partition_point(|e| e.key < k);
-    assert!(i < s.len() && s[i].key == k, "long key missing from the decode table");
-    (s[i].pre, s[i].hi, s[i].lo)
+    let pt = &t.parts[(k >> (64 - TAB_BITS)) as usize];
+    let mut s = slot_of(k, pt.mask);
+    loop {
+        let i = pt.idx[s];
+        assert!(i != 0, "long key missing from the decode table");
+        let e = &pt.ents[i as usize - 1];
+        if e.key == k {
+            return (e.pre, e.hi, e.lo);
+        }
+        s = (s + 1) & pt.mask;
+    }
 }
 
 fn long_string(k: u64, out: &mut Vec<u8>) {
