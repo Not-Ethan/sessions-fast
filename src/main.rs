@@ -1498,16 +1498,42 @@ struct BOut {
 }
 
 /// Pipeline B parse: links on all threads first, then events and clicks.
+/// Bytes per line of an input, from up to 16 KB at the start of up to 32
+/// tasks spread over it (sizing only); `dflt` when the sample is too small.
+fn bytes_per_line(inp: &Input, dflt: usize) -> usize {
+    let nt = inp.tasks.len().min(32);
+    let (mut bytes, mut lines) = (0usize, 0usize);
+    for k in 0..nt {
+        let t = inp.tasks[k * inp.tasks.len() / nt];
+        let b = inp.maps[t.file as usize].bytes();
+        let e = (t.start + 16384).min(t.end);
+        bytes += e - t.start;
+        lines += b[t.start..e].iter().filter(|&&c| c == b'\n').count();
+    }
+    if lines < 256 {
+        return dflt;
+    }
+    (bytes / lines).max(8)
+}
+
 fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt: Option<&EidTable>) -> (LinkTable, Vec<BOut>) {
     let pe = 1usize << ctx.pe_bits;
     let ps = 1usize << ctx.ps_bits;
     // Capacities with modest slack: huge pages zero the slack too, and a
     // partition that fills up continues in its (exact) overflow vector.
-    let est_lines = ev.bytes / 72 + 1;
-    let cap_a = est_lines / (ctx.threads * pe) * 5 / 4 + 32;
-    let cap_s = est_lines / (ctx.threads * ps) * 5 / 4 + 32;
-    let est_clicks = cl.bytes / 44 + 1;
-    let cap_c = est_clicks / (ctx.threads * ps) * 5 / 4 + 32;
+    // Line counts from the bytes per line of a sample (SS_OLDCAP=1: fixed
+    // 72 / 44 bytes per line, which overestimated lines with long IDs by
+    // about a third, and huge pages zero every byte of the slack).
+    let old_cap = std::env::var("SS_OLDCAP").is_ok();
+    let (est_lines, est_clicks, sl) = if old_cap {
+        (ev.bytes / 72 + 1, cl.bytes / 44 + 1, 5.0 / 4.0)
+    } else {
+        (ev.bytes / bytes_per_line(ev, 72) + 1, cl.bytes / bytes_per_line(cl, 44) + 1, 1.2)
+    };
+    let cap = |n: usize, parts: usize| (n as f64 / (ctx.threads * parts) as f64 * sl) as usize + 32;
+    let cap_a = cap(est_lines, pe);
+    let cap_s = cap(est_lines, ps);
+    let cap_c = cap(est_clicks, ps);
     let release = std::env::var("SS_NORELEASE").is_err();
     // map a chunk's pages in one call before parsing it (SS_POPULATE=1, experiment)
     let populate = std::env::var("SS_POPULATE").is_ok();
