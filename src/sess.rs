@@ -790,6 +790,9 @@ pub(crate) struct PersonSess(St);
 
 impl PersonSess {
     pub(crate) fn new(ctx: &Ctx, est_rows: usize) -> Self {
+        if prof::ON.load(Ordering::Relaxed) {
+            name_slots();
+        }
         PersonSess(St::new(ctx, est_rows, 64, 64))
     }
 

@@ -2566,13 +2566,14 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         if verbose {
             let rows: usize = outs.iter().map(|o| o.nrows).sum();
             return format!(
-                "sessions: {} | pipeline=dense threads={} user_rows={} peak_rss={}MB wc_over_lines={} {}",
+                "sessions: {} | pipeline=dense threads={} user_rows={} peak_rss={}MB wc_over_lines={} {}{}",
                 marks.report(),
                 threads,
                 rows,
                 sys::peak_rss_mb(),
                 parts::WC_OVER_LINES.load(Ordering::Relaxed),
-                densep::stats()
+                densep::stats(),
+                prof::report()
             );
         }
         return String::new();
