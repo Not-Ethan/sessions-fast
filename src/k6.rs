@@ -81,7 +81,8 @@ const NB: usize = 64;
 /// Bytes per segment.
 const SEG: usize = NB * 64;
 /// Entries of a segment: the virtual entry, at most one per byte, the
-/// unconditional writes past the last (8) and the sentinels (16).
+/// unconditional writes past the last (7 entries, 8 flag bytes) and the
+/// sentinels (16).
 const CAP: usize = SEG + 64;
 /// Sentinel entries after the last real one (flag `F_BAD`).
 const NSENT: usize = 16;
@@ -135,10 +136,9 @@ unsafe fn rd32(p: *const u8) -> u32 {
 /// ordinary bytes). Appends its entries and flags at `st.kb`.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn block(st: &mut S1, p: *const u8, blk: usize, vm: u64, e: *mut u32) {
+unsafe fn block(st: &mut S1, q: *const u8, base: u32, vm: u64, e: *mut u32) {
     // the flags live at a fixed offset from the entries (one base register)
     let fl = (e as *mut u8).add(FL_OFF);
-    let q = p.add(blk * 64);
     let a = _mm256_loadu_si256(q as *const __m256i);
     let b = _mm256_loadu_si256(q.add(32) as *const __m256i);
     let mm = |v: __m256i, ch: u8| -> u64 { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(ch as i8))) as u32 as u64 };
@@ -158,25 +158,27 @@ unsafe fn block(st: &mut S1, p: *const u8, blk: usize, vm: u64, e: *mut u32) {
     st.dp = d;
     st.qp = qq;
     st.cin = cout;
-    let base = (blk * 64) as u32;
     let kb = st.kb;
     let cnt = d.count_ones() as usize;
-    if (bad != 0) | (cnt > 8) {
+    // at most 7 delimiters in a block: 99.99% of dev5's blocks (8 or more, or a
+    // bad position: the exact loop)
+    if (bad != 0) | (cnt > 7) {
         st.kb = kb + block_slow(d | bad, qs, n, bad, base, e.add(kb), fl.add(kb));
         return;
     }
     let ep = e.add(kb);
     let mut f = d;
-    for i in 0..8 {
+    for i in 0..7 {
         *ep.add(i) = base + f.trailing_zeros();
         f &= f.wrapping_sub(1);
     }
-    let fl8 = _pdep_u64(_pext_u64(qs, d), L1) | _pdep_u64(_pext_u64(n, d), L1 << 1);
+    // flag bytes: bit 0 from qs, bit 1 from n (one constant; the add is a lea)
+    let fl8 = _pdep_u64(_pext_u64(qs, d), L1).wrapping_add(_pdep_u64(_pext_u64(n, d), L1).wrapping_mul(2));
     std::ptr::write_unaligned(fl.add(kb) as *mut u64, fl8.to_le());
     st.kb = kb + cnt;
 }
 
-/// A block with more than 8 entries or a bad position: every entry of `f`
+/// A block with more than 7 entries or a bad position: every entry of `f`
 /// (exact count), flags in groups of 8. Returns the entry count.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
@@ -216,11 +218,16 @@ pub(crate) unsafe fn stage1(p: *const u8, nb: usize, lastmask: u64, e: *mut u32)
     *fl = F_NL;
     // the byte before p ends a line: a delimiter there, no quote, no carry
     let mut st = S1 { dp: 1 << 63, qp: 0, cin: 0, kb: 1 };
-    for blk in 0..nb - 1 {
-        super::prefetch(p.wrapping_add(blk * 64 + PFD));
-        block(&mut st, p, blk, !0u64, e);
+    let mut q = p;
+    let mut base = 0u32;
+    let qend = p.add((nb - 1) * 64);
+    while q < qend {
+        super::prefetch(q.wrapping_add(PFD));
+        block(&mut st, q, base, !0u64, e);
+        q = q.add(64);
+        base += 64;
     }
-    block(&mut st, p, nb - 1, lastmask, e);
+    block(&mut st, q, base, lastmask, e);
     let kb = st.kb;
     let big = (nb * 64) as u32;
     for i in 0..NSENT {
