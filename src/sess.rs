@@ -303,9 +303,15 @@ impl St {
         };
         {
             let hist = &mut self.hist[..nb + 2];
+            let spf = SPF.load(Ordering::Relaxed);
             for t in sbufs {
                 for sl in t.get(q) {
-                    for r in sl {
+                    for (i, r) in sl.iter().enumerate() {
+                        if spf && i % 4 == 0 {
+                            // 64 records (1 KB) ahead: the partition's records
+                            // come from DRAM (written with non-temporal stores)
+                            crate::prefetch(sl.as_ptr().wrapping_add(i + 64) as *const u8);
+                        }
                         let b = bucket(r);
                         // b + 1 <= nb + 1 < hist.len()
                         unsafe { *hist.get_unchecked_mut(b + 1) += 1 };
@@ -777,6 +783,9 @@ impl St {
 /// index computed from any u32 is in bounds; real offsets are below the
 /// window length (at most 24 days: 1152 slots, 18 bitmap words).
 const SLOTS_ALL: usize = 2432;
+
+/// Software prefetch in the partition passes (SS_SPF=1, experiment).
+pub static SPF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const _: () = assert!(((u32::MAX / W) as usize) < SLOTS_ALL && SLOTS_ALL % 64 == 0 && SLOTS_ALL / 64 <= 64);
 
 /// Sessions, attribution and aggregation per person partition; each thread

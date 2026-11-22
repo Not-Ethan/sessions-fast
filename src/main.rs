@@ -2545,6 +2545,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         fastev::PF_DIST.store(d, Ordering::Relaxed);
     }
     fastev::PF2.store(std::env::var("SS_PF2").map_or(true, |v| v != "0"), Ordering::Relaxed);
+    sess::SPF.store(std::env::var("SS_SPF").is_ok(), Ordering::Relaxed);
     // 128-byte splitters for lines with long IDs unless SS_WIDECUT=0
     fastev::WIDE.store(std::env::var("SS_WIDECUT").map_or(true, |v| v != "0"), Ordering::Relaxed);
     if std::env::var("SS_CLICKCHECK").is_ok() {
