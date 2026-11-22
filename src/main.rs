@@ -1886,8 +1886,12 @@ fn apply_kills(sb: &[BOut], ctx: &Ctx, lb: LocBits) {
     });
 }
 
-/// Records per sub-bucket targeted by the in-cache split in `dedup_b`.
-const SUB_B: usize = 8 * 1024;
+/// Records per sub-bucket targeted by the in-cache split in `dedup_b`: a
+/// partition of up to this many records is deduplicated in one table (at
+/// 32K records 1 MB) without the counting / scatter pass. 32768: e60 (about
+/// 15K records per partition) no longer splits: -30 ms on e60 (2100.2 vs
+/// 2130.4 ms, 8 mirrored samples each, SS_SUBB=32768 against 8192).
+const SUB_B: usize = 32 * 1024;
 
 /// Marks the SRec at `loc` dead (no-op for LOC_NONE).
 #[inline(always)]
