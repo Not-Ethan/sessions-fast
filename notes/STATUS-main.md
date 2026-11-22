@@ -1,15 +1,16 @@
 # STATUS of the main engineer (branch ss-opt4, worktree .claude/worktrees/opt4)
 
-Updated: Sun 06:20 ET.
+Updated: Sun 07:10 ET.
 
 ## Now
-- Tags: m18 = 1651a22 (0.9154 s), m19 = c870b9c (0.8278 s), m20 = 0ed00d5 (0.7904 s).
-- m21 candidate = 86d13ad: m20 + b1f1c6a (input release off by default; SS_RELEASE=1) + e20ceef/c5f6e1a
-  (click deferral switches, off) + c7874ab (#12) + a842591 (row 3) + 32cf0ef (row 6, new long-ID hash) +
-  86d13ad (k4-v2f). On ss-bench: sess5 (x15 = 32cf0ef: checks + mirrored timing m20 | x15 | CDEFER=2 |
-  RELEASE=1), then sess6 builds x16 = 86d13ad and runs ~/xgate21.sh x16 (log ~/xgate_x16.log).
-- Click deferral SS_CDEFER=1 REJECTED: exact (records identical on dev5/e23/e60) but e60 +27.7 ms,
-  e23 +11.3 ms (fresh ~490 MB buffer at e60). SS_CDEFER=2 (512-click batches) being timed.
+- Tags: m18 = 1651a22 (0.9154 s), m19 = c870b9c (0.8278 s), m20 = 0ed00d5 (0.7904 s),
+  m21 = 86d13ad (gate xgate21: 92 MATCH/OK lines, nothing else).
+- m22 material on ss-opt4: d659217 (link finalize prefetch, SS_LINKPF=0 off; timing sess7: x16 | x17 |
+  x17 LINKPF=0) + 653fdf6 (input release decided once: off unless input > memory limit / 3; SS_RELEASE=1/0,
+  SS_RELEASE_BYTES threshold) + k6-v2 (event splitter, K6_DEFAULT = true) when its hash arrives.
+  Gate script ~/xgate22.sh on ss-bench (adds RELEASE_BYTES=1, RELEASE=0, K6=0, LINKPF=0, K6CHECK).
+- Rejected tonight (numbers in Measured): #6-B inline, PGO, decode-table single probe, click deferral
+  (both modes), SS_KEEPMEM (s1 engineer), #9 (quick-wins).
 - The public mirror of the top cluster carries an opt-out notice on every source file: not read, not used,
   not credited (orchestrator withdrew the instruction).
 
@@ -57,6 +58,10 @@ Updated: Sun 06:20 ET.
 - Record wanted from the click LINE decoder: per valid click {user key u64, mix(user key) u64, click key
   u64 (keys::click_key), ts - (window_start - 7 days) u32, campaign index u32} = 32 bytes, appended in
   input order to a per-thread buffer, no person lookup.
+
+- m21 stack (x15 = without v2f) vs m20, 8 mirrored samples: e60 2057.9 vs 2118.8; e23 748.8 vs 761.7.
+  CDEFER=2 (512-click batches): e60 +21, e23 +4 vs x15: rejected. RELEASE=1: e60 +40, e23 +6.
+- e60 peak RSS of m21 under --memory 24g: VmHWM 10.03 GB (anon 4.18 GB + mapped input).
 
 ## Known slow-but-exact paths (do not "fix" the order)
 - Click IDs that do not pack are references (file, length, offset) into the click file mapping. The
