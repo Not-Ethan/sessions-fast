@@ -557,6 +557,9 @@ unsafe fn split_lean<const K: usize>(c0: u64, n0: u64, q0: u64, c1: u64, n1: u64
 /// lines it does not take through `slow_line` (cut, cut_wide, scanner);
 /// the default.
 pub static SPLIT: AtomicUsize = AtomicUsize::new(3);
+/// The lean variant tries the second shape (`split_lean::<3>`) in
+/// `slow_line` before the old splitters (SS_K4SHAPEB=0: off).
+pub static SPLIT_B: AtomicBool = AtomicBool::new(true);
 /// Pack both IDs in one ymm (`pack2`); SS_K4PACK2=0 turns it off (default on:
 /// fewer instructions and faster in the lean loop).
 pub static PACK2: AtomicBool = AtomicBool::new(true);
@@ -609,8 +612,8 @@ pub struct Stats {
     pub range_fb: usize,
     /// lines at the buffer end through `fastev::event_task_fast` (ranges)
     pub tail: usize,
-    /// lines the lean split did not take (through `slow_line`; also counted
-    /// in fast / line_fb / range_fb)
+    /// lines neither lean shape took (the old splitters in `slow_line`; also
+    /// counted in fast / line_fb / range_fb)
     pub slow: usize,
 }
 
@@ -736,10 +739,7 @@ fn line_fb<S: EvSink>(p: *const u8, c: &fastev::Cut, ctx: &Ctx, sink: &mut S) {
 unsafe fn line_fb_lean<S: EvSink>(p: *const u8, ctx: &Ctx, sink: &mut S) {
     let (c0, n0, q0) = masks64(p);
     let (c1, n1, q1) = masks64(p.add(64));
-    let mut c = split_lean::<2>(c0, n0, q0, c1, n1, q1);
-    if !c.ok {
-        c = split_lean::<3>(c0, n0, q0, c1, n1, q1);
-    }
+    let c = split_lean::<2>(c0, n0, q0, c1, n1, q1);
     debug_assert!(c.ok);
     line_fb(p, &c, ctx, sink);
 }
@@ -828,10 +828,7 @@ unsafe fn task_k4<S: EvSink, const SPL: usize, const P2: bool>(b: &[u8], task: T
         if SPL == 3 {
             let (c0, n0, q0) = masks64(p);
             let (c1, n1, q1) = masks64(p.add(64));
-            let mut c = split_lean::<2>(c0, n0, q0, c1, n1, q1);
-            if !c.ok {
-                c = split_lean::<3>(c0, n0, q0, c1, n1, q1);
-            }
+            let c = split_lean::<2>(c0, n0, q0, c1, n1, q1);
             if c.ok {
                 if decode_body::<S, P2>(k, ctx, p, &c, sink) {
                     st.fast += 1;
@@ -891,8 +888,24 @@ unsafe fn task_k4<S: EvSink, const SPL: usize, const P2: bool>(b: &[u8], task: T
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn slow_line<S: EvSink, const P2: bool>(b: &[u8], off: usize, file: u32, k: &K4, ctx: &Ctx, sink: &mut S, safe_end: usize, st: &mut Stats) -> usize {
-    st.slow += 1;
     let p = b.as_ptr().add(off);
+    // the second lean shape first (fields 0..=2 in the first 64 bytes); out of
+    // the hot loop so that the loop's code stays that of shape A alone
+    if SPLIT_B.load(Ordering::Relaxed) {
+        let (c0, n0, q0) = masks64(p);
+        let (c1, n1, q1) = masks64(p.add(64));
+        let c = split_lean::<3>(c0, n0, q0, c1, n1, q1);
+        if c.ok {
+            if decode::<S, P2>(k, ctx, p, &c, sink) {
+                st.fast += 1;
+            } else {
+                st.line_fb += 1;
+                line_fb(p, &c, ctx, sink);
+            }
+            return off + c.len;
+        }
+    }
+    st.slow += 1;
     let mut c = fastev::cut::<true>(p);
     if !c.ok {
         c = fastev::cut_wide::<true>(p);
@@ -1021,7 +1034,7 @@ pub fn check(ev: &Input, ctx: &Ctx) {
     }
     let pct = |x: usize| x as f64 * 100.0 / lines.max(1) as f64;
     eprintln!(
-        "k4check: {} {} tasks, {} lines, {} copies ({} valid); k4 fast {} ({:.3}%), event_line fallback {} ({:.3}%), scanner lines {} ({:.4}%), buffer-end ranges {}; not taken by the lean split {} ({:.3}%)",
+        "k4check: {} {} tasks, {} lines, {} copies ({} valid); k4 fast {} ({:.3}%), event_line fallback {} ({:.3}%), scanner lines {} ({:.4}%), buffer-end ranges {}; taken by neither lean shape {} ({:.3}%)",
         if bad == 0 { "OK" } else { "FAILED" },
         ev.tasks.len(),
         lines,

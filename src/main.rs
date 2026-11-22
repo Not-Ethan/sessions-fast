@@ -2869,6 +2869,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         k4::SPLIT.store(v, Ordering::Relaxed);
     }
     k4::PACK2.store(std::env::var("SS_K4PACK2").map_or(true, |v| v != "0"), Ordering::Relaxed);
+    k4::SPLIT_B.store(std::env::var("SS_K4SHAPEB").map_or(true, |v| v != "0"), Ordering::Relaxed);
     if std::env::var("SS_K4CHECK").is_ok() {
         k4::COUNT.store(true, Ordering::Relaxed);
         k4::check(&events_in, &ctx);
