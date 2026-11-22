@@ -40,7 +40,7 @@ const LATE: i64 = 86_400_000;
 const K4_DEFAULT: bool = true;
 /// k6 (chunk-first event-line splitter, k6.rs; decode from k4.rs) when SS_K6
 /// is not set: off. Exact (SS_K6CHECK, k6test); it takes precedence over k4.
-const K6_DEFAULT: bool = false;
+const K6_DEFAULT: bool = true;
 
 #[inline(always)]
 pub fn prefetch(p: *const u8) {
