@@ -250,6 +250,14 @@ pub fn mem_report(phase: &str) -> String {
         for (lab, (r, t, h)) in agg {
             out.push_str(&format!(" {}={:.0}/{:.0}/{:.0}", lab, mb(r), mb(t), mb(h)));
         }
+        // total huge pages (VMAs of neighbouring arenas merge, so the per-label
+        // column only counts arenas that are a VMA of their own)
+        if let Ok(r) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+            if let Some(l) = r.lines().find(|l| l.starts_with("AnonHugePages:")) {
+                let kb: usize = l["AnonHugePages:".len()..].trim().trim_end_matches("kB").trim().parse().unwrap_or(0);
+                out.push_str(&format!(" AnonHuge:{:.0}", kb as f64 / 1024.0));
+            }
+        }
         let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         for k in ["VmRSS:", "RssAnon:", "RssFile:", "VmHWM:"] {
             if let Some(l) = st.lines().find(|l| l.starts_with(k)) {
