@@ -1,29 +1,50 @@
 # k6: chunk-first (streaming masks) event-line splitter: status (restart insurance)
 
-Branch ss-k6 (worktree .claude/worktrees/k6, from origin/ss-k4-rebased = k4-v2a rebased on main).
-VM ss-k5 (shared: every build/test/timing under `flock /home/Ethan/vm.lock`), tree /home/Ethan/k6/ss,
-scripts /home/Ethan/k6/{b.sh (release build), t.sh (tests)}. Switch SS_K6=1 (default off), checker
-SS_K6CHECK=1. Target: event line 544 -> ~380 instructions (NullSink line bench, dev5, 1 thread).
-Merge-ready by 8:00 AM ET; tag every checker-clean step k6-vN.
+## Current state (06:25 ET)
+- Branch ss-k6 = rebased onto origin/ss-opt4 653fdf6 (contains 86d13ad / k4-v2f); k6 code = v2 (82fdf21
+  on the k4-v2e base, f617214 on ss-opt4) + the segment-end test. Tag k6-v2 after the post-rebase
+  k6test, SS_K6CHECK dev5 + e23 and the e60 container output comparison (running).
+- Switch: SS_K6=1, or `K6_DEFAULT = true` in main.rs (k6 is checked before k4 in `event_task`).
+  Checker SS_K6CHECK=1 (every task through the old path and k6 into recording sinks).
+- Result (pre-rebase v2, image ss-k6-v2, mirrored vs k4-v2e): e23 -16.5 ms median (10/10 rounds),
+  e60 -29.4 ms median (7/8). Count dev5 520.6 -> 472.4 per event line (-9.3%).
+- Fallback with k6 on: 0.040-0.042% of lines go to k4's slow_line (dev5 0.040, e7 0.042, e23 0.0421,
+  e60 0.0414) = exactly the malformed lines (every one of them ends in the scanner: slow_line's cut,
+  cut_wide and lean shape B never take one); 0.37-0.59% go from the decode to event_line (line_fb:
+  decode not certain, as in k4); the last <=288 bytes of each file go to tail_fb (29-141 ranges per
+  data set). With k6 on, k4's own splitters (split_lean, split, split_wide, and the hot loop task_k4)
+  are dead code on the default path; k4's decode_body, line_fb, slow_line and tail_fb are what k6 uses.
+- VM ss-k5, my trees under /home/Ethan/k6 (v2src = 82fdf21 tree, v2r = rebased tree, images
+  ss-k6-v1, ss-k6-r, ss-k6-v2, ss-k6-v2r), scripts: bx.sh (release build of a tree), tx.sh (tests of a
+  tree), cgkx.sh (callgrind + cgaddr of a tree), lb.sh (line bench), k6out.sh (container outputs vs
+  ref5_*), v2chain2.sh / v2rchain.sh (validation chains).
 
 ## Files
-- src/k6.rs: stage 1 (`block`, `block_slow`, `stage1`), stage 2 (`cut`, loop in `task_k6`), checker.
-- src/k6test.rs: k4test adapted (old path vs k6, pack2 on/off) + block/segment offsets, lines longer
-  than the ring, end-of-buffer task cuts.
-- k4.rs: visibility only (decode_body, line_fb, slow_line, tail_fb, MARGIN pub(crate)), commit 22c9973.
+- src/k6.rs: stage 1 (`block`, `block_slow`, `stage1`), stage 2 (`is_simple`, `simple_run`, `cut_into`,
+  loop in `task_k6`), `task_any(_v)`, checker `check`.
+- src/k6test.rs: k4test adapted (old path vs k6, pack2 on/off; guard pages, every chunk size, all 128
+  quote patterns, malformed quotes, 0-12 fields, IDs of every shape/length 0-40, \r in every field, empty
+  lines, buffer tails incl. no final newline, single-byte changes, mutations) + block/segment offsets
+  0..129, lines longer than the 4 KB segment, every task cut in the last 700 bytes, and the first
+  segment's end at every byte of a probe line (unquoted / quoted / partly quoted / malformed; inside a
+  field, on the quotes, exactly on the newline, after it) with the buffer also ending at the probe line
+  with and without its newline. 15 tests.
+- k4.rs: visibility only (decode_body, line_fb, slow_line, tail_fb, MARGIN pub(crate)).
+- tools/cgaddr.py: k6 stages (k6-s1 = stage 1, k6-cut, k6-loop). Its k4 decode line ranges are stale
+  since k4-v2e (ts/ids/validity split wrong; totals right).
 
-## Design (as built, v0)
+## Design (as built, v2)
 - Segment = up to 4096 bytes from a line start `a`, scan end min(task end, b.len()-64, a+4096); bytes past
   the scan end in the last block masked out. Never reads past b.
-- Stage 1 per 64-byte block: C/N/Q masks (2 loads, 6 cmpeq, 6 movemask), D=C|N, FS, Qs, FSs, op, Od
-  (u128 add carries op through the field, across blocks), bad = (Qs&!FSs&!D) | (D&((Od^Qs)|(Qs&FSs))).
-  Common block (bad==0, <=8 delimiters): 8 unconditional entries (tzcnt+add+store+blsr) and one u64 of
-  flags = pdep(pext(Qs,D),0x01..) | pdep(pext(N,D),0x02..). Else `block_slow` (exact loop, bad flags).
-  Entries are u32 offsets from the segment start + 1; entry 0 = virtual newline before `a`; 16 sentinel
-  entries flagged bad after the last.
-- Stage 2 per line, first entry k: flags of k..k+7 as one u64; simple iff (x & 0x0006060606060606) ==
-  0x0002000000000000. Then 6 loads (vpmovzxdq/bq) + 8 ymm ops + 4 stores build the fastev::Cut
-  (s_j = e[k+j-1]+q_j, n_j = e[k+j]-e[k+j-1]-1-2q_j), k4::decode_body, else k4::line_fb; k += 7.
+- Stage 1 per 64-byte block (out-of-line function): C/N/Q masks (2 loads, 6 cmpeq, 6 movemask), D=C|N,
+  FS = D<<1, Qs = Q<<1, FSs = D<<2 (carries from the previous block), op = Q&FS, od = (op - D - borrow)&D
+  (= (!D + op + carry) & D: op carried to its field's end, across blocks), bad = Qs&!(FSs^D) | D&(od^Qs).
+  Common block (bad==0, <=7 delimiters, 99.99% on dev5): 7 unconditional entries (tzcnt+add+store+blsr)
+  and one u64 of flags = pdep(pext(Qs,D),0x01..) + 2*pdep(pext(N,D),0x01..). Else `block_slow` (exact
+  loop, bad flags). Then 16 sentinel entries flagged bad.
+- Stage 2 per line, first entry k: is_simple = one u64 flag load and compare. Then 6 loads (vpmovsxdq /
+  vpmovzxbq) + 9 ymm ops + 4 stores write the fastev::Cut (s_j = e[k+j-1]+1+q_j, n_j = e[k+j]-s_j-q_j),
+  k4::decode_body, else k4::line_fb; k += 7 (the loop-carried chain is this add).
 - Not simple: first newline entry j >= k; if found: slow_line(line start) (or tail_fb if the line starts
   after b.len()-288), k = j+1; if none: next segment at the line start (slow_line if it is the segment's
   first line: longer than the scan / end of b).
@@ -117,8 +138,13 @@ the instruction count decides, and k6 v1 removes only 19/line (v1b 28).
 Note: an outside build of f35b7a6 (= v0, 558/line, Cut copied 3x per line) measured k6 slower (73.6-75.2
 ms line bench); v0 was never the candidate. v1 = 978adc9.
 
-## Next
-- e23/e60 checker -> tag k6-v1 -> image ss-k6-v1, lifetimes 10x e23 + 4x e60 (k4 vs k6 one image).
-- stage 1 register pressure (fss from dp via shld, cin in a register, one base register for e/fl, const
-  prefetch): written, not yet measured (v1b). Then v3 scorecard + v3 line bench.
-- batch surface for the two-loop decode (simple-run iterator over a segment).
+## Next / open
+- v3 candidate (5317fdf on the old base; cherry-pick onto ss-k6): the >7 check from the flatten's 7th
+  blsr, popcnt only on the common path, index-based block loop: 469.8 vs 472.4 (-2.6/line), tests 14/14.
+  Too small to show in lifetimes (~1 ms); not the candidate.
+- Where stage 1 could still shrink (v2 build, ~86/block): masks 21 (19 under v3 tuning), quote rule ~16,
+  flatten 28, flags 6, check + popcnt 5, loop/prefetch/state ~8. The floor of this design is ~80/block
+  (~103/line); the u8-offset + block-index entry format would save ~7 adds/block but costs ~6/line in
+  stage 2 and changes the published entry format (not done).
+- The decode reads the Cut from memory (+~20/line vs k4's register Cut): the two-loop batch decode that
+  reads the entries directly (other engineer) removes that; `simple_run` gives it batches.
