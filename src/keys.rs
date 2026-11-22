@@ -298,7 +298,17 @@ pub fn long_settings() {
     if std::env::var("SS_LONGOFF").is_ok() {
         LONG_OFF.store(true, AO::Relaxed);
     }
+    VERIFY_OCC.store(std::env::var("SS_VERIFYOCC").map_or(false, |v| v == "1"), AO::Relaxed);
 }
+
+/// SS_VERIFYOCC=1: the verification index sized from occurrences (as before).
+static VERIFY_OCC: AtomicBool = AtomicBool::new(false);
+/// Largest initial verification index per partition (slots; tests: small,
+/// to exercise the growth).
+static VERIFY_START: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4096);
+/// Wall ns of the verifications of this run: links, after the parse, event IDs.
+pub static VERIFY_SPLIT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static VERIFY_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// 32 lowercase hex digits as (first 16, last 16) values; None for any other byte.
 #[inline(always)]
@@ -419,6 +429,7 @@ fn clear_logs() {
 /// ingest_ts rerun) are dropped; seed and interner mode are kept.
 pub fn new_run() {
     clear_logs();
+    VERIFY_CALLS.store(0, AO::Relaxed);
     TAB.store(std::ptr::null_mut(), AO::Release);
 }
 
@@ -471,7 +482,9 @@ pub fn verify_longs(threads: usize) -> usize {
     let t0 = std::time::Instant::now();
     let d = verify_longs_inner(threads);
     LOG_HINT.store(LOG_HINT_NEXT.load(AO::Relaxed), AO::Relaxed);
-    VERIFY_NS.fetch_add(t0.elapsed().as_nanos() as u64, AO::Relaxed);
+    let ns = t0.elapsed().as_nanos() as u64;
+    VERIFY_NS.fetch_add(ns, AO::Relaxed);
+    VERIFY_SPLIT[VERIFY_CALLS.fetch_add(1, AO::Relaxed).min(1)].store(ns, AO::Relaxed);
     d
 }
 
@@ -484,12 +497,15 @@ pub static LONG_DISTINCT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// "long_entries=.. long_distinct=.. long_verify_ms=.." for the verbose report.
 pub fn long_stats() -> String {
     format!(
-        "long_entries={} long_distinct={} long_ev_entries={} long_ev_checked={} long_verify_ms={:.1}",
+        "long_entries={} long_distinct={} long_ev_entries={} long_ev_checked={} long_verify_ms={:.1} (links {:.1} parse {:.1} ev {:.1})",
         LONG_ENTRIES.load(AO::Relaxed),
         LONG_DISTINCT.load(AO::Relaxed),
         EV_ENTRIES.load(AO::Relaxed),
         EV_CHECKED.load(AO::Relaxed),
-        VERIFY_NS.load(AO::Relaxed) as f64 / 1e6
+        VERIFY_NS.load(AO::Relaxed) as f64 / 1e6,
+        VERIFY_SPLIT[0].load(AO::Relaxed) as f64 / 1e6,
+        VERIFY_SPLIT[1].load(AO::Relaxed) as f64 / 1e6,
+        VERIFY_SPLIT[2].load(AO::Relaxed) as f64 / 1e6
     )
 }
 
@@ -514,10 +530,13 @@ fn verify_longs_inner(threads: usize) -> usize {
                 break;
             }
             let n: usize = lists.iter().map(|v| v.len(p)).sum();
-            let size = (2 * n).next_power_of_two().max(16);
-            let mask = size - 1;
+            // sized by the distinct values, not the occurrences (a long ID
+            // occurs ~18 times on average): the index starts small and
+            // doubles at load 1/2 (SS_VERIFYOCC=1: sized from occurrences)
+            let mut size = if VERIFY_OCC.load(AO::Relaxed) { (2 * n).next_power_of_two().max(16) } else { (2 * n).next_power_of_two().clamp(16, VERIFY_START.load(AO::Relaxed)) };
+            let mut mask = size - 1;
             let mut idx = vec![0u32; size];
-            let mut ents: Vec<LEnt> = Vec::with_capacity(n);
+            let mut ents: Vec<LEnt> = Vec::with_capacity((size / 2).min(n));
             let mut bad = false;
             for v in lists.iter() {
                 for sl in v.get(p) {
@@ -528,6 +547,19 @@ fn verify_longs_inner(threads: usize) -> usize {
                             if i == 0 {
                                 ents.push(*e);
                                 idx[s] = ents.len() as u32;
+                                if 2 * ents.len() > size {
+                                    // grow: reinsert the distinct keys
+                                    size *= 2;
+                                    mask = size - 1;
+                                    idx = vec![0u32; size];
+                                    for (j, f) in ents.iter().enumerate() {
+                                        let mut t = slot_of(f.key, mask);
+                                        while idx[t] != 0 {
+                                            t = (t + 1) & mask;
+                                        }
+                                        idx[t] = j as u32 + 1;
+                                    }
+                                }
                                 break;
                             }
                             let f = &ents[i as usize - 1];
@@ -666,6 +698,7 @@ pub fn verify_ev_longs(threads: usize, multi: Option<&[u64]>) {
         COLLISION.store(true, AO::Relaxed);
     }
     VERIFY_NS.fetch_add(t0.elapsed().as_nanos() as u64, AO::Relaxed);
+    VERIFY_SPLIT[2].store(t0.elapsed().as_nanos() as u64, AO::Relaxed);
 }
 
 /// (first byte, hi, lo) of a long key, from the decode table.
@@ -1078,6 +1111,46 @@ mod tests {
         assert!(LONG_OFF.load(AO::Relaxed));
         LONG_BITS.store(60, AO::Relaxed);
         LONG_OFF.store(false, AO::Relaxed);
+        reset_longs(0);
+    }
+
+    /// The verification index grows from a small start: distinct values,
+    /// repeats and forced collisions give the same verdicts and decode table
+    /// as an index sized from the occurrences.
+    #[test]
+    fn verify_index_grows() {
+        let _g = LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        for &(bits, start) in &[(60u32, 16usize), (60, 4096), (9, 16), (9, 1 << 20)] {
+            reset_longs(0);
+            LONG_OFF.store(false, AO::Relaxed);
+            LONG_BITS.store(bits, AO::Relaxed);
+            VERIFY_START.store(start, AO::Relaxed);
+            // 20000 distinct IDs, each 1 to 4 times, interleaved
+            let ids: Vec<Vec<u8>> = (0..20_000u64).map(|i| hex_id(b"uUk-"[(i % 4) as usize], mix(i ^ 0x55), mix(i + 99))).collect();
+            let mut keys = Vec::new();
+            for r in 0..4u64 {
+                for (i, s) in ids.iter().enumerate() {
+                    if (i as u64 + r) % 4 >= r {
+                        keys.push((i, key_of(s)));
+                    }
+                }
+            }
+            let d = verify_longs(3);
+            let distinct_keys: std::collections::HashSet<u64> = keys.iter().map(|&(_, k)| k).collect();
+            assert_eq!(d, distinct_keys.len());
+            if bits == 60 {
+                assert!(!collision());
+                assert_eq!(d, ids.len());
+                for &(i, k) in keys.iter().step_by(7) {
+                    assert_eq!(decode(k), ids[i]);
+                }
+            } else {
+                // 2^9 keys for 20000 IDs: collisions must be seen
+                assert!(collision());
+            }
+        }
+        VERIFY_START.store(4096, AO::Relaxed);
+        LONG_BITS.store(60, AO::Relaxed);
         reset_longs(0);
     }
 
