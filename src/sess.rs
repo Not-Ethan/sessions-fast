@@ -95,6 +95,7 @@ fn bm_click(bm: &mut Bm, nb: usize, ts: u32, camp: u32) -> u64 {
         let tsv = _mm256_set1_epi32(ts as i32);
         let t1 = _mm256_set1_epi32(ts.wrapping_add(1) as i32);
         let cv = _mm256_set1_epi32(camp as i32);
+        let ones = _mm256_set1_epi32(-1);
         for b in 0..nb {
             let o = b * 8;
             let lo = _mm256_load_si256(bm.lo.as_ptr().add(o) as *const __m256i);
@@ -114,14 +115,19 @@ fn bm_click(bm: &mut Bm, nb: usize, ts: u32, camp: u32) -> u64 {
             let pmx = bm.mx.as_mut_ptr().add(o) as *mut __m256i;
             let bt = _mm256_load_si256(pbt);
             let bc = _mm256_load_si256(pbc);
-            // later: ts + 1 > bt (unsigned); tie: ts + 1 == bt (implies a winner)
-            let gt = _mm256_andnot_si256(_mm256_cmpeq_epi32(_mm256_min_epu32(t1, bt), t1), el);
-            let eq = _mm256_and_si256(_mm256_cmpeq_epi32(bt, t1), el);
-            let diff = _mm256_andnot_si256(_mm256_cmpeq_epi32(bc, cv), eq);
+            // ts + 1 in the qualifying lanes, 0 elsewhere: later = t > bt
+            // (never in the others); bt becomes max(bt, t). A tie lane with
+            // bt = t = 0 (no click yet, not qualifying) may get mx set: harmless,
+            // mx is read only when bt != 0, and a lane gets its first click
+            // through `later`, which clears mx.
+            let t = _mm256_and_si256(t1, el);
+            let nbt = _mm256_max_epu32(bt, t);
+            let later = _mm256_xor_si256(_mm256_cmpeq_epi32(nbt, bt), ones);
+            let diff = _mm256_andnot_si256(_mm256_cmpeq_epi32(bc, cv), _mm256_cmpeq_epi32(bt, t));
             let mx = _mm256_load_si256(pmx);
-            _mm256_store_si256(pmx, _mm256_or_si256(_mm256_andnot_si256(gt, mx), diff));
-            _mm256_store_si256(pbt, _mm256_blendv_epi8(bt, t1, gt));
-            _mm256_store_si256(pbc, _mm256_blendv_epi8(bc, cv, gt));
+            _mm256_store_si256(pmx, _mm256_or_si256(_mm256_andnot_si256(later, mx), diff));
+            _mm256_store_si256(pbt, nbt);
+            _mm256_store_si256(pbc, _mm256_blendv_epi8(bc, cv, later));
         }
     }
     m
