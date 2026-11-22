@@ -120,11 +120,13 @@ pub unsafe fn pack_wide(s: &[u8]) -> Option<u64> {
     let us = _mm_and_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(0x5F)), _mm_set1_epi8(-4));
     let codes = _mm_and_si128(_mm_add_epi8(_mm_add_epi8(v, off), us), inlen);
     let t = _mm_maddubs_epi16(codes, _mm_set1_epi16(0x0140));
+    // 24-bit lanes l0 = codes 0-3, l1 = 4-7, l2 = 8-11 (bytes 0-2 of each)
     let u = _mm_madd_epi16(t, _mm_set1_epi32(0x0001_1000));
-    let l0 = _mm_cvtsi128_si32(u) as u32 as u64;
-    let l1 = _mm_extract_epi32::<1>(u) as u32 as u64;
-    let l2 = _mm_extract_epi32::<2>(u) as u32 as u64;
-    let key = (((l0 << 36) | (l1 << 12) | (l2 >> 12)) << 4) | n as u64;
+    // key = l0 << 40 | l1 << 16 | l2 >> 8 | n, as one byte shuffle: codes 10
+    // and 11 are 0 whenever n <= 10 (masked by inlen), so l2 >> 8 is
+    // (l2 >> 12) << 4 and its low nibble is free for n
+    let k = _mm_shuffle_epi8(u, _mm_setr_epi8(9, 10, 4, 5, 6, 0, 1, 2, -128, -128, -128, -128, -128, -128, -128, -128));
+    let key = _mm_cvtsi128_si64(k) as u64 | n as u64;
     if (_mm_movemask_epi8(invalid) == 0) & (n.wrapping_sub(1) < 10) {
         Some(key)
     } else {
@@ -1133,6 +1135,39 @@ mod tests {
                     s.extend_from_slice(&[0xFF; 20]);
                     assert_eq!(unsafe { pack_wide(&s[..n]) }, want);
                 }
+            }
+        }
+    }
+
+    /// `pack_wide` edge cases: n = 10 followed by bytes outside the alphabet,
+    /// n = 11, n = 0, a quoted field (closing quote and comma after it).
+    #[test]
+    fn pack_wide_edges() {
+        let check = |s: &[u8], n: usize| {
+            assert_eq!(unsafe { pack_wide(&s[..n]) }, pack(&s[..n]), "{:?} n={}", s, n);
+        };
+        let mut s = b"abcdefghij".to_vec();
+        for tail in [[0u8, 0], [0xFF, 0xFF], [b' ', b'"'], [b',', b'\n'], [0x80, 0x7F], [b'z', b'z']] {
+            let mut t = s.clone();
+            t.extend_from_slice(&tail);
+            t.extend_from_slice(&[0xA5; 16]);
+            check(&t, 10);
+            assert!(unsafe { pack_wide(&t[..10]) }.is_some());
+            check(&t, 11);
+            assert!(unsafe { pack_wide(&t[..11]) }.is_none());
+            check(&t, 0);
+            assert!(unsafe { pack_wide(&t[..0]) }.is_none());
+        }
+        // a quoted field: the slice is the value inside the quotes
+        let line = b"\"u42_x-Z9\",next,field,0123456789abcdef";
+        check(&line[1..], 8);
+        assert_eq!(unsafe { pack_wide(&line[1..9]) }, pack(b"u42_x-Z9"));
+        // every length 1..=10 of an all-'z' and an all-'-' string, garbage after
+        for n in 1..=10 {
+            for c in [b'z', b'-'] {
+                s = vec![c; n];
+                s.extend_from_slice(&[0xFF; 20]);
+                check(&s, n);
             }
         }
     }
