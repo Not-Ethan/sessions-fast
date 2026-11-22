@@ -569,10 +569,38 @@ pub fn verify_ev_longs(threads: usize, multi: Option<&[u64]>) {
     if total == 0 {
         return;
     }
-    let set: Option<std::collections::HashSet<u64>> = multi.map(|m| m.iter().copied().collect());
-    if set.as_ref().is_some_and(|s| s.is_empty()) {
+    // the keys as an open-addressing set (keys are hashes already: their own
+    // bits index it; 0 = empty, never a key)
+    let set: Option<(Vec<u64>, usize)> = multi.map(|m| {
+        let size = (2 * m.len()).next_power_of_two().max(16);
+        let mask = size - 1;
+        let mut t = vec![0u64; size];
+        for &k in m {
+            let mut s = slot_of(k, mask);
+            while t[s] != 0 && t[s] != k {
+                s = (s + 1) & mask;
+            }
+            t[s] = k;
+        }
+        (t, mask)
+    });
+    if multi.is_some_and(|m| m.is_empty()) {
         return;
     }
+    let has = |k: u64| -> bool {
+        let (t, mask) = set.as_ref().unwrap();
+        let mut s = slot_of(k, *mask);
+        loop {
+            let x = t[s];
+            if x == k {
+                return true;
+            }
+            if x == 0 {
+                return false;
+            }
+            s = (s + 1) & mask;
+        }
+    };
     // the entries to compare, per partition, then a sort and run check
     let next = std::sync::atomic::AtomicUsize::new(0);
     let coll = AtomicBool::new(false);
@@ -587,9 +615,10 @@ pub fn verify_ev_longs(threads: usize, multi: Option<&[u64]>) {
             v.clear();
             for l in lists.iter() {
                 for sl in l.get(p) {
-                    match &set {
-                        Some(s) => v.extend(sl.iter().filter(|e| s.contains(&e.key))),
-                        None => v.extend_from_slice(sl),
+                    if set.is_some() {
+                        v.extend(sl.iter().filter(|e| has(e.key)));
+                    } else {
+                        v.extend_from_slice(sl);
                     }
                 }
             }
