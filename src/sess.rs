@@ -173,6 +173,9 @@ struct St {
     sess: Vec<Sess>,
     catsum: Vec<u64>,
     touched: Vec<u32>,
+    /// per day: (summed price, category) of the day's top category so far
+    /// (sums only grow, so the last update that beats it gives the top)
+    daytop: Vec<(u64, u32)>,
     wcount: Vec<u32>,
     wpos: Vec<u32>,
     /// session index at which the campaign entered the window
@@ -249,6 +252,7 @@ impl St {
             sess: Vec::new(),
             catsum: vec![0; ctx.ndays * 256],
             touched: Vec::new(),
+            daytop: vec![(0, u32::MAX); ctx.ndays],
             wcount: vec![0; ctx.ncamp.max(1)],
             wpos: vec![0; ctx.ncamp.max(1)],
             since: vec![0; ctx.ncamp.max(1)],
@@ -398,7 +402,7 @@ impl St {
             let cs = &mut cl[self.chist[b] as usize..self.chist[b + 1] as usize];
             let p0 = es[0].person;
             if es.iter().all(|r| r.person == p0) {
-                self.person(p0, p0, es, cs, ctx);
+                self.person(p0, p0, es, cs, false, ctx);
             } else {
                 self.mixed(es, cs, ctx);
             }
@@ -429,7 +433,7 @@ impl St {
             while l < cs.len() && cs[l].person == p {
                 l += 1;
             }
-            self.person(p, p, &me[i..k], &mut cs[j..l], ctx);
+            self.person(p, p, &me[i..k], &mut cs[j..l], true, ctx);
             i = k;
             j = l;
         }
@@ -482,7 +486,8 @@ impl St {
     /// clicks of the bucket `cs` (those with person `p` are the person's).
     /// `p`: the person's value in `es` / `cs` person fields (clicks of other
     /// persons in `cs` are skipped); `name`: keys::mix of the person key.
-    fn person(&mut self, p: u64, name: u64, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
+    /// `own`: every click in `cs` is the person's (mixed buckets).
+    fn person(&mut self, p: u64, name: u64, es: &[SRec], cs: &mut [Cl], own: bool, ctx: &Ctx) {
         self.acc.start();
         // events already in ts order: one scan, a new session at every gap
         // over W; equal timestamps have gap 0. The same sessions, counts and
@@ -505,14 +510,10 @@ impl St {
                 s.cnt += 1;
                 if r.pay != 0 {
                     let pay = r.pay;
-                    let price = (pay & 0xFF_FFFF) as u64;
-                    s.rev += price;
+                    s.rev += (pay & 0xFF_FFFF) as u64;
                     s.purch = 1;
-                    let idx = s.day as usize * 256 + (pay >> 24) as usize;
-                    if self.catsum[idx] == 0 {
-                        self.touched.push(idx as u32);
-                    }
-                    self.catsum[idx] += price;
+                    let day = s.day;
+                    self.cat_add(day, pay);
                 }
             }
         } else {
@@ -569,15 +570,11 @@ impl St {
             for k in 0..self.pur.len() {
                 let (t, pay) = self.pur[k];
                 let si = self.slot[(t / W) as usize].sidx as usize;
-                let price = (pay & 0xFF_FFFF) as u64;
                 let s = &mut self.sess[si];
-                s.rev += price;
+                s.rev += (pay & 0xFF_FFFF) as u64;
                 s.purch = 1;
-                let idx = s.day as usize * 256 + (pay >> 24) as usize;
-                if self.catsum[idx] == 0 {
-                    self.touched.push(idx as u32);
-                }
-                self.catsum[idx] += price;
+                let day = s.day;
+                self.cat_add(day, pay);
             }
         }
         // day runs (sessions are in time order, so days are non-decreasing)
@@ -592,7 +589,9 @@ impl St {
         self.acc.lap(P_WALK);
         // 3. the person's clicks (the bucket's clicks of person p), by ts
         let mut m = cs.len();
-        if let Some(k0) = cs.iter().position(|c| c.person != p) {
+        if own {
+            debug_assert!(cs.iter().all(|c| c.person == p));
+        } else if let Some(k0) = cs.iter().position(|c| c.person != p) {
             m = k0;
             for k in k0 + 1..cs.len() {
                 if cs[k].person == p {
@@ -642,9 +641,27 @@ impl St {
         }
         for &idx in &self.touched {
             self.catsum[idx as usize] = 0;
+            self.daytop[idx as usize / 256] = (0, u32::MAX);
         }
         self.touched.clear();
         self.acc.lap(P_ROWS);
+    }
+
+    /// A purchase `pay` (price | category rank << 24) in a session of day `day`.
+    #[inline(always)]
+    fn cat_add(&mut self, day: u32, pay: u32) {
+        let c = pay >> 24;
+        let idx = day as usize * 256 + c as usize;
+        let v = self.catsum[idx];
+        if v == 0 {
+            self.touched.push(idx as u32);
+        }
+        let v = v + (pay & 0xFF_FFFF) as u64;
+        self.catsum[idx] = v;
+        let t = &mut self.daytop[day as usize];
+        if v > t.0 || (v == t.0 && c < t.1) {
+            *t = (v, c);
+        }
     }
 
     /// Credits and assists of the current person's sessions when it has few
@@ -706,6 +723,10 @@ impl St {
     fn attribute_window(&mut self, pc: &[Cl], ncamp: usize, ndays: usize) {
         let ns = self.sess.len();
         let (mut add, mut rem) = (0usize, 0usize);
+        // the credit of the previous session with clicks, and its `add`: the
+        // clicks at the latest ts in the window all have index >= rem (they
+        // are >= the session start), so the credit depends on `add` only
+        let (mut memo_add, mut memo_credit) = (0usize, 0usize);
         for si in 0..ns {
             let s = self.sess[si];
             // click offsets c (base window_start - 7 days) qualify iff start <= c <= start + 7 days
@@ -718,7 +739,9 @@ impl St {
                 self.win_remove(pc[rem].camp, si, ndays);
                 rem += 1;
             }
-            let credit = if add > rem {
+            let credit = if add > rem && add == memo_add {
+                memo_credit
+            } else if add > rem {
                 // latest ts; among equal ts the smallest click_id
                 let tmax = pc[add - 1].ts;
                 let mut best = add - 1;
@@ -737,7 +760,9 @@ impl St {
                         }
                     }
                 }
-                pc[best].camp as usize
+                memo_add = add;
+                memo_credit = pc[best].camp as usize;
+                memo_credit
             } else {
                 ncamp
             };
@@ -759,18 +784,8 @@ impl St {
     /// Appends the user_daily row of the current person for local day `day`.
     #[inline(always)]
     fn row(&mut self, day: u32, sessions: u32, events: u32, revenue: u64, ctx: &Ctx) {
-        let mut top = u32::MAX;
-        let mut best = 0u64;
-        for &idx in &self.touched {
-            if idx as usize / 256 == day as usize {
-                let c = idx % 256;
-                let v = self.catsum[idx as usize];
-                if v > best || (v == best && c < top) {
-                    best = v;
-                    top = c;
-                }
-            }
-        }
+        // the day's top category (u32::MAX: no purchase), kept by cat_add
+        let top = self.daytop[day as usize].1;
         let cols = &mut self.cols;
         cols.uid.extend(&self.ubuf);
         cols.day.push((ctx.first_day + day as i64) as i32);
