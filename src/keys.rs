@@ -1098,6 +1098,38 @@ fn click_cmp_bytes(a: u64, b: u64) -> Ordering {
     x.cmp(y)
 }
 
+/// Hash of an event key (event_id): one multiply by an odd constant, a
+/// bijection on u64 (`ev_unhash` inverts it). Only its HIGH bits are well
+/// spread (the low k bits of a product depend only on the low k bits of the
+/// key): the event partition is its top bits and every table indexed by an
+/// event hash takes the bits just below the bits already used (dedup_insert,
+/// dedup_bucket, EidTable). Person and user keys keep `mix` (links.rs and
+/// sess.rs invert it and use its low bits).
+pub const EV_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
+/// The inverse of EV_MUL modulo 2^64 (Newton's iteration; checked below).
+pub const EV_INV: u64 = {
+    let a = EV_MUL;
+    let mut x = a; // correct to 3 bits for odd a; each step doubles
+    let mut i = 0;
+    while i < 6 {
+        x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+        i += 1;
+    }
+    x
+};
+const _: () = assert!(EV_MUL & 1 == 1 && EV_MUL.wrapping_mul(EV_INV) == 1);
+
+#[inline(always)]
+pub fn ev_hash(k: u64) -> u64 {
+    k.wrapping_mul(EV_MUL)
+}
+
+/// Inverse of `ev_hash`.
+#[inline(always)]
+pub fn ev_unhash(h: u64) -> u64 {
+    h.wrapping_mul(EV_INV)
+}
+
 /// A well-mixed 64-bit hash of a key (splitmix64 finalizer, a bijection).
 #[inline(always)]
 pub const fn mix(k: u64) -> u64 {
@@ -1126,6 +1158,23 @@ pub(crate) static LONG_TEST: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ev_unhash_inverts_ev_hash() {
+        let mut x: u64 = 0x0123_4567_89AB_CDEF;
+        for _ in 0..2_000_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            assert_eq!(ev_unhash(ev_hash(x)), x);
+            assert_eq!(ev_hash(ev_unhash(x)), x);
+        }
+        for v in [0u64, 1, u64::MAX, 1 << 63, 0xF, 0x10] {
+            assert_eq!(ev_unhash(ev_hash(v)), v);
+        }
+        // 0 is the only key hashing to 0 (tables use 0 as empty)
+        assert_eq!(ev_hash(0), 0);
+    }
 
     #[test]
     fn unmix_inverts_mix() {

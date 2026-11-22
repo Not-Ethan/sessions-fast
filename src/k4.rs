@@ -711,7 +711,7 @@ pub(crate) unsafe fn decode_body<S: EvSink, const P2: bool>(k: &K4, ctx: &Ctx, p
     }
     let ingest = d3e.rel_s.wrapping_add(sec3);
     let f0 = field(p, c.s[0], n0);
-    let eid = crate::keys::mix(if !p2 {
+    let eid = crate::keys::ev_hash(if !p2 {
         key_ev(f0)
     } else if oka {
         ka

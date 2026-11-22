@@ -646,7 +646,7 @@ fn event_line<'a, const WIDE: bool, S: EvSink, F: scan::Fields<'a>>(f: &F, f0: &
     let f3 = f.get(3);
     let ing = if WIDE && ctx.tsw { unsafe { ctx.tsp.parse_wide_f1(f3) } } else { ctx.tsp.parse(f3) };
     let Some(ing) = ing else { return };
-    let eid = keys::mix(if WIDE { unsafe { keys::key_of_ev_wide(f0) } } else { keys::key_of_ev(f0) });
+    let eid = keys::ev_hash(if WIDE { unsafe { keys::key_of_ev_wide(f0) } } else { keys::key_of_ev(f0) });
     let ingest = ingest_rel(ing, ctx.ws_s);
     let valid = 'v: {
         let f1 = f.get(1);
@@ -1002,17 +1002,19 @@ struct Slot {
 /// bucket): keeps the copy with the smallest ingest (ties: any, the copies are
 /// identical) and appends the kept copies that passed validation to `kept`.
 #[inline(always)]
-fn dedup_bucket(recs: &[ERec], table: &mut Vec<Slot>, kept: &mut Vec<(u64, u32, u32)>) {
+fn dedup_bucket(recs: &[ERec], used: u32, table: &mut Vec<Slot>, kept: &mut Vec<(u64, u32, u32)>) {
     let n = recs.len();
     if n == 0 {
         return;
     }
     let cap = (n + n / 4 + 16).next_power_of_two();
     let mask = cap - 1;
+    // the event hash's bits just below the `used` top bits (keys::ev_hash)
+    let ishift = 64u32.saturating_sub(used + cap.trailing_zeros());
     table.clear();
     table.resize(cap, Slot::default());
     for (j, r) in recs.iter().enumerate() {
-        let mut i = r.eid as usize & mask;
+        let mut i = (r.eid >> ishift) as usize & mask;
         loop {
             let s = &mut table[i];
             if s.eid == 0 {
@@ -1069,7 +1071,7 @@ fn dedup(e: &[Parts<ERec>], lt: &LinkTable, ctx: &Ctx) -> Vec<Parts<SRec>> {
                 let mut slices = e.iter().flat_map(|t| t.get(p)).filter(|sl| !sl.is_empty());
                 let first = slices.next().unwrap();
                 if slices.next().is_none() {
-                    dedup_bucket(first, &mut table, &mut kept);
+                    dedup_bucket(first, ctx.pe_bits, &mut table, &mut kept);
                 } else {
                     scratch.clear();
                     for t in e {
@@ -1077,7 +1079,7 @@ fn dedup(e: &[Parts<ERec>], lt: &LinkTable, ctx: &Ctx) -> Vec<Parts<SRec>> {
                             scratch.extend_from_slice(sl);
                         }
                     }
-                    dedup_bucket(&scratch, &mut table, &mut kept);
+                    dedup_bucket(&scratch, ctx.pe_bits, &mut table, &mut kept);
                 }
             } else {
                 // split by the hash bits just below the partition bits
@@ -1109,7 +1111,7 @@ fn dedup(e: &[Parts<ERec>], lt: &LinkTable, ctx: &Ctx) -> Vec<Parts<SRec>> {
                     }
                 }
                 for b in 0..(1 << sub_bits) {
-                    dedup_bucket(&scratch[counts[b]..counts[b + 1]], &mut table, &mut kept);
+                    dedup_bucket(&scratch[counts[b]..counts[b + 1]], ctx.pe_bits + sub_bits, &mut table, &mut kept);
                 }
             }
             const AHEAD: usize = 16;
@@ -1219,6 +1221,9 @@ const PROBE_LIMIT: usize = 4096;
 struct EidTable {
     slots: &'static [[AtomicU64; 2]],
     mask: usize,
+    /// 64 - log2(slots): a slot index is the event hash's top bits
+    /// (keys::ev_hash spreads only its high bits)
+    shift: u32,
     limit: usize,
     count: AtomicUsize,
     full: std::sync::atomic::AtomicBool,
@@ -1231,6 +1236,7 @@ impl EidTable {
         EidTable {
             slots: unsafe { std::slice::from_raw_parts(p, cap) },
             mask: cap - 1,
+            shift: 64 - cap.trailing_zeros(),
             limit: cap / 4 * 3,
             count: AtomicUsize::new(0),
             full: std::sync::atomic::AtomicBool::new(false),
@@ -1239,7 +1245,7 @@ impl EidTable {
 
     #[inline(always)]
     fn prefetch(&self, eid: u64) {
-        prefetch(self.slots.as_ptr().wrapping_add(eid as usize & self.mask) as *const u8);
+        prefetch(self.slots.as_ptr().wrapping_add((eid >> self.shift) as usize & self.mask) as *const u8);
     }
 
     /// Inserts one copy; returns false if the table is (nearly) full, in
@@ -1248,7 +1254,7 @@ impl EidTable {
     #[inline(always)]
     fn insert(&self, eid: u64, ingest: u32, loc: u32, kills: &mut Vec<u32>, fresh: &mut usize) -> bool {
         let enc = ((ingest.min(u32::MAX - 1) as u64 + 1) << 32) | loc as u64;
-        let mut i = eid as usize & self.mask;
+        let mut i = (eid >> self.shift) as usize & self.mask;
         let mut probes = 0usize;
         loop {
             probes += 1;
@@ -2174,8 +2180,9 @@ fn kill(loc: u32, sb: &[BOut], lb: LocBits) {
 /// ingest (on a tie, the one already there; equal-ingest copies are
 /// identical) and marks the loser's SRec dead.
 #[inline(always)]
-fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocBits, multi: &mut Vec<u64>) {
-    let mut i = r.eid as usize & mask;
+fn dedup_insert(table: &mut [ARec], mask: usize, ishift: u32, r: &ARec, sb: &[BOut], lb: LocBits, multi: &mut Vec<u64>) {
+    // the event hash's bits just below the partition (and split) bits
+    let mut i = (r.eid >> ishift) as usize & mask;
     loop {
         let slot = unsafe { table.get_unchecked_mut(i) };
         if slot.eid == 0 {
@@ -2185,7 +2192,7 @@ fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocB
         if slot.eid == r.eid {
             // a long event ID met more than once: its log entries are compared
             // (keys::verify_ev_longs)
-            let k = keys::unmix(r.eid);
+            let k = keys::ev_unhash(r.eid);
             if keys::is_long(k) {
                 multi.push(k);
             }
@@ -2226,6 +2233,8 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
             table.resize(cap, ARec::default());
             cap - 1
         };
+        // index shift of a table of mask + 1 slots below `used` top bits
+        let ishift = |used: u32, mask: usize| -> u32 { 64u32.saturating_sub(used + (mask + 1).trailing_zeros()) };
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(&(n, p)) = order.get(i) else { break };
@@ -2235,10 +2244,11 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
             let sub_bits = ceil_log2(n.div_ceil(sub_b)).min(12);
             if sub_bits == 0 {
                 let mask = reset(&mut table, n);
+                let sh = ishift(ctx.pe_bits, mask);
                 for t in sb {
                     for sl in t.a.get(p) {
                         for r in sl {
-                            dedup_insert(&mut table, mask, r, sb, lb, &mut multi);
+                            dedup_insert(&mut table, mask, sh, r, sb, lb, &mut multi);
                         }
                     }
                 }
@@ -2277,8 +2287,9 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
                     continue;
                 }
                 let mask = reset(&mut table, bucket.len());
+                let sh = ishift(ctx.pe_bits + sub_bits, mask);
                 for r in bucket {
-                    dedup_insert(&mut table, mask, r, sb, lb, &mut multi);
+                    dedup_insert(&mut table, mask, sh, r, sb, lb, &mut multi);
                 }
             }
         }
@@ -3720,7 +3731,7 @@ fn ev_batch_flush<S: EvSink>(bt: &mut EvBatch, base: *const u8, ctx: &Ctx, sink:
     }
     if upto >= 2 {
         for i in 0..n {
-            bt.eid[i] = keys::mix(unsafe { keys::key_of_ev_wide(bfield(bt, base, 0, i)) });
+            bt.eid[i] = keys::ev_hash(unsafe { keys::key_of_ev_wide(bfield(bt, base, 0, i)) });
         }
     }
     if upto >= 3 {
