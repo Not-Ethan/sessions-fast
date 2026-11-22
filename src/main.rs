@@ -2214,6 +2214,29 @@ fn phase_threads(name: &str, ctx: &Ctx) -> usize {
     env_usize(&format!("SS_{}_THREADS", name)).filter(|&n| n > 0).unwrap_or(ctx.threads).min(ctx.threads.max(1))
 }
 
+/// SS_PROBESTAT=1: longest successful probe sequence and summed probe
+/// lengths / entries over every dedup_b table (an offline scan of each
+/// filled table: displacement of every entry from its home slot)
+static PROBE_MAX: AtomicUsize = AtomicUsize::new(0);
+static PROBE_SUM: AtomicUsize = AtomicUsize::new(0);
+static PROBE_N: AtomicUsize = AtomicUsize::new(0);
+
+fn probe_scan(table: &[ARec], mask: usize, ishift: u32) {
+    let (mut mx, mut sum, mut n) = (0usize, 0usize, 0usize);
+    for (j, r) in table.iter().enumerate() {
+        if r.eid != 0 {
+            let home = (r.eid >> ishift) as usize & mask;
+            let d = j.wrapping_sub(home) & mask;
+            mx = mx.max(d + 1);
+            sum += d + 1;
+            n += 1;
+        }
+    }
+    PROBE_MAX.fetch_max(mx, Ordering::Relaxed);
+    PROBE_SUM.fetch_add(sum, Ordering::Relaxed);
+    PROBE_N.fetch_add(n, Ordering::Relaxed);
+}
+
 /// Returns the long event-ID keys met more than once (for keys::verify_ev_longs).
 fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
     let pe = 1usize << ctx.pe_bits;
@@ -2222,6 +2245,7 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
     let next = AtomicUsize::new(0);
     // records per sub-bucket of the in-cache split (SS_SUBB overrides, experiment)
     let sub_b = env_usize("SS_SUBB").filter(|&v| v > 0).unwrap_or(SUB_B);
+    let pstat = std::env::var("SS_PROBESTAT").is_ok();
     let multis = par(phase_threads("DEDUP", ctx), |_| {
         let mut multi: Vec<u64> = Vec::new();
         let mut table: Vec<ARec> = Vec::new();
@@ -2251,6 +2275,9 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
                             dedup_insert(&mut table, mask, sh, r, sb, lb, &mut multi);
                         }
                     }
+                }
+                if pstat {
+                    probe_scan(&table, mask, sh);
                 }
                 continue;
             }
@@ -2291,10 +2318,17 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
                 for r in bucket {
                     dedup_insert(&mut table, mask, sh, r, sb, lb, &mut multi);
                 }
+                if pstat {
+                    probe_scan(&table, mask, sh);
+                }
             }
         }
         multi
     });
+    if pstat {
+        let n = PROBE_N.load(Ordering::Relaxed).max(1);
+        eprintln!("probestat: dedup_b tables: {} entries, longest probe {}, mean probe {:.3}", n, PROBE_MAX.load(Ordering::Relaxed), PROBE_SUM.load(Ordering::Relaxed) as f64 / n as f64);
+    }
     // (duplicates are fine: keys::verify_ev_longs builds a set)
     multis.into_iter().flatten().collect()
 }
