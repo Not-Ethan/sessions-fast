@@ -52,8 +52,8 @@ pub static COUNT_SLOW: AtomicBool = AtomicBool::new(false);
 /// line splitters; 0 = none (SS_PFDIST, default 1024).
 pub static PF_DIST: AtomicUsize = AtomicUsize::new(1024);
 /// A second prefetch per line, 64 bytes further (lines average ~1.4 cache
-/// lines; SS_PF2=1, experiment).
-pub static PF2: AtomicBool = AtomicBool::new(false);
+/// lines; on unless SS_PF2=0).
+pub static PF2: AtomicBool = AtomicBool::new(true);
 /// The 128-byte splitters for lines the 64-byte windows cannot cut (long
 /// IDs, scorer version 5) unless SS_WIDECUT=0.
 pub static WIDE: AtomicBool = AtomicBool::new(true);
