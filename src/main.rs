@@ -1732,15 +1732,20 @@ fn kill(loc: u32, sb: &[BOut], lb: LocBits) {
 /// Inserts one copy into the dedup table: keeps the copy with the smallest
 /// ingest (on a tie, the one already there; equal-ingest copies are
 /// identical) and marks the loser's SRec dead.
+///
+/// The table is never cleared between buckets: a slot is empty when it
+/// holds 0 or a stale key, i.e. one whose top bits (partition | sub-bucket,
+/// above `shift`) differ from those of the bucket being deduplicated. Every
+/// key of the current bucket has the same top bits, every key left over from
+/// an earlier bucket (another partition, or another sub-bucket of this one)
+/// differs from them there, so a stale key never equals a current one, and
+/// within a bucket slots only go from empty to occupied (linear probing
+/// stays exact).
 #[inline(always)]
-fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocBits, multi: &mut Vec<u64>) {
+fn dedup_insert(table: &mut [ARec], mask: usize, shift: u32, r: &ARec, sb: &[BOut], lb: LocBits, multi: &mut Vec<u64>) {
     let mut i = r.eid as usize & mask;
     loop {
         let slot = unsafe { table.get_unchecked_mut(i) };
-        if slot.eid == 0 {
-            *slot = *r;
-            return;
-        }
         if slot.eid == r.eid {
             // a long event ID met more than once: its log entries are compared
             // (keys::verify_ev_longs)
@@ -1755,6 +1760,10 @@ fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocB
             } else {
                 kill(r.loc, sb, lb);
             }
+            return;
+        }
+        if slot.eid == 0 || ((slot.eid ^ r.eid) >> shift) != 0 {
+            *slot = *r;
             return;
         }
         i = (i + 1) & mask;
@@ -1779,8 +1788,10 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
         let mut counts: Vec<usize> = Vec::new();
         let reset = |table: &mut Vec<ARec>, n: usize| -> usize {
             let cap = (n + n / 4 + 16).next_power_of_two();
-            table.clear();
-            table.resize(cap, ARec::default());
+            if table.len() < cap {
+                // never cleared (see dedup_insert): only new slots are zeroed
+                table.resize(cap, ARec::default());
+            }
             cap - 1
         };
         loop {
@@ -1792,10 +1803,11 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
             let sub_bits = ceil_log2(n.div_ceil(SUB_B)).min(12);
             if sub_bits == 0 {
                 let mask = reset(&mut table, n);
+                let shift = 64 - ctx.pe_bits;
                 for t in sb {
                     for sl in t.a.get(p) {
                         for r in sl {
-                            dedup_insert(&mut table, mask, r, sb, lb, &mut multi);
+                            dedup_insert(&mut table, mask, shift, r, sb, lb, &mut multi);
                         }
                     }
                 }
@@ -1817,7 +1829,10 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
                 counts[b + 1] += counts[b];
             }
             scratch.clear();
-            scratch.resize(n, ARec::default());
+            // every one of the n slots is written by the scatter below (the
+            // same records as the counts): no zero fill
+            scratch.reserve(n);
+            unsafe { scratch.set_len(n) };
             let mut cur: Vec<usize> = counts[..(1 << sub_bits)].to_vec();
             for t in sb {
                 for sl in t.a.get(p) {
@@ -1835,7 +1850,7 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
                 }
                 let mask = reset(&mut table, bucket.len());
                 for r in bucket {
-                    dedup_insert(&mut table, mask, r, sb, lb, &mut multi);
+                    dedup_insert(&mut table, mask, shift, r, sb, lb, &mut multi);
                 }
             }
         }
