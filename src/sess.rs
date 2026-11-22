@@ -252,6 +252,8 @@ struct St {
     /// persons with 1..=64 sessions and at least `bm_min` clicks
     bm_on: bool,
     bm_min: usize,
+    /// at most this many clicks (SS_ATTRBM_MAX; default: no limit)
+    bm_max: usize,
     bm: Box<Bm>,
     /// per campaign: the sessions it assists (attribute_bm), and the
     /// campaigns with a non-zero mask
@@ -343,6 +345,7 @@ impl St {
             sorted_fast: std::env::var("SS_NOSORTED").is_err(),
             bm_on: BM_BUILD && std::env::var("SS_ATTRBM").map_or(true, |v| v != "0"),
             bm_min: crate::env_usize("SS_ATTRBM_MIN").unwrap_or(1).max(1),
+            bm_max: crate::env_usize("SS_ATTRBM_MAX").unwrap_or(usize::MAX),
             bm: Box::new(Bm { lo: [0; 64], hi: [0; 64], bt: [0; 64], bc: [0; 64], mx: [0; 64] }),
             amask: vec![0; ncamp.max(1)],
             atouched: Vec::new(),
@@ -739,7 +742,7 @@ impl St {
         let pc = &mut cs[..m];
         let small = pc.len() <= self.bf_max;
         // the bitmask path takes the clicks in any order
-        let bm = self.bm_on && ns <= 64 && pc.len() >= self.bm_min;
+        let bm = self.bm_on && ns <= 64 && pc.len() >= self.bm_min && pc.len() <= self.bm_max;
         if pc.len() > 1 && !small && !bm {
             pc.sort_unstable_by_key(|c| c.ts);
         }
@@ -1364,6 +1367,89 @@ mod tests {
         // the tables saw real work
         assert!(a.out.cred[..ncamp * ndays].iter().map(|c| c.s).sum::<u32>() > 10_000);
         assert!(a.out.assist.iter().sum::<u32>() > 10_000);
+
+        // equal-ts ties in every arrival order: 5 clicks at one ts (two of
+        // its campaigns, short and long ids), one later and one earlier
+        // click, sessions with the tie exactly at their start, exactly 7
+        // days before it, and 1 ms outside each side
+        let base = 3 * DAY as u32;
+        let tie = base + WEEK as u32;
+        let starts = [base - 1, base, base + 1, tie - 1, tie, tie + 1];
+        let sess: Vec<Sess> = starts
+            .iter()
+            .enumerate()
+            .map(|(i, &st)| Sess { start: st, day: st / DAY as u32, cnt: 1, purch: (i % 2) as u32, rev: 10 * i as u64, dend: 0 })
+            .collect();
+        let mut sess = sess;
+        let ns = sess.len();
+        let mut end = ns as u32;
+        for i in (0..ns).rev() {
+            if i + 1 < ns && sess[i + 1].day != sess[i].day {
+                end = i as u32 + 1;
+            }
+            sess[i].dend = end;
+        }
+        let tied = [(tie, 1u32, cks[1]), (tie, 2, cks[5]), (tie, 1, cks[2]), (tie, 3, cks[9]), (tie, 2, cks[3])];
+        let extra = [(tie + 7, 4u32, cks[6]), (base - 3, 0, cks[7])];
+        let mut perm: Vec<usize> = (0..tied.len()).collect();
+        let mut count = 0;
+        // Heap's algorithm over the tied clicks (120 orders), the extra two at
+        // the front and at the back
+        let mut cidx = vec![0usize; perm.len()];
+        let mut run = |perm: &[usize], front: bool, a: &mut St, c: &mut St| {
+            let mut pc: Vec<Cl> = Vec::new();
+            let push_extra = |pc: &mut Vec<Cl>| {
+                for &(ts, camp, ck) in &extra {
+                    pc.push(Cl { person: 1, ck, ts, camp });
+                }
+            };
+            if front {
+                push_extra(&mut pc);
+            }
+            for &i in perm {
+                let (ts, camp, ck) = tied[i];
+                pc.push(Cl { person: 1, ck, ts, camp });
+            }
+            if !front {
+                push_extra(&mut pc);
+            }
+            for st in [&mut *a, &mut *c] {
+                st.sess.clear();
+                st.sess.extend_from_slice(&sess);
+            }
+            a.attribute_small(&pc, ncamp, ndays);
+            c.attribute_bm(&pc, ncamp, ndays);
+        };
+        let (mut a2, mut c2) = (mk(), mk());
+        run(&perm, true, &mut a2, &mut c2);
+        run(&perm, false, &mut a2, &mut c2);
+        count += 2;
+        let mut i = 0;
+        while i < perm.len() {
+            if cidx[i] < i {
+                if i % 2 == 0 {
+                    perm.swap(0, i);
+                } else {
+                    perm.swap(cidx[i], i);
+                }
+                run(&perm, true, &mut a2, &mut c2);
+                run(&perm, false, &mut a2, &mut c2);
+                count += 2;
+                cidx[i] += 1;
+                i = 0;
+            } else {
+                cidx[i] = 0;
+                i += 1;
+            }
+        }
+        assert_eq!(count, 240);
+        for (k, (p, q)) in a2.out.cred.iter().zip(&c2.out.cred).enumerate() {
+            assert!(p.s == q.s && p.p == q.p && p.r == q.r, "tie orders: cred cell {}", k);
+        }
+        assert_eq!(a2.out.assist, c2.out.assist, "tie orders: assists");
+        // the tie decided credits: sessions starting at tie .. tie + 1 qualify
+        // for it (base .. base + 1 see the earlier click only up to its week)
+        assert!(a2.out.cred.iter().map(|c| c.s).sum::<u32>() == 240 * ns as u32);
         crate::keys::set_click_maps(Vec::new());
     }
 }
