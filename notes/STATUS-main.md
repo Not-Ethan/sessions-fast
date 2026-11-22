@@ -39,6 +39,13 @@ Updated: Sun 05:20 ET.
   2130.4, m21 SS_LEAN=0 2180.8, m21 SS_SUBB=32768 2100.2, pgo-on 2213.9, pgo-off 2187.9.
   e23 m19 810.5, m20 785.7, m21 763.5, m21 LEAN=0 780.8, pgo-on 786.8, pgo-off 781.1.
 
+- The per-Parts overflow counter (6b2a0c5) is probably most of m20's -105 ms on e60 (#8 and #10 alone
+  measured -9 and -5): every thread bumped one global atomic per overflowing 64-byte line, and whale
+  person partitions overflow heavily (733K lines on e23, about 2.1M on e60). Grep of every other
+  fetch_add in worker code (05:25): fastev SLOW/WIDE_N/CWIDE_N/CSLOW, k4 N_*, k5 N_* are all behind
+  COUNT / COUNT_SLOW flags (off unless a check mode); prof only with SS_PROF; keys counters once per
+  verification; link compact-index blocks once per 4096 IDs. No other shared counter in a hot loop.
+
 ## Known slow-but-exact paths (do not "fix" the order)
 - Click IDs that do not pack are references (file, length, offset) into the click file mapping. The
   input pages are released with MADV_DONTNEED after the parse and again after every sessions
