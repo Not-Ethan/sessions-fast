@@ -1692,7 +1692,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
     // and about -40 ms on e60 (the input is page cache, so keeping it mapped
     // adds file-backed RSS, not memory; sessions2 still drops the mappings
     // in parallel after its partitions)
-    let release = std::env::var("SS_RELEASE").map_or(false, |v| v == "1") && std::env::var("SS_NORELEASE").is_err();
+    let release = release_input(links_in.bytes + ev.bytes + cl.bytes);
     // map a chunk's pages in one call before parsing it (SS_POPULATE=1, experiment)
     let populate = std::env::var("SS_POPULATE").is_ok();
     let ntasks = ev.tasks.len() + cl.tasks.len();
@@ -1778,6 +1778,44 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
         BOut { a: sink.a, s: sink.s, c, overflow: sink.overflow, kills: std::mem::take(&mut sink.kills) }
     });
     (cell.into_inner().unwrap(), outs)
+}
+
+/// Whether the parse releases each task's input pages (decided once).
+/// Explicit: SS_RELEASE=1 / SS_RELEASE=0 (SS_NORELEASE: never). Otherwise
+/// only when the input is larger than a third of the memory limit (or
+/// SS_RELEASE_BYTES bytes): kept mapped it stays resident as clean
+/// file-backed pages (+5 GB of RSS on e60), and a larger-than-stated input
+/// must not push the process toward the limit.
+fn release_input(input_bytes: usize) -> bool {
+    let env = |k: &str| std::env::var(k).ok();
+    release_decision(input_bytes, env("SS_RELEASE").as_deref(), env("SS_NORELEASE").is_some(), env("SS_RELEASE_BYTES").and_then(|v| v.trim().parse().ok()), mem_limit_bytes())
+}
+
+/// `release_input`'s rule (pure, for the tests).
+fn release_decision(input_bytes: usize, explicit: Option<&str>, never: bool, threshold: Option<usize>, mem_limit: usize) -> bool {
+    if never {
+        return false;
+    }
+    match explicit {
+        Some("1") => return true,
+        Some("0") => return false,
+        _ => {}
+    }
+    input_bytes > threshold.unwrap_or(mem_limit / 3)
+}
+
+/// The memory limit: the cgroup's memory.max when it is a number, else
+/// MEM_GB, else 24 GB.
+fn mem_limit_bytes() -> usize {
+    if let Ok(t) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        if let Ok(v) = t.trim().parse::<usize>() {
+            return v;
+        }
+    }
+    if let Some(g) = env_usize("MEM_GB").filter(|&g| g > 0) {
+        return g << 30;
+    }
+    24usize << 30
 }
 
 /// The event and click tasks of one parse thread (parse_b), for any event sink.
@@ -4388,6 +4426,26 @@ fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
 #[cfg(test)]
 mod sink_tests {
     use super::*;
+
+    /// Input release: explicit switches win; otherwise release only above a
+    /// third of the memory limit (or the SS_RELEASE_BYTES threshold).
+    #[test]
+    fn release_rule() {
+        let g = 1usize << 30;
+        // automatic: 5.7 GB of input under 24 GB stays mapped, 9 GB is released
+        assert!(!release_decision(5_700_000_000, None, false, None, 24 * g));
+        assert!(release_decision(9 * g, None, false, None, 24 * g));
+        assert!(release_decision(3 * g, None, false, None, 8 * g));
+        // threshold override forces either side
+        assert!(release_decision(100, None, false, Some(1), 24 * g));
+        assert!(!release_decision(100, None, false, Some(1000), 24 * g));
+        // explicit switches
+        assert!(release_decision(1, Some("1"), false, None, 24 * g));
+        assert!(!release_decision(100 * g, Some("0"), false, None, 24 * g));
+        assert!(!release_decision(100 * g, Some("1"), true, None, 24 * g));
+        // anything else is automatic
+        assert!(release_decision(9 * g, Some("yes"), false, None, 24 * g));
+    }
 
     /// The lean sink writes exactly BSink's records (bulk mode) in the same
     /// order: dedup records, session records and locations, with linked and
