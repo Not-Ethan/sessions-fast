@@ -235,13 +235,14 @@ unsafe fn tvec(a: *const u8, b: *const u8) -> (u32, u32, u32, u32, u32) {
 }
 
 /// 13 digits at q: (value, nonzero unless all 13 bytes are digits). Reads
-/// q..q+16.
+/// q-3..q+13 (decode: field 2 starts at byte 3 or later, event_id being
+/// non-empty).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn f3_13(q: *const u8) -> (u64, u32) {
-    // lanes 3..16 = q[0..13]
-    let v = _mm_slli_si128::<3>(_mm_loadu_si128(q as *const __m128i));
+    // lanes 3..16 = q[0..13] (lanes 0..3 = q[-3..0], masked out below)
+    let v = _mm_loadu_si128(q.sub(3) as *const __m128i);
     let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
     let ok = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) as u32;
     let dz = _mm_and_si128(d, _mm_setr_epi8(0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
