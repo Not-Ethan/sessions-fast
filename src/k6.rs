@@ -112,10 +112,10 @@ pub(crate) struct Ring {
 
 /// Stage 1 state carried from block to block.
 struct S1 {
-    /// previous block's delimiters and quotes; carry of `od`
+    /// previous block's delimiters and quotes; borrow of `od` (1 - carry)
     dp: u64,
     qp: u64,
-    cin: u8,
+    bin: u8,
     /// next entry index
     kb: usize,
 }
@@ -125,10 +125,6 @@ unsafe fn rd64(p: *const u8) -> u64 {
     u64::from_le(std::ptr::read_unaligned(p as *const u64))
 }
 
-#[inline(always)]
-unsafe fn rd32(p: *const u8) -> u32 {
-    u32::from_le(std::ptr::read_unaligned(p as *const u32))
-}
 
 // ---------------------------------------------------------------- stage 1
 
@@ -151,13 +147,19 @@ unsafe fn block(st: &mut S1, q: *const u8, base: u32, vm: u64, e: *mut u32) {
     // fs << 1 with the previous block's fs bit 63 (= its d bit 62)
     let fss = (d << 2) | (st.dp >> 62);
     let op = qq & fs;
+    // od: op carried through its field to the delimiter that ends it, i.e.
+    // (!d + op + carry) & d. As op - d - borrow (the same sum mod 2^64; the
+    // borrow out is the inverse of the carry out, so the state is the borrow).
     let mut sum = 0u64;
-    let cout = _addcarry_u64(st.cin, !d, op, &mut sum);
+    let bout = _subborrow_u64(st.bin, op, d, &mut sum);
     let od = sum & d;
-    let bad = (qs & !fss & !d) | (d & ((od ^ qs) | (qs & fss)));
+    // bad (see the header): d & qs & fss (a one-byte quoted field) and
+    // !d & qs & !fss (an inner quote), together qs & !(fss ^ d); and at a
+    // delimiter od ^ qs (a field that starts with a quote xor ends with one)
+    let bad = (qs & !(fss ^ d)) | (d & (od ^ qs));
     st.dp = d;
     st.qp = qq;
-    st.cin = cout;
+    st.bin = bout;
     let kb = st.kb;
     let cnt = d.count_ones() as usize;
     // at most 7 delimiters in a block: 99.99% of dev5's blocks (8 or more, or a
@@ -217,9 +219,11 @@ pub(crate) unsafe fn stage1(p: *const u8, nb: usize, lastmask: u64, e: *mut u32)
     *e = u32::MAX;
     *fl = F_NL;
     // the byte before p ends a line: a delimiter there, no quote, no carry
-    let mut st = S1 { dp: 1 << 63, qp: 0, cin: 0, kb: 1 };
+    let mut st = S1 { dp: 1 << 63, qp: 0, bin: 1, kb: 1 };
     let mut q = p;
     let mut base = 0u32;
+    // the nb - 1 full blocks, then the last (masked) block (unrolling x2
+    // measured no fewer instructions)
     let qend = p.add((nb - 1) * 64);
     while q < qend {
         super::prefetch(q.wrapping_add(PFD));
@@ -272,11 +276,11 @@ unsafe fn cut_into(c: *mut fastev::Cut, e: *const u32, fl: *const u8, k: usize) 
     // fields 0..3: flags of entries k..k+3 are 0 or 1 (simple line)
     let alo = ld(k - 1);
     let blo = ld(k);
-    let qlo = _mm256_cvtepu8_epi64(_mm_cvtsi32_si128(rd32(fl.add(k)) as i32));
+    let qlo = _mm256_cvtepu8_epi64(_mm_loadl_epi64(fl.add(k) as *const __m128i));
     // fields 3..6: entry k+6 carries the newline flag
     let ahi = ld(k + 2);
     let bhi = ld(k + 3);
-    let qhi = _mm256_and_si256(_mm256_cvtepu8_epi64(_mm_cvtsi32_si128(rd32(fl.add(k + 3)) as i32)), one);
+    let qhi = _mm256_and_si256(_mm256_cvtepu8_epi64(_mm_loadl_epi64(fl.add(k + 3) as *const __m128i)), one);
     let slo = _mm256_add_epi64(_mm256_add_epi64(alo, qlo), one);
     let shi = _mm256_add_epi64(_mm256_add_epi64(ahi, qhi), one);
     let nlo = _mm256_sub_epi64(_mm256_sub_epi64(blo, slo), qlo);

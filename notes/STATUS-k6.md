@@ -76,6 +76,17 @@ branches 6, flatten 32 (8 x tzcnt/add/store/blsr), flags 8 (2 pext, 2 pdep, or, 
 prefetch 1, carried state ~3. Floor of this design about 90.
 NB=128 segments: no gain (line bench 59.3-60.7 ms).
 
+## Rebased onto k4-v2e (744d257) at 05:14; decision rule from the coordinator
+k6 ships only if, on one shipped-style image, mirrored order (ab_env.sh k4-first x5 + k6-first x5),
+against k4-v2e: >= 5 ms on e23 over 10 rounds AND a consistent gain on e60 over 8 rounds.
+Verdict due 7:00 AM with per-round lifetimes.
+- rebased v1b (tree ss4, image ss-k6-r): k6test 14/14, SS_K6CHECK dev5 OK; lifetimes queued.
+- v2 candidate 4936c59 (7 unconditional entries, flags via one constant + lea, moving pointer):
+  483.0/line total (k6-s1 117.8) on the rebased tree (k4-v2e decode). NB: cgaddr's decode line ranges
+  are stale after the rebase (ts/ids/validity split wrong), totals are right.
+- v2 additions in test: stage-1 loop unrolled x2; bad = (qs & !(fss ^ d)) | (d & (od ^ qs)) (5 ops
+  instead of 7); od via _subborrow_u64 (op - d - borrow = !d + op + carry mod 2^64, borrow = !carry).
+
 ## Lifetimes (ab_env.sh, one image, flag-free otherwise; ms)
 ss-k6-v1 (978adc9, shipped Dockerfile, Rust 1.100, v3 binary):
 - e23 x10 (k4/k6): 836.4/829.7 826.7/840.5 825.9/822.7 821.6/820.6 822.4/817.9 823.7/814.3 827.1/819.0
