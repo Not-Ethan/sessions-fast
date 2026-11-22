@@ -42,6 +42,9 @@ pub static SLOW: AtomicUsize = AtomicUsize::new(0);
 pub static CLICKS: AtomicBool = AtomicBool::new(false);
 /// Click lines handed to the general scanner (statistics).
 pub static CSLOW: AtomicUsize = AtomicUsize::new(0);
+/// Lines cut by the 128-byte splitters (statistics, counted like SLOW).
+pub static WIDE_N: AtomicUsize = AtomicUsize::new(0);
+pub static CWIDE_N: AtomicUsize = AtomicUsize::new(0);
 /// SLOW / CSLOW are counted only while set (the checks): a shared counter
 /// bumped by every thread for every slow line costs far more than the line.
 pub static COUNT_SLOW: AtomicBool = AtomicBool::new(false);
@@ -410,6 +413,9 @@ pub fn for_each_line2<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FR: FnMut
                 if wide && off <= lim_w {
                     let c = cut_wide::<AVX2>(p);
                     if c.ok {
+                        if COUNT_SLOW.load(Ordering::Relaxed) {
+                            WIDE_N.fetch_add(1, Ordering::Relaxed);
+                        }
                         ff(&fields(p, &c));
                         off += c.len;
                         continue;
@@ -544,6 +550,9 @@ pub fn for_each_click<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 4])>(b: &'a [u8
                 if wide && off <= lim_w {
                     let c = cut4_wide::<AVX2>(p);
                     if c.ok {
+                        if COUNT_SLOW.load(Ordering::Relaxed) {
+                            CWIDE_N.fetch_add(1, Ordering::Relaxed);
+                        }
                         f(&fields4(p, &c));
                         off += c.len;
                         continue;
@@ -602,12 +611,13 @@ pub fn click_check(links_in: &super::Input, cl: &super::Input, ctx: &Ctx) {
     }
     CLICKS.store(saved, Ordering::Relaxed);
     eprintln!(
-        "clickcheck: OK {} tasks, {} lines, {} click records identical (avx2={}); {} lines took the general path",
+        "clickcheck: OK {} tasks, {} lines, {} click records identical (avx2={}); {} lines took the general path, {} the 128-byte splitter",
         cl.tasks.len(),
         lines,
         recs,
         ctx.avx2,
-        CSLOW.load(Ordering::Relaxed)
+        CSLOW.load(Ordering::Relaxed),
+        CWIDE_N.load(Ordering::Relaxed)
     );
 }
 
@@ -664,12 +674,13 @@ pub fn check(ev: &super::Input, ctx: &Ctx) {
         }
     }
     eprintln!(
-        "evcheck: OK {} tasks, {} lines, {} copies identical (avx2={}); {} lines took the general path",
+        "evcheck: OK {} tasks, {} lines, {} copies identical (avx2={}); {} lines took the general path, {} the 128-byte splitter",
         ev.tasks.len(),
         lines,
         copies,
         ctx.avx2,
-        SLOW.load(Ordering::Relaxed)
+        SLOW.load(Ordering::Relaxed),
+        WIDE_N.load(Ordering::Relaxed)
     );
 }
 
