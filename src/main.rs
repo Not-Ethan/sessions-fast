@@ -14,7 +14,7 @@ mod sys;
 mod ts;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use links::LinkTable;
@@ -724,19 +724,12 @@ fn event_task_scan<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx,
 /// Receives every valid click, routed by person (partition `q`).
 trait CSink {
     fn push_click(&mut self, q: usize, r: CRec);
-    /// Prefetch hint for a coming push to partition q (default: none).
-    #[inline(always)]
-    fn prefetch_click(&self, _q: usize) {}
 }
 
 impl CSink for Parts<CRec> {
     #[inline(always)]
     fn push_click(&mut self, q: usize, r: CRec) {
         self.push(q, r)
-    }
-    #[inline(always)]
-    fn prefetch_click(&self, q: usize) {
-        self.prefetch_stage(q)
     }
 }
 
@@ -756,27 +749,6 @@ fn click_task<const AVX2: bool, C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &
         r.person = person_hash(lt, user, h);
         cache.put(user, h, r.person);
         c.push_click((r.person >> (64 - ctx.ps_bits)) as usize, r);
-    };
-    // batched (SS_CBATCH, default): clicks queue up to CB; every CB/2 the
-    // oldest half is resolved (persons, staging lines prefetched), then
-    // written, in queue order
-    const CB: usize = 64;
-    let batch = CRING_BATCH.load(Ordering::Relaxed);
-    let mut cq = [(CRec { person: 0, ck: 0, ts: 0, camp: 0, _pad: 0 }, 0u64); CB];
-    let mut cn = 0usize;
-    let cq_run = |c: &mut C, cache: &mut PCache, cq: &mut [(CRec, u64); CB], n: usize| {
-        let mut hp = [0u64; CB];
-        for k in 0..n {
-            let (r, h) = cq[k];
-            hp[k] = person_hash(lt, r.person, h);
-            c.prefetch_click((hp[k] >> (64 - ctx.ps_bits)) as usize);
-        }
-        for k in 0..n {
-            let (mut r, h) = cq[k];
-            cache.put(r.person, h, hp[k]);
-            r.person = hp[k];
-            c.push_click((hp[k] >> (64 - ctx.ps_bits)) as usize, r);
-        }
     };
     let mut line = |f: &[&[u8]; 4]| {
         if f[0].is_empty() || f[1].is_empty() {
@@ -808,16 +780,6 @@ fn click_task<const AVX2: bool, C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &
         lt.prefetch_h(h);
         // `person` holds the user key until the lookup in `emit`
         let r = (CRec { person: user, ck, ts: (t - cws) as u32, camp: camp as u32, _pad: 0 }, h);
-        if batch {
-            cq[cn] = r;
-            cn += 1;
-            if cn == CB {
-                cq_run(c, cache, &mut cq, CB / 2);
-                cq.copy_within(CB / 2..CB, 0);
-                cn = CB / 2;
-            }
-            return;
-        }
         if rn == RING {
             emit(c, cache, ring[rh]);
             ring[rh] = r;
@@ -836,13 +798,7 @@ fn click_task<const AVX2: bool, C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &
     for k in 0..rn {
         emit(c, cache, ring[(rh + k) % RING]);
     }
-    if cn > 0 {
-        cq_run(c, cache, &mut cq, cn);
-    }
 }
-
-/// Batched click emission with staging-line prefetch (SS_CBATCH=0: off).
-static CRING_BATCH: AtomicBool = AtomicBool::new(true);
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
@@ -1409,28 +1365,9 @@ impl BSink<'_> {
     /// ago) and moves the rest to the front.
     #[inline(never)]
     fn bulk_run(&mut self) {
-        if self.gt.is_none() && !self.nolookup && BULK_PF.load(Ordering::Relaxed) {
-            // two passes: persons (link slots prefetched when queued) and a
-            // prefetch of both records' staging lines, then the writes; same
-            // records in the same order as emit()
-            let mut hp = [0u64; BULK_RUN];
-            for k in 0..BULK_RUN {
-                let p = self.bulk[k];
-                let person = person_hash(self.lt, p.user, p.h);
-                hp[k] = person;
-                self.s.prefetch_stage((person >> (64 - self.ps_bits)) as usize);
-                self.a.prefetch_stage((p.eid >> (64 - self.pe_bits)) as usize);
-            }
-            for k in 0..BULK_RUN {
-                let p = self.bulk[k];
-                self.cache.put(p.user, p.h, hp[k]);
-                self.emit_hp(p, hp[k]);
-            }
-        } else {
-            for k in 0..BULK_RUN {
-                let p = self.bulk[k];
-                self.emit(p);
-            }
+        for k in 0..BULK_RUN {
+            let p = self.bulk[k];
+            self.emit(p);
         }
         self.bulk.copy_within(BULK_RUN..BULK_CAP, 0);
         self.bn = BULK_CAP - BULK_RUN;
@@ -1439,9 +1376,6 @@ impl BSink<'_> {
 
 /// Bulk queue: resolve BULK_RUN copies whenever BULK_CAP are queued (build-
 /// time overrides SS_BULKCAP / SS_BULKRUN for experiments).
-/// Batched bulk emission with staging-line prefetch (SS_BULKPF=0: off).
-static BULK_PF: AtomicBool = AtomicBool::new(true);
-
 const BULK_CAP: usize = const_usize(option_env!("SS_BULKCAP"), 48);
 const BULK_RUN: usize = const_usize(option_env!("SS_BULKRUN"), 32);
 
@@ -2642,8 +2576,6 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     }
     fastev::PF2.store(std::env::var("SS_PF2").map_or(true, |v| v != "0"), Ordering::Relaxed);
     sess::SPF.store(std::env::var("SS_SPF").is_ok(), Ordering::Relaxed);
-    BULK_PF.store(std::env::var("SS_BULKPF").map_or(true, |v| v != "0"), Ordering::Relaxed);
-    CRING_BATCH.store(std::env::var("SS_CBATCH").map_or(true, |v| v != "0"), Ordering::Relaxed);
     // 128-byte splitters for lines with long IDs unless SS_WIDECUT=0
     fastev::WIDE.store(std::env::var("SS_WIDECUT").map_or(true, |v| v != "0"), Ordering::Relaxed);
     if std::env::var("SS_CLICKCHECK").is_ok() {
