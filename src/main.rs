@@ -1315,7 +1315,9 @@ struct BSink<'a> {
     cache: PCache,
     /// queue + bulk lookups (default; SS_RING=1 selects the ring instead)
     use_bulk: bool,
-    bulk: [Pending; BULK_CAP],
+    /// ring of queued copies: bn of them from index bh (mod BULK_RING)
+    bulk: [Pending; BULK_RING],
+    bh: usize,
     bn: usize,
     /// batched output for batched parsing (SS_BATCHOUT=0 disables)
     batch_out: bool,
@@ -1374,22 +1376,34 @@ impl BSink<'_> {
         }
         let n = self.bn;
         for k in 0..n {
-            let p = self.bulk[k];
+            let p = self.bulk[(self.bh + k) & (BULK_RING - 1)];
             self.emit(p);
         }
+        self.bh = 0;
         self.bn = 0;
+    }
+
+    /// Queues a copy (bulk mode); resolves the oldest BULK_RUN when BULK_CAP
+    /// are queued.
+    #[inline(always)]
+    fn bulk_push(&mut self, p: Pending) {
+        self.bulk[(self.bh + self.bn) & (BULK_RING - 1)] = p;
+        self.bn += 1;
+        if self.bn == BULK_CAP {
+            self.bulk_run();
+        }
     }
 
     /// Bulk mode: resolves and emits the oldest BULK_RUN queued copies (their
     /// link-table slots were prefetched at least BULK_CAP - BULK_RUN copies
-    /// ago) and moves the rest to the front.
+    /// ago); the ring's head moves past them (nothing is copied).
     #[inline(never)]
     fn bulk_run(&mut self) {
         for k in 0..BULK_RUN {
-            let p = self.bulk[k];
+            let p = self.bulk[(self.bh + k) & (BULK_RING - 1)];
             self.emit(p);
         }
-        self.bulk.copy_within(BULK_RUN..BULK_CAP, 0);
+        self.bh = (self.bh + BULK_RUN) & (BULK_RING - 1);
         self.bn = BULK_CAP - BULK_RUN;
     }
 }
@@ -1398,6 +1412,8 @@ impl BSink<'_> {
 /// time overrides SS_BULKCAP / SS_BULKRUN for experiments).
 const BULK_CAP: usize = const_usize(option_env!("SS_BULKCAP"), 48);
 const BULK_RUN: usize = const_usize(option_env!("SS_BULKRUN"), 32);
+/// Ring size of the bulk queue (a power of two, at least BULK_CAP).
+const BULK_RING: usize = BULK_CAP.next_power_of_two();
 
 impl EvSink for BSink<'_> {
     /// Batched output: hash users and prefetch their link-table slots for the
@@ -1461,11 +1477,7 @@ impl EvSink for BSink<'_> {
             None => {
                 if let Some(gt) = self.gt {
                     gt.prefetch(eid);
-                    self.bulk[self.bn] = Pending { eid, user: 0, h: 0, ingest, ts: 0, pay: 0 };
-                    self.bn += 1;
-                    if self.bn == BULK_CAP {
-                        self.bulk_run();
-                    }
+                    self.bulk_push(Pending { eid, user: 0, h: 0, ingest, ts: 0, pay: 0 });
                 } else {
                     self.a.push((eid >> (64 - self.pe_bits)) as usize, ARec { eid, ingest, loc: LOC_NONE })
                 }
@@ -1487,11 +1499,7 @@ impl EvSink for BSink<'_> {
                 }
                 self.lt.prefetch_h(h);
                 if self.use_bulk {
-                    self.bulk[self.bn] = p;
-                    self.bn += 1;
-                    if self.bn == BULK_CAP {
-                        self.bulk_run();
-                    }
+                    self.bulk_push(p);
                     return;
                 }
                 if self.rn == BRING {
@@ -1586,7 +1594,8 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
             rh: 0,
             rn: 0,
             use_bulk: std::env::var("SS_RING").is_err(),
-            bulk: [Pending::default(); BULK_CAP],
+            bulk: [Pending::default(); BULK_RING],
+            bh: 0,
             bn: 0,
             tbase: ((t as u64) << (lb.qbits + lb.ibits)) as u32,
             overflow: false,
@@ -3482,7 +3491,8 @@ fn pair_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
                             rh: 0,
                             rn: 0,
                             use_bulk: std::env::var("SS_RING").is_err(),
-                            bulk: [Pending::default(); BULK_CAP],
+                            bulk: [Pending::default(); BULK_RING],
+                            bh: 0,
                             bn: 0,
                             tbase: ((wi as u64) << (lb.qbits + lb.ibits)) as u32,
                             overflow: false,
@@ -3756,7 +3766,8 @@ fn decomp_bench(ev: &Input, links_in: &Input, ctx: &Ctx) {
                         rn: 0,
                         // as in production: bulk lookup queue unless SS_RING
                         use_bulk: std::env::var("SS_RING").is_err(),
-                        bulk: [Pending::default(); BULK_CAP],
+                        bulk: [Pending::default(); BULK_RING],
+                        bh: 0,
                         bn: 0,
                         tbase: ((ti as u64) << (lb.qbits + lb.ibits)) as u32,
                         overflow: false,
@@ -3950,7 +3961,8 @@ fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
         rh: 0,
         rn: 0,
         use_bulk: std::env::var("SS_BULK").is_ok(),
-        bulk: [Pending::default(); BULK_CAP],
+        bulk: [Pending::default(); BULK_RING],
+        bh: 0,
         bn: 0,
         tbase: 0,
         overflow: false,
