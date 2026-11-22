@@ -1687,7 +1687,12 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
     let cap_a = cap(est_lines, pe);
     let cap_s = cap(est_lines, ps);
     let cap_c = cap(est_clicks, ps);
-    let release = std::env::var("SS_NORELEASE").is_err();
+    // input pages are no longer released after each parse task (opt-in with
+    // SS_RELEASE=1): measured on m20, flag-free mirrored, -10.6 ms on e23
+    // and about -40 ms on e60 (the input is page cache, so keeping it mapped
+    // adds file-backed RSS, not memory; sessions2 still drops the mappings
+    // in parallel after its partitions)
+    let release = std::env::var("SS_RELEASE").map_or(false, |v| v == "1") && std::env::var("SS_NORELEASE").is_err();
     // map a chunk's pages in one call before parsing it (SS_POPULATE=1, experiment)
     let populate = std::env::var("SS_POPULATE").is_ok();
     let ntasks = ev.tasks.len() + cl.tasks.len();
