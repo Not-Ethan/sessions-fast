@@ -453,7 +453,10 @@ fn verify_longs_inner(threads: usize) -> usize {
     let parts: Vec<PartTab> = done.into_iter().map(|d| d.1).collect();
     let distinct = parts.iter().map(|t| t.ents.len()).sum();
     LONG_DISTINCT.store(distinct as u64, AO::Relaxed);
-    TAB.store(Box::into_raw(Box::new(LongTab { parts })), AO::Release);
+    // black_box: rustc 1.85's LLVM otherwise turns the boxed table into a
+    // global with an i8 "initialised" flag and fails to select its atomic swap
+    let tab = std::hint::black_box(Box::into_raw(Box::new(LongTab { parts })));
+    TAB.store(tab, AO::Release);
     distinct
 }
 
