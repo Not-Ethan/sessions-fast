@@ -589,6 +589,24 @@ pub fn verify_ev_longs(threads: usize, multi: Option<&[u64]>) {
     if multi.is_some_and(|m| m.is_empty()) {
         return;
     }
+    // a bitmap over other key bits in front of the set (256 KB, in cache;
+    // most entries are not in the set and stop here)
+    const BM_BITS: u32 = 21;
+    let bm: Vec<u64> = match multi {
+        Some(m) => {
+            let mut b = vec![0u64; 1 << (BM_BITS - 6)];
+            for &k in m {
+                let i = ((k >> 24) & ((1 << BM_BITS) - 1)) as usize;
+                b[i >> 6] |= 1 << (i & 63);
+            }
+            b
+        }
+        None => Vec::new(),
+    };
+    let maybe = |k: u64| -> bool {
+        let i = ((k >> 24) & ((1 << BM_BITS) - 1)) as usize;
+        bm[i >> 6] >> (i & 63) & 1 != 0
+    };
     let has = |k: u64| -> bool {
         let (t, mask) = set.as_ref().unwrap();
         let mut s = slot_of(k, *mask);
@@ -618,7 +636,7 @@ pub fn verify_ev_longs(threads: usize, multi: Option<&[u64]>) {
             for l in lists.iter() {
                 for sl in l.get(p) {
                     if set.is_some() {
-                        v.extend(sl.iter().filter(|e| has(e.key)));
+                        v.extend(sl.iter().filter(|e| maybe(e.key) && has(e.key)));
                     } else {
                         v.extend_from_slice(sl);
                     }
