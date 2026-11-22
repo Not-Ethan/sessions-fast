@@ -40,7 +40,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 /// k5 on when SS_K5 is not set.
-pub const DEFAULT: bool = false;
+pub const DEFAULT: bool = true;
 /// click tasks through k5 (SS_K5; needs AVX2, see `main::click_task_avx2`).
 pub static ON: AtomicBool = AtomicBool::new(false);
 /// statistics (checks only): lines cut by the kernel / handed to the scanner
