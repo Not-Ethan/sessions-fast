@@ -49,7 +49,16 @@ The whole-pipeline checks on ss-gate (fixtures, dev5, e7, e23, e60, f23 with the
 SS_POISON=1 and SS_NOEXEC=1) are listed under Results when done.
 
 ## Results
-(filled in as they come)
+- **Counts** (cachegrind, dev5, x86-64-v3 profiling build, per event line, SS_ATTRBM on vs 0):
+  - whole program 992 vs 992 instructions;
+  - St::person 103.7 vs 97.7; the click sort it no longer needs was the other 6;
+  - simulated mispredicts 4.30 vs 4.57 for the whole program, 1.2 vs 1.4 in St::person.
+- **Lifetimes** (`ab_env.sh`, one image, mirrored, SS_ATTRBM on vs 0):
+  - e60: 1900.3 vs 1914.2 ms median, 6+6 rounds: -13.9 ms (-0.73%), new faster in 6 of 6. Ranges 1899-1904 vs
+    1904-1916.
+  - e23: 726.0 vs 733.9, 6+6 rounds: -7.9 ms (-1.1%), new faster in 4 of 6. No regression.
+- **Verdict:** passes the orchestrator's rule (e60 at least 5 of 6 and -8 ms or better, e23 not worse).
+- **Full checks on the rebased tree:** see below.
 
 ## Expectation (before measuring)
 The v3 cachegrind split of St::person on dev5 (98 instructions per event line):
