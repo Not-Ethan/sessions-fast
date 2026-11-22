@@ -240,6 +240,20 @@ pub unsafe fn key_of_ev_wide(s: &[u8]) -> u64 {
 /// Hash seeds tried in turn (rerun after a collision); then the interner.
 pub const LONG_TRIES: u64 = 3;
 static LONG_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x5EED_0000_0000_0001);
+/// The two words of the long-ID hash, derived from LONG_SEED (`set_seed`):
+/// they change with it on every rerun.
+static LONG_S0: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(seed_word(0x5EED_0000_0000_0001, 0));
+static LONG_S1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(seed_word(0x5EED_0000_0000_0001, 1));
+
+const fn seed_word(seed: u64, i: u64) -> u64 {
+    mix(seed ^ (0x243F_6A88_85A3_08D3u64.wrapping_mul(i + 1)))
+}
+
+fn set_seed(seed: u64) {
+    LONG_SEED.store(seed, AO::Relaxed);
+    LONG_S0.store(seed_word(seed, 0), AO::Relaxed);
+    LONG_S1.store(seed_word(seed, 1), AO::Relaxed);
+}
 /// Long IDs go to the interner (after LONG_TRIES collisions, or SS_LONGOFF).
 static LONG_OFF: AtomicBool = AtomicBool::new(false);
 /// Hash bits kept (SS_LONGBITS, tests: few bits force collisions), <= 60.
@@ -334,7 +348,11 @@ static VERIFY_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 #[inline(always)]
 fn hex32(s: &[u8]) -> Option<(u64, u64)> {
     debug_assert!(s.len() == 32);
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        return hex32_avx2(s.as_ptr());
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     unsafe {
         let a = hex16_sse(s.as_ptr());
         let b = hex16_sse(s.as_ptr().add(16));
@@ -358,9 +376,34 @@ fn hex32(s: &[u8]) -> Option<(u64, u64)> {
     }
 }
 
+/// 32 lowercase hex digits at p (32 readable bytes) as (first 16, last 16)
+/// values, None unless all 32 are `[0-9a-f]`: one ymm (builds for AVX2).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn hex32_avx2(p: *const u8) -> Option<(u64, u64)> {
+    use std::arch::x86_64::*;
+    let v = _mm256_loadu_si256(p as *const __m256i);
+    let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+    let isd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+    let l = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+    let isl = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+    if _mm256_movemask_epi8(_mm256_or_si256(isd, isl)) != -1 {
+        return None;
+    }
+    // '0'-'9' & 0x0F = 0-9; 'a'-'f' & 0x0F = 1-6, + 9 = 10-15
+    let nib = _mm256_add_epi8(_mm256_and_si256(v, _mm256_set1_epi8(0x0F)), _mm256_and_si256(isl, _mm256_set1_epi8(9)));
+    // pairs (first digit high): 16 * a + b per 16-bit lane
+    let w = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+    // per 128-bit lane: its 8 bytes twice; then qwords 0 (digits 0-15) and 2 (16-31)
+    let b = _mm256_permute4x64_epi64::<0b1000>(_mm256_packus_epi16(w, w));
+    let x = _mm256_castsi256_si128(b);
+    Some(((_mm_cvtsi128_si64(x) as u64).swap_bytes(), (_mm_extract_epi64::<1>(x) as u64).swap_bytes()))
+}
+
 /// 16 lowercase hex digits at p (16 readable bytes) as a value (first digit
-/// most significant), None unless all 16 are `[0-9a-f]`. SSE4.1 (x86-64-v2).
-#[cfg(target_arch = "x86_64")]
+/// most significant), None unless all 16 are `[0-9a-f]`. SSE4.1 (x86-64-v2;
+/// the AVX2 build uses hex32_avx2).
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 #[inline(always)]
 unsafe fn hex16_sse(p: *const u8) -> Option<u64> {
     use std::arch::x86_64::*;
@@ -379,12 +422,17 @@ unsafe fn hex16_sse(p: *const u8) -> Option<u64> {
     Some((_mm_cvtsi128_si64(b) as u64).swap_bytes())
 }
 
+/// Keyed hash of a long ID: one 64 x 64 -> 128-bit multiply of the two
+/// seeded halves, folded, with the first byte in the top byte (so IDs that
+/// differ only there never share a key). Exactness does not depend on its
+/// quality: every key is verified against the logged IDs and a collision
+/// reruns the job with new seeds.
 #[inline(always)]
 fn long_hash(pre: u64, hi: u64, lo: u64) -> u64 {
-    let seed = LONG_SEED.load(AO::Relaxed);
-    let a = mix(hi ^ seed);
-    let b = mix(lo.wrapping_add(seed.rotate_left(17)) ^ pre.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    mix(a ^ b.rotate_left(29))
+    let a = hi ^ LONG_S0.load(AO::Relaxed);
+    let b = lo ^ LONG_S1.load(AO::Relaxed);
+    let m = (a as u128) * (b as u128);
+    ((m >> 64) as u64) ^ (m as u64) ^ (pre << 56)
 }
 
 #[inline(always)]
@@ -539,7 +587,7 @@ pub fn reset_longs(attempt: u64) {
     if attempt >= LONG_TRIES {
         LONG_OFF.store(true, AO::Relaxed);
     } else {
-        LONG_SEED.store(mix(0x5EED_0000_0000_0001 ^ attempt.wrapping_mul(0xA24B_AED4_963E_E407)), AO::Relaxed);
+        set_seed(mix(0x5EED_0000_0000_0001 ^ attempt.wrapping_mul(0xA24B_AED4_963E_E407)));
     }
 }
 
@@ -1052,7 +1100,7 @@ fn click_cmp_bytes(a: u64, b: u64) -> Ordering {
 
 /// A well-mixed 64-bit hash of a key (splitmix64 finalizer, a bijection).
 #[inline(always)]
-pub fn mix(k: u64) -> u64 {
+pub const fn mix(k: u64) -> u64 {
     let mut z = k;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
@@ -1428,6 +1476,30 @@ mod tests {
                 Some((v[0], v[1]))
             })();
             assert_eq!(hex32(&s), want, "{:?}", String::from_utf8_lossy(&s));
+        }
+        // every byte value at every position of valid digits (the AVX2 build
+        // decodes all 32 in one ymm, the others 16 + 16)
+        let scalar = |s: &[u8; 32]| -> Option<(u64, u64)> {
+            let mut v = [0u64; 2];
+            for (h, c) in s.iter().enumerate() {
+                let d = match c {
+                    b'0'..=b'9' => c - b'0',
+                    b'a'..=b'f' => c - b'a' + 10,
+                    _ => return None,
+                };
+                v[h / 16] = (v[h / 16] << 4) | d as u64;
+            }
+            Some((v[0], v[1]))
+        };
+        for base in [*b"0123456789abcdeffedcba9876543210", *b"ffffffffffffffff0000000000000000", *b"a0a0a0a0a0a0a0a09f9f9f9f9f9f9f9f"] {
+            assert_eq!(hex32(&base), scalar(&base));
+            for pos in 0..32 {
+                for c in 0..=255u8 {
+                    let mut s = base;
+                    s[pos] = c;
+                    assert_eq!(hex32(&s), scalar(&s), "pos {} byte {}", pos, c);
+                }
+            }
         }
     }
 
