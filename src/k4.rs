@@ -58,7 +58,7 @@ pub static N_TAIL: AtomicUsize = AtomicUsize::new(0);
 
 /// Readable bytes from a line start for the kernel: the wide cut (256),
 /// and 32 bytes from the start of any field it yields.
-const MARGIN: usize = 288;
+pub(crate) const MARGIN: usize = 288;
 
 // ---------------------------------------------------------------- date table
 
@@ -660,7 +660,7 @@ unsafe fn decode<S: EvSink, const P2: bool>(k: &K4, ctx: &Ctx, p: *const u8, c: 
 /// calls inline there).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn decode_body<S: EvSink, const P2: bool>(k: &K4, ctx: &Ctx, p: *const u8, c: &fastev::Cut, sink: &mut S) -> bool {
+pub(crate) unsafe fn decode_body<S: EvSink, const P2: bool>(k: &K4, ctx: &Ctx, p: *const u8, c: &fastev::Cut, sink: &mut S) -> bool {
     let p2 = P2;
     let n0 = c.n[0];
     if n0 == 0 {
@@ -751,7 +751,7 @@ unsafe fn decode_body<S: EvSink, const P2: bool>(k: &K4, ctx: &Ctx, p: *const u8
 #[cfg(target_arch = "x86_64")]
 #[cold]
 #[inline(never)]
-fn line_fb<S: EvSink>(p: *const u8, c: &fastev::Cut, ctx: &Ctx, sink: &mut S) {
+pub(crate) fn line_fb<S: EvSink>(p: *const u8, c: &fastev::Cut, ctx: &Ctx, sink: &mut S) {
     let f: [&[u8]; 7] = unsafe { std::array::from_fn(|j| field(p, c.s[j], c.n[j])) };
     if !f[0].is_empty() {
         event_line::<true, S, _>(&f, f[0], ctx, sink);
@@ -914,7 +914,7 @@ unsafe fn task_k4<S: EvSink, const SPL: usize, const P2: bool>(b: &[u8], task: T
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn slow_line<S: EvSink, const P2: bool>(b: &[u8], off: usize, file: u32, k: &K4, ctx: &Ctx, sink: &mut S, safe_end: usize, st: &mut Stats) -> usize {
+pub(crate) unsafe fn slow_line<S: EvSink, const P2: bool>(b: &[u8], off: usize, file: u32, k: &K4, ctx: &Ctx, sink: &mut S, safe_end: usize, st: &mut Stats) -> usize {
     let p = b.as_ptr().add(off);
     // the second lean shape first (fields 0..=2 in the first 64 bytes); out of
     // the hot loop so that the loop's code stays that of shape A alone
@@ -956,7 +956,7 @@ unsafe fn slow_line<S: EvSink, const P2: bool>(b: &[u8], off: usize, file: u32, 
 #[cfg(target_arch = "x86_64")]
 #[cold]
 #[inline(never)]
-fn tail_fb<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
+pub(crate) fn tail_fb<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
     fastev::task_fast_any(b, task, ctx, sink, safe_end)
 }
 
