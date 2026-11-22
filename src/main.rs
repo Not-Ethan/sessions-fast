@@ -378,7 +378,7 @@ impl Marks {
 
 /// `link_task` with AVX2 masks when `AVX2`.
 #[inline(always)]
-fn link_task_x<const AVX2: bool>(input: &Input, task: Task, v: &mut Vec<(u64, u64)>) {
+fn link_task_x<const AVX2: bool>(input: &Input, task: Task, v: &mut Vec<LinkPair>) {
     let b = input.maps[task.file as usize].bytes();
     let safe_end = b.as_ptr() as usize + b.len();
     // a link line is at least 4 bytes ("a,b\n")
@@ -393,19 +393,23 @@ fn link_task_x<const AVX2: bool>(input: &Input, task: Task, v: &mut Vec<(u64, u6
             (keys::key_of(f[0]), keys::key_of(f[1]))
         };
         if a != c {
-            v.push((a, c));
+            v.push((a, c, links::pref8(f[0]), links::pref8(f[1])));
         }
     });
 }
 
+/// One link line: both IDs' keys and the first 8 bytes of each ID
+/// (links::pref8; the union decides root order by them when they differ).
+type LinkPair = (u64, u64, u64, u64);
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn link_task_avx2(input: &Input, task: Task, v: &mut Vec<(u64, u64)>) {
+unsafe fn link_task_avx2(input: &Input, task: Task, v: &mut Vec<LinkPair>) {
     link_task_x::<true>(input, task, v)
 }
 
 /// Parses link lines of one chunk into (a, b) key pairs (self-links skipped).
-fn link_task(input: &Input, task: Task, v: &mut Vec<(u64, u64)>) {
+fn link_task(input: &Input, task: Task, v: &mut Vec<LinkPair>) {
     #[cfg(target_arch = "x86_64")]
     if use_avx2() {
         return unsafe { link_task_avx2(input, task, v) };
@@ -420,7 +424,7 @@ fn link_worker(
     t: usize,
     links_in: &Input,
     lnext: &AtomicUsize,
-    pairs: &[std::sync::Mutex<Vec<(u64, u64)>>],
+    pairs: &[std::sync::Mutex<Vec<LinkPair>>],
     bar: &std::sync::Barrier,
     cell: &std::sync::OnceLock<LinkTable>,
     f1: &AtomicUsize,
@@ -464,7 +468,7 @@ fn link_worker(
                 lt.prefetch(v[k + AHEAD].0);
                 lt.prefetch(v[k + AHEAD].1);
             }
-            dv.push(lt.insert_pair(v[k].0, v[k].1, &mut alloc));
+            dv.push(lt.insert_pair(v[k].0, v[k].1, v[k].2, v[k].3, &mut alloc));
         }
         for k in 0..dv.len() {
             if k + AHEAD < dv.len() {
@@ -911,7 +915,7 @@ fn parse_all(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx) -> (LinkTable,
     let avx2 = ctx.avx2;
     let nl = ctx.threads.min(2);
     let lnext = AtomicUsize::new(0);
-    let pairs: Vec<std::sync::Mutex<Vec<(u64, u64)>>> = (0..nl).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let pairs: Vec<std::sync::Mutex<Vec<LinkPair>>> = (0..nl).map(|_| std::sync::Mutex::new(Vec::new())).collect();
     let bar = std::sync::Barrier::new(nl);
     let cell: std::sync::OnceLock<LinkTable> = std::sync::OnceLock::new();
     let (f1, f2) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -1710,7 +1714,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
     let next = AtomicUsize::new(0);
     let nl = ctx.threads;
     let lnext = AtomicUsize::new(0);
-    let pairs: Vec<std::sync::Mutex<Vec<(u64, u64)>>> = (0..nl).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let pairs: Vec<std::sync::Mutex<Vec<LinkPair>>> = (0..nl).map(|_| std::sync::Mutex::new(Vec::new())).collect();
     let bar = std::sync::Barrier::new(nl);
     let cell: std::sync::OnceLock<LinkTable> = std::sync::OnceLock::new();
     let (f1, f2) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -3115,6 +3119,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     sys::POPW.store(std::env::var("SS_POPW").is_ok(), Ordering::Relaxed);
     sys::POISON.store(std::env::var("SS_POISON").is_ok(), Ordering::Relaxed);
     links::SCALAR_PROBE.store(std::env::var("SS_SCALARPROBE").map_or(false, |v| v == "1"), Ordering::Relaxed);
+    links::LINK_PREF.store(std::env::var("SS_LINKPREF").map_or(true, |v| v != "0"), Ordering::Relaxed);
     links::PROBE_SEL.store(std::env::var("SS_PROBESEL").map_or(true, |v| v != "0"), Ordering::Relaxed);
     sys::RECYCLE.store(std::env::var("SS_RECYCLE").map_or(true, |v| v != "0"), Ordering::Relaxed);
     // 128-byte splitters for lines with long IDs unless SS_WIDECUT=0
@@ -4487,7 +4492,8 @@ mod sink_tests {
                 let mut a = links::IdxAlloc::new();
                 let mut prs = Vec::new();
                 for i in 0..npairs as u64 {
-                    prs.push(lt.insert_pair(key(i + 1), key(i / 3 * 3 + 1000), &mut a));
+                    let (x, y) = (format!("u{:x}", i + 1), format!("u{:x}", i / 3 * 3 + 1000));
+                    prs.push(lt.insert_pair(key(i + 1), key(i / 3 * 3 + 1000), links::pref8(x.as_bytes()), links::pref8(y.as_bytes()), &mut a));
                 }
                 for &(da, db) in &prs {
                     lt.union_idx(da, db);

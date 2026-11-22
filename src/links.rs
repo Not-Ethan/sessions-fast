@@ -26,6 +26,9 @@ pub struct LinkTable {
     parent: &'static [AtomicU32],
     /// compact index -> key
     dkey: &'static [AtomicU64],
+    /// compact index -> the first 8 bytes of the ID (`pref8`; SS_LINKPREF=0:
+    /// unused, every root comparison through keys::cmp)
+    dpref: &'static [AtomicU64],
     /// compact index -> person key (the root's key; finalize scratch)
     dpkey: &'static [AtomicU64],
     /// next free block of compact indices
@@ -36,6 +39,21 @@ pub struct LinkTable {
 }
 
 pub const FINALIZE_BLOCK: usize = 1 << 16;
+
+/// Root order by 8-byte prefixes first (SS_LINKPREF=0: keys::cmp only, A/B).
+pub static LINK_PREF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The first 8 bytes of `s` as a big-endian number, zero-padded: for two
+/// strings with different prefixes, prefix order is byte-wise string order
+/// (a shorter string's padding sorts below any byte the other has there, or
+/// equals a 0 byte, in which case the prefixes do not decide).
+#[inline(always)]
+pub fn pref8(s: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    let n = s.len().min(8);
+    b[..n].copy_from_slice(&s[..n]);
+    u64::from_be_bytes(b)
+}
 
 /// SS_SCALARPROBE=1: the scalar group probe in AVX2 builds too (A/B).
 pub static SCALAR_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -70,7 +88,7 @@ impl IdxAlloc {
 
 impl LinkTable {
     pub fn empty() -> Self {
-        LinkTable { slots: &[], mask: 0, amask: !0, parent: &[], dkey: &[], dpkey: &[], next_block: AtomicU32::new(0), mixed: false }
+        LinkTable { slots: &[], mask: 0, amask: !0, parent: &[], dkey: &[], dpref: &[], dpkey: &[], next_block: AtomicU32::new(0), mixed: false }
     }
 
     /// A table for `total_pairs` links built by up to `threads` threads.
@@ -91,6 +109,7 @@ impl LinkTable {
             amask: if std::env::var("SS_LINKALIGN").map_or(false, |v| v == "0") { !0 } else { !3 },
             parent: arena(nd),
             dkey: arena(nd),
+            dpref: arena(nd),
             dpkey: arena(nd),
             next_block: AtomicU32::new(0),
             mixed: std::env::var("SS_OLDPH").map_or(true, |v| v != "1"),
@@ -118,7 +137,7 @@ impl LinkTable {
 
     /// Compact index of key k, inserting it if absent.
     #[inline(always)]
-    fn insert(&self, k: u64, a: &mut IdxAlloc) -> u32 {
+    fn insert(&self, k: u64, pref: u64, a: &mut IdxAlloc) -> u32 {
         let mut i = self.start(keys::mix(k));
         loop {
             let cur = self.slots[i][0].load(Ordering::Acquire);
@@ -127,6 +146,7 @@ impl LinkTable {
                     Ok(_) => {
                         let d = self.alloc(a);
                         self.dkey[d as usize].store(k, Ordering::Relaxed);
+                        self.dpref[d as usize].store(pref, Ordering::Relaxed);
                         self.slots[i][1].store(d as u64 + 1, Ordering::Release);
                         return d;
                     }
@@ -180,9 +200,7 @@ impl LinkTable {
             if a == b {
                 return;
             }
-            let ka = self.dkey[a as usize].load(Ordering::Relaxed);
-            let kb = self.dkey[b as usize].load(Ordering::Relaxed);
-            if keys::cmp(ka, kb) == std::cmp::Ordering::Greater {
+            if self.greater(a, b) {
                 std::mem::swap(&mut a, &mut b);
             }
             // hook b (larger key) under a (smaller key)
@@ -192,12 +210,30 @@ impl LinkTable {
         }
     }
 
+    /// Whether the ID of compact index a sorts after that of b (byte-wise):
+    /// by their first 8 bytes when those differ (padding zeros below every
+    /// byte, so a different prefix orders the strings exactly as the bytes
+    /// do), else by the keys (keys::cmp; long keys through the decode table).
+    #[inline(always)]
+    fn greater(&self, a: u32, b: u32) -> bool {
+        if LINK_PREF.load(Ordering::Relaxed) {
+            let pa = self.dpref[a as usize].load(Ordering::Relaxed);
+            let pb = self.dpref[b as usize].load(Ordering::Relaxed);
+            if pa != pb {
+                return pa > pb;
+            }
+        }
+        let ka = self.dkey[a as usize].load(Ordering::Relaxed);
+        let kb = self.dkey[b as usize].load(Ordering::Relaxed);
+        keys::cmp(ka, kb) == std::cmp::Ordering::Greater
+    }
+
     /// Joins two IDs. Safe to call from many threads at once.
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn link(&self, a: u64, b: u64, alloc: &mut IdxAlloc) {
-        let da = self.insert(a, alloc);
-        let db = self.insert(b, alloc);
+    pub fn link(&self, a: u64, b: u64, pa: u64, pb: u64, alloc: &mut IdxAlloc) {
+        let da = self.insert(a, pa, alloc);
+        let db = self.insert(b, pb, alloc);
         if da != db {
             self.union(da, db);
         }
@@ -205,8 +241,8 @@ impl LinkTable {
 
     /// Compact indices of both IDs of a link, inserting them if absent.
     #[inline(always)]
-    pub fn insert_pair(&self, a: u64, b: u64, alloc: &mut IdxAlloc) -> (u32, u32) {
-        (self.insert(a, alloc), self.insert(b, alloc))
+    pub fn insert_pair(&self, a: u64, b: u64, pa: u64, pb: u64, alloc: &mut IdxAlloc) -> (u32, u32) {
+        (self.insert(a, pa, alloc), self.insert(b, pb, alloc))
     }
 
     /// Joins two inserted IDs by compact index. Safe to call from many threads
@@ -440,6 +476,79 @@ impl LinkTable {
 mod tests {
     use super::*;
 
+    /// Every component's root (its person) is its byte-wise smallest ID,
+    /// with root order by 8-byte prefixes and without: short, long (hex),
+    /// prefix-sharing, zero-byte, upper-case and odd IDs, random links.
+    #[test]
+    fn union_roots_are_min() {
+        let _g = crate::keys::LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut x: u64 = 0x1357_9BDF_2468_ACE1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut ids: Vec<Vec<u8>> = Vec::new();
+        for i in 0..300u64 {
+            ids.push(format!("u{:x}", keys::mix(i) % 100_000).into_bytes());
+            ids.push(format!("u{:016x}{:016x}", keys::mix(i + 7), keys::mix(i + 9)).into_bytes());
+        }
+        for s in [&b"abcdefgh"[..], b"abcdefgh1", b"abcdefg ", b"abcdefgh x", b"abcdefg", b"abcdefgi", b"ABCDEFGH", b" ", b"  ", b"u", b"u0", b"u0123456789abcdef0123456789abcdef", b"u0123456789abcdef0123456789abcdee", b"u01234567"] {
+            ids.push(s.to_vec());
+        }
+        ids.sort();
+        ids.dedup();
+        let keys_: Vec<u64> = ids.iter().map(|s| keys::key_of(s)).collect();
+        keys::verify_longs(1);
+        assert!(!keys::collision());
+        for pref_on in [true, false] {
+            LINK_PREF.store(pref_on, Ordering::Relaxed);
+            let n = ids.len();
+            let t = LinkTable::with_pairs(n, 1);
+            let mut a = IdxAlloc::new();
+            // reference: union-find over indices, root = smallest string
+            let mut par: Vec<usize> = (0..n).collect();
+            fn root(p: &mut Vec<usize>, mut i: usize) -> usize {
+                while p[i] != i {
+                    i = p[i];
+                }
+                i
+            }
+            let mut idx = Vec::new();
+            for _ in 0..n {
+                let (i, j) = ((next() % n as u64) as usize, (next() % n as u64) as usize);
+                if i == j {
+                    continue;
+                }
+                idx.push(t.insert_pair(keys_[i], keys_[j], pref8(&ids[i]), pref8(&ids[j]), &mut a));
+                let (ri, rj) = (root(&mut par, i), root(&mut par, j));
+                if ri != rj {
+                    // ids are sorted: the smaller index is the smaller string
+                    let (lo, hi) = if ri < rj { (ri, rj) } else { (rj, ri) };
+                    par[hi] = lo;
+                }
+            }
+            for &(da, db) in &idx {
+                t.union_idx(da, db);
+            }
+            for b in 0..t.root_blocks() {
+                t.finalize_roots(b);
+            }
+            for b in 0..t.val_blocks() {
+                t.finalize_vals(b);
+            }
+            for i in 0..n {
+                let r = root(&mut par, i);
+                let k = keys_[i];
+                let want = if r == i && t.person_of_h(k, keys::mix(k)).is_none() { k } else { keys_[r] };
+                assert_eq!(t.person_of(k), want, "{:?} (prefixes {})", String::from_utf8_lossy(&ids[i]), pref_on);
+            }
+        }
+        LINK_PREF.store(true, Ordering::Relaxed);
+        keys::reset_longs(0);
+    }
+
     /// The group probe agrees with the slot-by-slot probe, also at a high
     /// load factor (full groups, probes that wrap around the table end).
     #[test]
@@ -458,8 +567,9 @@ mod tests {
             let mut pairs = Vec::new();
             let mut inserted = Vec::new();
             for _ in 0..actual {
-                let (u, v) = (key(next() % space + 1), key(next() % space + 1));
-                let (du, dv) = t.insert_pair(u, v, &mut a);
+                let (nu, nv) = (next() % space + 1, next() % space + 1);
+                let (u, v) = (key(nu), key(nv));
+                let (du, dv) = t.insert_pair(u, v, pref8(format!("u{:x}", nu).as_bytes()), pref8(format!("u{:x}", nv).as_bytes()), &mut a);
                 pairs.push((du, dv));
                 inserted.push(u);
                 inserted.push(v);
