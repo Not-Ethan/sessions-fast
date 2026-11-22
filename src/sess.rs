@@ -329,8 +329,6 @@ struct St {
     /// persons with 1..=64 sessions and at least `bm_min` clicks
     bm_on: bool,
     bm_min: usize,
-    /// at most this many clicks (SS_ATTRBM_MAX; default: no limit)
-    bm_max: usize,
     bm: Box<Bm>,
     /// per campaign: the sessions it assists (attribute_bm), and the
     /// campaigns with a non-zero mask
@@ -422,7 +420,6 @@ impl St {
             sorted_fast: std::env::var("SS_NOSORTED").is_err(),
             bm_on: BM_BUILD && std::env::var("SS_ATTRBM").map_or(true, |v| v != "0"),
             bm_min: crate::env_usize("SS_ATTRBM_MIN").unwrap_or(1).max(1),
-            bm_max: crate::env_usize("SS_ATTRBM_MAX").unwrap_or(usize::MAX),
             bm: Box::new(Bm { lo: [0; 64], hi: [0; 64], bt: [0; 64], bc: [0; 64], mx: [0; 64] }),
             amask: vec![0; ncamp.max(1)],
             atouched: Vec::new(),
@@ -819,7 +816,7 @@ impl St {
         let pc = &mut cs[..m];
         let small = pc.len() <= self.bf_max;
         // the bitmask path takes the clicks in any order
-        let bm = self.bm_on && ns <= 64 && pc.len() >= self.bm_min && pc.len() <= self.bm_max;
+        let bm = self.bm_on && ns <= 64 && pc.len() >= self.bm_min;
         if pc.len() > 1 && !small && !bm {
             pc.sort_unstable_by_key(|c| c.ts);
         }

@@ -4,8 +4,9 @@ Owner: quick-wins helper. Base: ss-opt4 9fdf3fb (= `ss-m22-rc1` base). Touches `
 
 ## What it is
 `St::attribute_bm`, a third attribution path:
-- Who takes it: persons with 1..=64 sessions and between SS_ATTRBM_MIN (default 1) and SS_ATTRBM_MAX (default no
-  limit) clicks, in AVX2 builds (the /sessions-v3 binary).
+- Who takes it: persons with 1..=64 sessions and at least SS_ATTRBM_MIN (default 1) clicks, in AVX2 builds (the
+  /sessions-v3 binary). An upper limit on clicks (SS_ATTRBM_MAX=16, persons with few clicks only) was tried and
+  dropped: +3 instructions and -0.11 mispredicts per line, against 0 and -0.27 with no limit.
 - SS_ATTRBM=0 turns it off and gives today's paths. The baseline v2 binary (SS_NOEXEC=1) keeps today's code.
 - The clicks are not sorted on this path. The sort is still done for attribute_window.
 
