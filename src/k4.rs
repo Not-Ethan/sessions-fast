@@ -192,12 +192,24 @@ fn sel(c: bool, a: u64, b: u64) -> u64 {
 
 /// The date `YYYY-MM-DDT` at q looked up in `tab`: (nonzero unless the 11
 /// bytes are exactly a table date, its entry). Reads q..q+12.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn date(q: *const u8, tab: &DTab) -> (u64, &DEnt) {
     let a = rd64(q);
     let d4 = rd32(q.add(8));
-    let e = tab.0.get_unchecked(dslot(d4));
+    let e = tab.0.get_unchecked(dslot_pext(d4));
     ((a ^ e.pat) | ((d4 & 0xFF_FFFF) ^ e.dd) as u64, e)
+}
+
+/// `dslot` in one instruction: PEXT of bits 0, 1 and 8..12 gives the same
+/// six bits in the same order ((d4 & 3) | ((d4 >> 6) & 0x3C)). BMI2: only
+/// inside the kernel's target-feature context (k4 runs only with AVX2+BMI2).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn dslot_pext(d4: u32) -> usize {
+    let k = _pext_u32(d4, 0x0F03) as usize;
+    debug_assert_eq!(k, dslot(d4));
+    k
 }
 
 /// The 16 bytes from a + 11 (ts) and from b + 11 (ingest_ts) at once:
