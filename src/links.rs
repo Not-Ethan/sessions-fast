@@ -37,11 +37,6 @@ pub struct LinkTable {
 
 pub const FINALIZE_BLOCK: usize = 1 << 16;
 
-/// Software prefetch in the finalize steps (SS_LINKPF=0: off, A/B).
-pub static LINK_PF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-/// How far ahead the finalize steps prefetch (indices / slots).
-const FIN_AHEAD: usize = 16;
-
 /// SS_SCALARPROBE=1: the scalar group probe in AVX2 builds too (A/B).
 pub static SCALAR_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const IDX_BLOCK: u32 = 4096;
@@ -235,18 +230,7 @@ impl LinkTable {
     /// concurrently.
     pub fn finalize_roots(&self, b: usize) {
         let n = (self.next_block.load(Ordering::Acquire) as usize).min(self.parent.len());
-        let end = ((b + 1) * FINALIZE_BLOCK).min(n);
-        let pf = LINK_PF.load(Ordering::Relaxed);
-        for d in b * FINALIZE_BLOCK..end {
-            // the parent (often the root) of an index FIN_AHEAD ahead: its
-            // parent entry and key are random reads
-            if pf && d + FIN_AHEAD < end {
-                let p = self.parent[d + FIN_AHEAD].load(Ordering::Relaxed);
-                if p != 0 {
-                    crate::prefetch(self.parent.as_ptr().wrapping_add(p as usize - 1) as *const u8);
-                    crate::prefetch(self.dkey.as_ptr().wrapping_add(p as usize - 1) as *const u8);
-                }
-            }
+        for d in b * FINALIZE_BLOCK..((b + 1) * FINALIZE_BLOCK).min(n) {
             let r = self.find(d as u32) as usize;
             self.dpkey[d].store(self.dkey[r].load(Ordering::Relaxed), Ordering::Relaxed);
         }
@@ -257,17 +241,7 @@ impl LinkTable {
     /// when `mixed` (the lookups below undo or use that consistently).
     pub fn finalize_vals(&self, b: usize) {
         let n = self.slots.len();
-        let end = ((b + 1) * FINALIZE_BLOCK).min(n);
-        let pf = LINK_PF.load(Ordering::Relaxed);
-        for i in b * FINALIZE_BLOCK..end {
-            // the person key of the slot FIN_AHEAD ahead (a random read; that
-            // slot still holds its compact index + 1, or 0 when empty)
-            if pf && i + FIN_AHEAD < end {
-                let v = self.slots[i + FIN_AHEAD][1].load(Ordering::Relaxed);
-                if v != 0 {
-                    crate::prefetch(self.dpkey.as_ptr().wrapping_add(v as usize - 1) as *const u8);
-                }
-            }
+        for i in b * FINALIZE_BLOCK..((b + 1) * FINALIZE_BLOCK).min(n) {
             if self.slots[i][0].load(Ordering::Relaxed) != 0 {
                 let d = (self.slots[i][1].load(Ordering::Relaxed) - 1) as usize;
                 let pk = self.dpkey[d].load(Ordering::Relaxed);
