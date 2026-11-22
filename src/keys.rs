@@ -710,7 +710,36 @@ fn cmp_slow(a: u64, b: u64) -> Ordering {
         // same width, hex digits in value order: (first byte, value) order
         return long_value(a).cmp(&long_value(b));
     }
+    if a & 0xF != FALLBACK_TAG && b & 0xF != FALLBACK_TAG {
+        // long vs packed: both strings on the stack (no allocation)
+        let (mut x, mut y) = ([0u8; 33], [0u8; 33]);
+        let n = stack_string(a, &mut x);
+        let m = stack_string(b, &mut y);
+        return x[..n].cmp(&y[..m]);
+    }
     decode(a).cmp(&decode(b))
+}
+
+/// The string of a long or packed key into `out`; returns its length.
+#[inline]
+fn stack_string(k: u64, out: &mut [u8; 33]) -> usize {
+    if is_long(k) {
+        let (pre, hi, lo) = long_value(k);
+        out[0] = pre as u8;
+        for (j, v) in [hi, lo].into_iter().enumerate() {
+            for i in 0..16 {
+                out[1 + 16 * j + i] = b"0123456789abcdef"[((v >> (4 * (15 - i))) & 15) as usize];
+            }
+        }
+        33
+    } else {
+        let n = (k & 0xF) as usize;
+        let codes = k >> 4;
+        for (i, c) in out.iter_mut().enumerate().take(10) {
+            *c = ALPHABET[((codes >> (6 * (9 - i))) & 63) as usize];
+        }
+        n
+    }
 }
 
 /// A well-mixed 64-bit hash of a key (splitmix64 finalizer, a bijection).
