@@ -296,17 +296,19 @@ pub(crate) unsafe fn pack2(a: *const u8, na: usize, b: *const u8, nb: usize) -> 
     let codes = _mm256_and_si256(_mm256_add_epi8(_mm256_add_epi8(v, off), us), inlen);
     let t = _mm256_maddubs_epi16(codes, _mm256_set1_epi16(0x0140));
     let u = _mm256_madd_epi16(t, _mm256_set1_epi32(0x0001_1000));
-    let ul = _mm256_castsi256_si128(u);
-    let uh = _mm256_extracti128_si256::<1>(u);
-    let a01 = _mm_cvtsi128_si64(ul) as u64;
-    let a2 = _mm_extract_epi32::<2>(ul) as u32 as u64;
-    let b01 = _mm_cvtsi128_si64(uh) as u64;
-    let b2 = _mm_extract_epi32::<2>(uh) as u32 as u64;
-    let key = |l01: u64, l2: u64, n: usize| ((((l01 & 0xFFFF_FFFF) << 36) | ((l01 >> 32) << 12) | (l2 >> 12)) << 4) | n as u64;
+    // per lane, dwords [l0, l1, l2, l3] (24-bit groups of 4 codes); the key of
+    // pack_wide is (((l0 << 36) | (l1 << 12) | (l2 >> 12)) << 4) | n
+    //   = l0 << 40 | l1 << 16 | ((l2 >> 12) << 4) | n, built in the low qword:
+    let top = _mm256_slli_epi64::<40>(u); // l0 << 40 (l1 shifted out)
+    let mid = _mm256_and_si256(_mm256_srli_epi64::<16>(u), _mm256_set1_epi64x(!0xFFFF)); // l1 << 16
+    let bot = _mm256_and_si256(_mm256_srli_epi64::<8>(_mm256_srli_si256::<8>(u)), _mm256_set1_epi64x(0xFFF0)); // (l2 >> 12) << 4
+    let k = _mm256_or_si256(_mm256_or_si256(top, mid), bot);
+    let ka = _mm_cvtsi128_si64(_mm256_castsi256_si128(k)) as u64;
+    let kb = _mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(k)) as u64;
     let inv = _mm256_movemask_epi8(invalid) as u32;
     let oka = ((inv & 0xFFFF) == 0) & (na.wrapping_sub(1) < 10);
     let okb = ((inv >> 16) == 0) & (nb.wrapping_sub(1) < 10);
-    (key(a01, a2, na), oka, key(b01, b2, nb), okb)
+    (ka | na as u64, oka, kb | nb as u64, okb)
 }
 
 // ---------------------------------------------------------------- split

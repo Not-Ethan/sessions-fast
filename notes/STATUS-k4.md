@@ -95,6 +95,26 @@ dev5 e7 e23 e60. Lifetime A/B (image ss-k4v2a, SS_K4=0 vs 1): running.
    badly (stage 1 every 64 B, lines every ~80 B: a data-dependent inner loop = mispredicts),
    so stage 1 should run ahead over a whole ring (4 KB) and stage 2 consume it.
 
+## Lifetimes and rebase (04:00-04:30)
+- k4-v2a (Rust 1.85, v2 image ss-k4v2a), SS_K4=0 vs 1: e23 x5 median 941.4 -> 874.1 (-67, -7.1%,
+  5/5 lower); e60 x4 median 2682.6 -> 2463.0 (-220, -8.2%, 4/4 lower).
+- k4-v2a-rebased = f30d21e (squash on ss-opt4 41c0a81; branches ss-k4 and ss-k4-rebased):
+  tests 37 OK, SS_K4CHECK OK dev5 e23, outputs = references dev5 e23.
+- Under the shipped build (two-binary image ss-k4rb, Rust 1.100.0, v3 launcher): e23 x5 median
+  901.9 -> 841.1 (-61, -6.7%); e60 x3 2568.2 -> 2374.3 (-194, -7.6%); every round lower.
+- Scorecard v3/1.100 dev5 whole program: 1256 -> 1176 instr/event line; event kernel 652
+  (event_task_avx2 600.4 + cut_wide 51.9) -> 557 (task_variant 483.4 + slow_line 33.7 +
+  other_ev 20.2 + other_main 19.7); event-kernel mispredicts 1.5 M -> 0.4 M.
+- Division of work (coordinator, 04:20): k6 (other engineer, branch ss-k6) owns split + loop
+  (streaming masks); I own the decode. decode_body's signature and fastev::Cut stay stable;
+  decode steps go to ss-k4-rebased and ss-k4.
+
+## v2b / v2c (in progress)
+- v2b = a2ec589: second lean shape (K=3) before slow_line (e23 sample: lean take 94.3% ->
+  97.6%), timestamp validity masks in one word, Stats.slow. Validation + count + 10-round
+  e23 image A/B vs ss-k4rb queued (/home/Ethan/v2bval.sh).
+- v2c: pack2 key assembly in SIMD (3 shifts, 2 ands, 2 ors, 2 extracts instead of 4 extracts
+  + 16 scalar ops).
+
 ## Next
-- lifetimes; rebased validation; scorecard under x86-64-v3; then v2b (spills, lazy 5/6,
-  long-ID path, ts masks), each tagged with count + 10-round e23 timing.
+- validate v2b, tag; validate v2c; then decode: F2 offset without imul, type check, spills.
