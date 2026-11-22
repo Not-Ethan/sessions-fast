@@ -51,6 +51,9 @@ pub static COUNT_SLOW: AtomicBool = AtomicBool::new(false);
 /// Software prefetch distance (bytes ahead of the current line) for the
 /// line splitters; 0 = none (SS_PFDIST, default 1024).
 pub static PF_DIST: AtomicUsize = AtomicUsize::new(1024);
+/// A second prefetch per line, 64 bytes further (lines average ~1.4 cache
+/// lines; SS_PF2=1, experiment).
+pub static PF2: AtomicBool = AtomicBool::new(false);
 /// The 128-byte splitters for lines the 64-byte windows cannot cut (long
 /// IDs, scorer version 5) unless SS_WIDECUT=0.
 pub static WIDE: AtomicBool = AtomicBool::new(true);
@@ -405,6 +408,7 @@ pub fn for_each_line2<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FR: FnMut
     let wide = WIDE.load(Ordering::Relaxed) && b.len() >= MARGIN_W;
     let base = b.as_ptr();
     let pf = PF_DIST.load(Ordering::Relaxed);
+    let pf2 = PF2.load(Ordering::Relaxed);
     // prefetch addresses stay inside b (a prefetch never faults, but keep it tidy)
     let pf_lim = (base as usize + b.len()).saturating_sub(64);
     let mut off = start;
@@ -413,6 +417,9 @@ pub fn for_each_line2<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FR: FnMut
             let p = base.add(off);
             if pf != 0 {
                 super::prefetch((p as usize + pf).min(pf_lim) as *const u8);
+                if pf2 {
+                    super::prefetch((p as usize + pf + 64).min(pf_lim) as *const u8);
+                }
             }
             let c = cut::<AVX2>(p);
             if c.ok {
