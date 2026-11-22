@@ -2408,6 +2408,7 @@ fn main() {
 
 /// The whole pipeline on one dataset. Returns the verbose report line.
 fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String {
+    keys::new_run();
     sys::NOHUGE.store(std::env::var("SS_NOHUGE").is_ok(), Ordering::Relaxed);
     scan::USE_V1.store(std::env::var("SS_SCAN1").is_ok(), Ordering::Relaxed);
     parts::OLD_LINE_OVER.store(std::env::var("SS_OLDOVER").map_or(false, |v| v == "1"), Ordering::Relaxed);
@@ -2620,7 +2621,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         marks.mark("write");
         souts.iter().map(|s| s.nrows).sum()
     } else {
-        let mut dead = Vec::new();
+        // the long-ID decode table is dead after the names are written too
+        let mut dead = keys::long_regions();
         for inp in [&links_in, &events_in, &clicks_in] {
             for m in &inp.maps {
                 let b = m.bytes();

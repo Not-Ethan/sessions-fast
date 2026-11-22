@@ -358,6 +358,41 @@ pub fn flush_thread() {
     }
 }
 
+/// Start of a job (main::run): logs and table of a previous job (the far
+/// ingest_ts rerun) are dropped; seed and interner mode are kept.
+pub fn new_run() {
+    let p = LOG.with(|l| l.replace(std::ptr::null_mut()));
+    if !p.is_null() {
+        drop(unsafe { Box::from_raw(p) });
+    }
+    LOGS.lock().unwrap().clear();
+    TAB.store(std::ptr::null_mut(), AO::Release);
+}
+
+/// The whole pages inside the decode table's buffers, as (address, length):
+/// dead once every name is written (sess::sessions2 releases them with its
+/// other dead memory, in parallel, instead of the single-threaded exit).
+pub fn long_regions() -> Vec<(usize, usize)> {
+    let t = TAB.load(AO::Acquire);
+    if t.is_null() {
+        return Vec::new();
+    }
+    let t = unsafe { &*t };
+    let mut v = Vec::new();
+    let mut add = |a: usize, l: usize| {
+        let s = (a + 4095) & !4095;
+        let e = (a + l) & !4095;
+        if e > s {
+            v.push((s, e - s));
+        }
+    };
+    for pt in &t.parts {
+        add(pt.ents.as_ptr() as usize, pt.ents.capacity() * std::mem::size_of::<LEnt>());
+        add(pt.idx.as_ptr() as usize, pt.idx.len() * 4);
+    }
+    v
+}
+
 /// A key collision was seen by a verification (the job must run again).
 pub fn collision() -> bool {
     COLLISION.load(AO::Relaxed)
