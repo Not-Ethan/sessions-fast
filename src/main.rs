@@ -838,6 +838,10 @@ unsafe fn event_task_batched_avx2<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, e:
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 unsafe fn click_task_avx2<C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &LinkTable, c: &mut C, safe_end: usize, cache: &mut PCache) {
+    // the fused click kernel (k5.rs) when SS_K5=1 and the person cache is off
+    if k5::wanted(cache) {
+        return k5::task(b, task, ctx, lt, c);
+    }
     click_task::<true, C>(b, task, ctx, lt, c, safe_end, cache)
 }
 
