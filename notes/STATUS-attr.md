@@ -58,7 +58,13 @@ SS_POISON=1 and SS_NOEXEC=1) are listed under Results when done.
     1904-1916.
   - e23: 726.0 vs 733.9, 6+6 rounds: -7.9 ms (-1.1%), new faster in 4 of 6. No regression.
 - **Verdict:** passes the orchestrator's rule (e60 at least 5 of 6 and -8 ms or better, e23 not worse).
-- **Full checks on the rebased tree:** see below.
+- **Pre-check of the rebased tree** (5a9a6ff on ss-opt4 d9332ed, image ss-q-abm2, as reduced by the orchestrator):
+  - unit tests 65/65 on ss-gate (x86-64-v2); 46/46 earlier under Rosetta on x86-64-v3;
+  - dev5 vs the organisers' answer MATCH, with the default and with SS_ATTRBM=0;
+  - e23 and e60 vs ref5 MATCH (default).
+
+  The full matrix (fixtures, e7, f23, POISON, NOEXEC) is left to the milestone 23 gate.
+- Tagged attr-bm-v1.
 
 ## Expectation (before measuring)
 The v3 cachegrind split of St::person on dev5 (98 instructions per event line):
