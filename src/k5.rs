@@ -762,6 +762,21 @@ impl CSink for RecC {
     }
 }
 
+/// Records with every side-table click reference (keys::click_key for a
+/// click_id of 1024+ bytes: an index into a global table that grows with
+/// every call) replaced by one placeholder: running both paths in one
+/// process gives the same click_id two indices. Both paths make such
+/// references with the same `keys::click_key` call (k5 never cuts a line
+/// that long), so only the placeholder is compared.
+pub fn norm(mut v: Vec<(usize, u64, u64, u32, u32)>) -> Vec<(usize, u64, u64, u32, u32)> {
+    for r in v.iter_mut() {
+        if r.2 & 0xF == 0 && r.2 >> 54 == 1023 {
+            r.2 = 1023 << 54;
+        }
+    }
+    v
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[inline(never)]
@@ -809,6 +824,7 @@ pub fn check(links_in: &Input, cl: &Input, ctx: &Ctx) {
             unsafe { task_k5(b, task, ctx, &lt, &mut got) };
             l += b[task.start..task.end].iter().filter(|&&c| c == b'\n').count();
             r += want.0.len();
+            let (want, got) = (RecC(norm(want.0)), RecC(norm(got.0)));
             if got.0 != want.0 {
                 let culprit = culprits(b, task, ctx, &lt);
                 let k = got.0.iter().zip(want.0.iter()).position(|(a, b)| a != b).unwrap_or(got.0.len().min(want.0.len()));
@@ -870,6 +886,7 @@ pub fn culprits(b: &[u8], t: Task, ctx: &Ctx, lt: &LinkTable) -> String {
         old_task(b, lt1, ctx, lt, &mut a, safe_end);
         let mut k = RecC::default();
         unsafe { task_k5(b, lt1, ctx, lt, &mut k) };
+        let (a, k) = (RecC(norm(a.0)), RecC(norm(k.0)));
         if a.0 != k.0 {
             s += &format!("  line at {} ({} bytes before the buffer end): \"{}\"\n    old: {:?}\n    k5:  {:?}\n", l, b.len() - l, b[l..e].escape_ascii(), a.0, k.0);
             shown += 1;

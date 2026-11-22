@@ -194,7 +194,7 @@ mod x86 {
         k5::old_task(buf, t, ctx, lt, &mut a, safe_end);
         let mut b = RecC::default();
         unsafe { k5::task_k5(buf, t, ctx, lt, &mut b) };
-        (a.0, b.0)
+        (k5::norm(a.0), k5::norm(b.0))
     }
 
     fn list<T: std::fmt::Debug>(v: &[T]) -> String {
@@ -664,7 +664,9 @@ mod x86 {
                 loop {
                     let hh = (r.next() & !(mask as u64)) | if last { (mask & !3) as u64 | r.below(4) } else { r.below(4) };
                     let k = crate::keys::unmix(hh);
-                    if k != 0 {
+                    // packed-form keys only (low 4 bits 1..=10): the
+                    // union-find orders keys, long / interned ones need tables
+                    if (1..=10).contains(&(k & 0xF)) {
                         return k;
                     }
                 }
@@ -677,9 +679,10 @@ mod x86 {
                 keys_in.push(a);
                 keys_in.push(b);
             }
+            let pk = |r: &mut Rng| (r.next() & !0xF) | (1 + r.below(10));
             for _ in 0..npairs {
-                let a = r.next() | 1;
-                let b = if r.chance(0.5) { r.next() | 1 } else { *r.pick(&keys_in) };
+                let a = pk(&mut r);
+                let b = if r.chance(0.5) { pk(&mut r) } else { *r.pick(&keys_in) };
                 t.link(a, b, &mut alloc);
                 keys_in.push(a);
                 keys_in.push(b);
@@ -698,7 +701,7 @@ mod x86 {
                         let last = r.chance(0.5);
                         crowd_key(&mut r, last)
                     }
-                    _ => r.next() | 1,
+                    _ => pk(&mut r),
                 };
                 let h = crate::keys::mix(k);
                 let got = unsafe { pv(&t, k, h) };
