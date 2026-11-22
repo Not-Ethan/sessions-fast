@@ -848,6 +848,10 @@ pub fn sessions2(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: 
     }
     let bar = std::sync::Barrier::new(ctx.threads);
     let next_piece = AtomicUsize::new(0);
+    // recycled memory nobody took (sys::alloc_arena_dirty): known only once
+    // every thread has allocated its buffers, i.e. after the barrier
+    let extra: std::sync::OnceLock<Vec<(usize, usize)>> = std::sync::OnceLock::new();
+    let next_extra = AtomicUsize::new(0);
     par(ctx.threads, |t| {
         sys::set_label("sess");
         let mut st = St::new(ctx, est_rows, max_ev, max_cl);
@@ -866,6 +870,23 @@ pub fn sessions2(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: 
             loop {
                 let i = next_piece.fetch_add(1, Ordering::Relaxed);
                 let Some(&(a, l)) = pieces.get(i) else { break };
+                sys::release(a, l);
+            }
+            let ex = extra.get_or_init(|| {
+                let mut v = Vec::new();
+                for (a, l) in sys::take_pool() {
+                    let mut o = 0;
+                    while o < l {
+                        let n = (l - o).min(32 << 20);
+                        v.push((a + o, n));
+                        o += n;
+                    }
+                }
+                v
+            });
+            loop {
+                let i = next_extra.fetch_add(1, Ordering::Relaxed);
+                let Some(&(a, l)) = ex.get(i) else { break };
                 sys::release(a, l);
             }
         }

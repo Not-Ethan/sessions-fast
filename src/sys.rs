@@ -205,6 +205,11 @@ pub fn give_back_labels(labels: &[&str]) {
     pool.sort_unstable_by(|x, y| y.1.cmp(&x.1));
 }
 
+/// Empties the pool (its regions are dead: nobody will take them now).
+pub fn take_pool() -> Vec<(usize, usize)> {
+    std::mem::take(&mut *POOL.lock().unwrap())
+}
+
 /// Memory for a consumer that writes every byte before reading it: from the
 /// pool if a region is large enough (stale contents), else a fresh arena.
 pub fn alloc_arena_dirty(bytes: usize) -> *mut u8 {
