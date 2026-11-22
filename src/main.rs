@@ -772,7 +772,7 @@ fn click_task<const AVX2: bool, C: CSink>(b: &[u8], task: Task, ctx: &Ctx, lt: &
         }
         let user = if wide { unsafe { keys::key_of_wide(f[1]) } } else { keys::key_of(f[1]) };
         let h = keys::mix(user);
-        let ck = if wide { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) };
+        let ck = keys::click_ref(task.file, b.as_ptr(), f[0]);
         if let Some(hp) = cache.get(user, h) {
             c.push_click((hp >> (64 - ctx.ps_bits)) as usize, CRec { person: hp, ck, ts: (t - cws) as u32, camp: camp as u32, _pad: 0 });
             return;
@@ -2212,7 +2212,7 @@ impl SState {
 fn person_sort(ev: &mut [u64], cl: &mut [Click]) {
     ev.sort_unstable();
     if cl.len() > 1 {
-        cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::cmp(a.ck, b.ck)));
+        cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::click_cmp(a.ck, b.ck)));
     }
 }
 
@@ -2528,15 +2528,17 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     // tail where threads wait for the slowest (join idle 14-24 -> 6-8
     // thread-ms on the twin, d7; SS_CCHUNK overrides)
     let clicks_in = load_input(&data_dir.join("clicks"), env_usize("SS_CCHUNK").unwrap_or(chunk / 2).max(1));
+    // clicks carry references to their click_id bytes (keys::click_ref)
+    keys::set_click_maps(clicks_in.maps.iter().map(|m| (m.bytes().as_ptr() as usize, m.bytes().len())).collect());
     marks.mark("mmap");
     let est_lines = events_in.bytes / 75 + 1;
     // long IDs per thread if this is version-5 data (two IDs per event and
     // click line, one in eight long): sizing of the per-thread logs only
-    // (one ID in eight long: event IDs to the event log; user IDs of events,
-    // click and user IDs of clicks to the main log)
+    // (one ID in eight long: event IDs to the event log; user IDs of events
+    // and clicks to the main log; click IDs are not keyed: keys::click_ref)
     let (ev_lines, cl_lines) = (events_in.bytes / bytes_per_line(&events_in, 75) + 1, clicks_in.bytes / bytes_per_line(&clicks_in, 45) + 1);
     let t8 = 8 * threads.max(1);
-    keys::set_log_hints(links_in.bytes / 22 * 2 / t8, (ev_lines + 2 * cl_lines) / t8, ev_lines / t8);
+    keys::set_log_hints(links_in.bytes / 22 * 2 / t8, (ev_lines + cl_lines) / t8, ev_lines / t8);
     let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 12));
     let ps_bits = env_usize("SS_PS_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 16384).clamp(2, 10));
 

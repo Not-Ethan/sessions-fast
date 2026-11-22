@@ -791,6 +791,78 @@ fn stack_string(k: u64, out: &mut [u8; 33]) -> usize {
     }
 }
 
+// ---------------------------------------------------------------- click references
+//
+// A click_id is only ever compared, byte-wise, to break a tie between two
+// clicks with the same ts, which is rare. So clicks carry a reference to the
+// click_id's bytes in the input instead of a key: (file, length, offset) of
+// the unquoted field in the click file mapping, which stays mapped for the
+// whole run (pages dropped after parsing are read back from the file). A tie
+// compares the bytes themselves: exact for every shape, quoted or not. Fields
+// that do not fit the encoding are copied to a side table (file 4095).
+
+/// (base address, length) of every click file mapping of the current run.
+static CMAPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static CMAPS_PTR: std::sync::atomic::AtomicPtr<Vec<(usize, usize)>> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static CSIDE: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+const CREF_SIDE: u64 = 4095;
+
+/// The click file mappings of this run (main::run, before the clicks are parsed).
+pub fn set_click_maps(maps: Vec<(usize, usize)>) {
+    let mut g = CMAPS.lock().unwrap();
+    *g = maps;
+    // a leaked snapshot for lock-free reads (a few per run)
+    let p = Box::into_raw(Box::new(g.clone()));
+    CMAPS_PTR.store(std::hint::black_box(p), AO::Release);
+    CSIDE.lock().unwrap().clear();
+}
+
+/// The reference of click_id field `f` (non-empty) of click file `file`,
+/// whose mapping starts at `base`.
+#[inline(always)]
+pub fn click_ref(file: u32, base: *const u8, f: &[u8]) -> u64 {
+    let off = f.as_ptr() as usize - base as usize;
+    let len = f.len();
+    if (file as u64) < CREF_SIDE && len < 4096 && (off as u64) < (1 << 40) {
+        ((file as u64) << 52) | ((len as u64) << 40) | off as u64
+    } else {
+        click_ref_side(f)
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn click_ref_side(f: &[u8]) -> u64 {
+    let mut g = CSIDE.lock().unwrap();
+    g.push(f.to_vec());
+    (CREF_SIDE << 52) | (g.len() as u64 - 1)
+}
+
+/// Byte-wise order of the click_ids behind two references.
+#[cold]
+pub fn click_cmp(a: u64, b: u64) -> Ordering {
+    if a == b {
+        return Ordering::Equal;
+    }
+    let side = CSIDE.lock().unwrap();
+    let maps = unsafe { &*CMAPS_PTR.load(AO::Acquire) };
+    let bytes = |h: u64| -> &[u8] {
+        let file = h >> 52;
+        if file == CREF_SIDE {
+            let s: &[u8] = &side[(h & ((1 << 52) - 1)) as usize];
+            // the side table outlives this call (cleared only at the next run)
+            unsafe { std::slice::from_raw_parts(s.as_ptr(), s.len()) }
+        } else {
+            let (base, mlen) = maps[file as usize];
+            let len = ((h >> 40) & 4095) as usize;
+            let off = (h & ((1 << 40) - 1)) as usize;
+            assert!(off + len <= mlen, "click reference outside its file");
+            unsafe { std::slice::from_raw_parts((base + off) as *const u8, len) }
+        }
+    };
+    bytes(a).cmp(bytes(b))
+}
+
 /// A well-mixed 64-bit hash of a key (splitmix64 finalizer, a bijection).
 #[inline(always)]
 pub fn mix(k: u64) -> u64 {
@@ -1017,6 +1089,44 @@ mod tests {
         verify_ev_longs(2, None);
         assert!(!collision());
         reset_longs(0);
+    }
+
+    /// Click references: ties compare the referenced bytes, exactly the
+    /// byte-wise order of the click_ids, for quoted / unquoted copies, long,
+    /// short and odd shapes, and fields that go to the side table.
+    #[test]
+    fn click_refs_order() {
+        let _g = LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let ids: Vec<Vec<u8>> = vec![
+            b"k1".to_vec(), b"k10".to_vec(), b"k0123456789abcdef0123456789abcdef".to_vec(), b"k0123456789abcdef0123456789abcdee".to_vec(),
+            b"K0123456789abcdef0123456789abcdef".to_vec(), b"k0".to_vec(), b"k".to_vec(), b" k1".to_vec(), b"k1 ".to_vec(), b"\xc3\xa9".to_vec(),
+            vec![b'k'; 5000], b"k0123456789ABCDEF0123456789abcdef".to_vec(),
+        ];
+        // a "file": every id twice, once quoted
+        let mut buf = Vec::new();
+        let mut pos = Vec::new();
+        for id in &ids {
+            pos.push((buf.len(), id.len()));
+            buf.extend_from_slice(id);
+            buf.push(b',');
+            buf.push(b'"');
+            pos.push((buf.len(), id.len()));
+            buf.extend_from_slice(id);
+            buf.extend_from_slice(b"\",\n");
+        }
+        set_click_maps(vec![(buf.as_ptr() as usize, buf.len())]);
+        let refs: Vec<u64> = pos.iter().map(|&(o, n)| click_ref(0, buf.as_ptr(), &buf[o..o + n])).collect();
+        // a file index beyond the encoding goes to the side table
+        let side = click_ref(5000, buf.as_ptr(), &buf[pos[0].0..pos[0].0 + pos[0].1]);
+        for i in 0..refs.len() {
+            let si = &buf[pos[i].0..pos[i].0 + pos[i].1];
+            assert_eq!(click_cmp(refs[i], side), si.cmp(&ids[0][..]));
+            for j in 0..refs.len() {
+                let sj = &buf[pos[j].0..pos[j].0 + pos[j].1];
+                assert_eq!(click_cmp(refs[i], refs[j]), si.cmp(sj), "{} {}", i, j);
+            }
+        }
+        set_click_maps(Vec::new());
     }
 
     /// The SSE hex decoder agrees with a scalar one on random strings.

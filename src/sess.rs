@@ -34,6 +34,7 @@ const W: u32 = crate::GAP;
 #[derive(Clone, Copy)]
 pub(crate) struct Cl {
     pub(crate) person: u64,
+    /// click_id reference (keys::click_ref; compare with keys::click_cmp)
     pub(crate) ck: u64,
     pub(crate) ts: u32,
     pub(crate) camp: u32,
@@ -666,7 +667,7 @@ impl St {
                 if c.ts >= lo && c.ts as u64 <= hi {
                     if best == usize::MAX
                         || c.ts > pc[best].ts
-                        || (c.ts == pc[best].ts && keys::cmp(c.ck, pc[best].ck) == CmpOrd::Less)
+                        || (c.ts == pc[best].ts && keys::click_cmp(c.ck, pc[best].ck) == CmpOrd::Less)
                     {
                         best = k;
                     }
@@ -709,7 +710,7 @@ impl St {
                 let mut k = add - 1;
                 while k > rem && pc[k - 1].ts == tmax {
                     k -= 1;
-                    if keys::cmp(pc[k].ck, pc[best].ck) == CmpOrd::Less {
+                    if keys::click_cmp(pc[k].ck, pc[best].ck) == CmpOrd::Less {
                         best = k;
                     }
                 }
