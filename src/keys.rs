@@ -192,6 +192,14 @@ static LONG_OFF: AtomicBool = AtomicBool::new(false);
 /// Hash bits kept (SS_LONGBITS, tests: few bits force collisions), <= 60.
 static LONG_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
 static COLLISION: AtomicBool = AtomicBool::new(false);
+/// Initial capacity of a thread's log (entries; `set_log_hint`).
+static LOG_HINT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1024);
+
+/// Expected long IDs per worker thread (sizing only): a thread's log starts
+/// with this capacity instead of growing by doubling (copies, page faults).
+pub fn set_log_hint(n: usize) {
+    LOG_HINT.store(n.clamp(1024, 1 << 26), AO::Relaxed);
+}
 static ANY_LONG: AtomicBool = AtomicBool::new(false);
 
 /// One logged long ID: key, first byte, the 32 hex digits as two u64.
@@ -292,7 +300,13 @@ fn long_key(pre: u8, hi: u64, lo: u64) -> u64 {
     let bits = LONG_BITS.load(AO::Relaxed);
     let h = if bits >= 60 { h } else { h & ((1u64 << bits) - 1) };
     let key = (h << 4) | 0xE;
-    LOG.with(|l| l.borrow_mut().push(LEnt { key, pre: pre as u64, hi, lo }));
+    LOG.with(|l| {
+        let mut l = l.borrow_mut();
+        if l.capacity() == 0 {
+            l.reserve(LOG_HINT.load(AO::Relaxed));
+        }
+        l.push(LEnt { key, pre: pre as u64, hi, lo })
+    });
     key
 }
 
@@ -434,7 +448,9 @@ fn verify_longs_inner(threads: usize) -> usize {
                 break;
             }
             let s = unsafe { std::slice::from_raw_parts_mut((ap as *mut LEnt).add(startr[p]), startr[p + 1] - startr[p]) };
-            s.sort_unstable();
+            // by key only; within a run of equal keys every entry must equal
+            // the run's first (the kept one), else two IDs share the key
+            s.sort_unstable_by_key(|e| e.key);
             let mut k = 0usize;
             for i in 0..s.len() {
                 if k > 0 && s[k - 1].key == s[i].key {

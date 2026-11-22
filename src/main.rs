@@ -2489,6 +2489,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let clicks_in = load_input(&data_dir.join("clicks"), env_usize("SS_CCHUNK").unwrap_or(chunk / 2).max(1));
     marks.mark("mmap");
     let est_lines = events_in.bytes / 75 + 1;
+    // long IDs per thread if this is version-5 data (two IDs per event and
+    // click line, one in eight long): sizing of the per-thread logs only
+    keys::set_log_hint((est_lines + clicks_in.bytes / 45) * 2 / 7 / threads.max(1));
     let pe_bits = env_usize("SS_PE_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 4096).clamp(2, 12));
     let ps_bits = env_usize("SS_PS_BITS").map(|b| b as u32).unwrap_or_else(|| ceil_log2(est_lines / 16384).clamp(2, 10));
 
