@@ -80,7 +80,26 @@ NB=128 segments: no gain (line bench 59.3-60.7 ms).
 k6 ships only if, on one shipped-style image, mirrored order (ab_env.sh k4-first x5 + k6-first x5),
 against k4-v2e: >= 5 ms on e23 over 10 rounds AND a consistent gain on e60 over 8 rounds.
 Verdict due 7:00 AM with per-round lifetimes.
-- rebased v1b (tree ss4, image ss-k6-r): k6test 14/14, SS_K6CHECK dev5 OK; lifetimes queued.
+- rebased v1b (tree ss4, image ss-k6-r): k6test 14/14, SS_K6CHECK dev5 OK. Lifetimes vs k4-v2e (same image):
+  e23 k4-first x5 (k4/k6): 882.9/873.2 875.2/864.9 876.0/871.0 874.5/871.7 849.7/842.0 (k6-k4 mean -7.1)
+  e23 k6-first x5 (k6/k4): 861.5/866.4 872.8/864.3 856.2/853.5 866.4/868.0 862.7/868.0 (k6-k4 mean -0.1)
+  -> 10 rounds mirrored: -3.6 ms (an order bias of ~3.6 ms favours the second run of a pair). Below the
+  5 ms rule. (e60 for this image not run: replaced by v2.)
+- v2 = 82fdf21 (stage 1: 7 entries, 5-op quote rule, subborrow, folded flag loads); tests 14/14.
+  v2q (same + an x2 unroll that LLVM compiled worse) counted 476.6/line.
+- COUNTS on the rebased tree (dev5 line bench, callgrind, v2 profiling build): k4-v2e 520.6/line;
+  k6 v2 472.4 (-48.2, -9.3%: k6-s1 111.3, k6-cut 25.0, k6-loop 10.6, decode+sink+other ~325);
+  v3 candidate 5317fdf (flatten's 7th blsr as the >7 check, index loop): 469.8 (k6-s1 108.6), tests 14/14.
+- llvm-mca (cascadelake) of the stage-1 loop alone (v2, 84 instr/block): 23 cycles/block, IPC 3.64,
+  resource-bound (RThroughput 15); ~30 cycles per line at 1.29 blocks/line.
+- v2 checker dev5 OK; image ss-k6-v2 built (82fdf21, shipped Dockerfile).
+  e23 k4-first x5 (k4/k6): 872.2/821.6 843.9/817.9 838.5/824.6 840.2/824.9 842.8/825.4
+  e23 k6-first x5 (k6/k4): 822.8/839.4 830.2/834.7 831.8/843.2 817.6/834.4 828.0/842.2
+  -> medians k4 841.2 / k6 824.75 (-16.5 ms); paired mean -18.7 (-15.1 without round 1); k6 faster 10/10.
+  e60 k4-first x4 (k4/k6): 2386.5/2300.5 2366.7/2337.8 2364.7/2313.1 2350.4/2334.2
+  e60 k6-first x4 (k6/k4): 2410.4/2402.9 2360.8/2427.1 2381.7/2417.8 2364.3/2370.9
+  -> medians k4 2378.7 / k6 2349.3 (-29.4 ms); paired mean -35.5; k6 faster 7/8.
+  VERDICT: v2 passes the rule (>= 5 ms e23 over 10 mirrored rounds, consistent on e60 over 8).
 - v2 candidate 4936c59 (7 unconditional entries, flags via one constant + lea, moving pointer):
   483.0/line total (k6-s1 117.8) on the rebased tree (k4-v2e decode). NB: cgaddr's decode line ranges
   are stale after the rebase (ts/ids/validity split wrong), totals are right.
