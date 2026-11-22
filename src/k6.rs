@@ -11,7 +11,7 @@
 //!   newline and quote masks; the dialect's quote rule as a mask `bad` of
 //!   positions that make their line malformed (see `block`); the positions
 //!   of every delimiter (comma or newline) and every `bad` bit, in order,
-//!   flattened into `e` (u32, offset from the segment start + 1), and one
+//!   flattened into `e` (u32, offset from the segment start), and one
 //!   flag byte per entry in `fl`: bit 0 = the byte before it is a quote,
 //!   bit 1 = it is a newline, bit 2 = it is a `bad` position.
 //! * stage 2, per line (its first entry has index k; entry k - 1 is the
@@ -21,7 +21,7 @@
 //!   the line has exactly seven fields, ends at its first newline, and has
 //!   no quote except a pair around a whole field (the closing one is flag
 //!   bit 0 of the field's terminating entry); field j is
-//!   [e[k+j-1] + q_j, e[k+j] - 1 - q_j) (offsets from the segment start),
+//!   [e[k+j-1] + 1 + q_j, e[k+j] - q_j) (offsets from the segment start),
 //!   computed for all seven fields at once in two ymm, written into a
 //!   `fastev::Cut` and handed to k4's own `decode_body` (and to k4's
 //!   `line_fb` when it is not certain), so timestamps, IDs, validity,
@@ -107,7 +107,7 @@ struct S1 {
     dp: u64,
     qp: u64,
     fsp: u64,
-    cin: u64,
+    cin: u8,
     /// next entry index
     kb: usize,
 }
@@ -141,24 +141,25 @@ unsafe fn block(st: &mut S1, p: *const u8, blk: usize, vm: u64, e: *mut u32, fl:
     let qs = (qq << 1) | (st.qp >> 63);
     let fss = (fs << 1) | (st.fsp >> 63);
     let op = qq & fs;
-    let sum = (!d as u128) + (op as u128) + (st.cin as u128);
-    let od = (sum as u64) & d;
+    let mut sum = 0u64;
+    let cout = _addcarry_u64(st.cin, !d, op, &mut sum);
+    let od = sum & d;
     let bad = (qs & !fss & !d) | (d & ((od ^ qs) | (qs & fss)));
     st.dp = d;
     st.qp = qq;
     st.fsp = fs;
-    st.cin = (sum >> 64) as u64;
-    let base1 = (blk * 64 + 1) as u32;
+    st.cin = cout;
+    let base = (blk * 64) as u32;
     let kb = st.kb;
     let cnt = d.count_ones() as usize;
     if (bad != 0) | (cnt > 8) {
-        st.kb = kb + block_slow(d | bad, qs, n, bad, base1, e.add(kb), fl.add(kb));
+        st.kb = kb + block_slow(d | bad, qs, n, bad, base, e.add(kb), fl.add(kb));
         return;
     }
     let ep = e.add(kb);
     let mut f = d;
     for i in 0..8 {
-        *ep.add(i) = base1 + f.trailing_zeros();
+        *ep.add(i) = base + f.trailing_zeros();
         f &= f.wrapping_sub(1);
     }
     let fl8 = _pdep_u64(_pext_u64(qs, d), L1) | _pdep_u64(_pext_u64(n, d), L1 << 1);
@@ -172,12 +173,12 @@ unsafe fn block(st: &mut S1, p: *const u8, blk: usize, vm: u64, e: *mut u32, fl:
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[cold]
 #[inline(never)]
-unsafe fn block_slow(f: u64, qs: u64, n: u64, bad: u64, base1: u32, ep: *mut u32, flp: *mut u8) -> usize {
+unsafe fn block_slow(f: u64, qs: u64, n: u64, bad: u64, base: u32, ep: *mut u32, flp: *mut u8) -> usize {
     let cnt = f.count_ones() as usize;
     let mut x = f;
     let mut i = 0;
     while x != 0 {
-        *ep.add(i) = base1 + x.trailing_zeros();
+        *ep.add(i) = base + x.trailing_zeros();
         x &= x - 1;
         i += 1;
     }
@@ -195,12 +196,13 @@ unsafe fn block_slow(f: u64, qs: u64, n: u64, bad: u64, base1: u32, ep: *mut u32
 
 /// Stage 1 over the `nb` blocks at p (the segment; p is a line start; bytes
 /// of the last block outside `lastmask` are ignored). Returns the number of
-/// entries including the virtual entry 0 (the newline before p); sentinels
-/// follow.
+/// entries including the virtual entry 0 (the newline before p, offset -1);
+/// sentinels follow. Out of line: its loop gets every register.
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+#[inline(never)]
 unsafe fn stage1(p: *const u8, nb: usize, lastmask: u64, e: *mut u32, fl: *mut u8, pf: usize) -> usize {
-    *e = 0;
+    *e = u32::MAX;
     *fl = F_NL;
     // the byte before p ends a line: a delimiter there, no quote, no carry
     let mut st = S1 { dp: 1 << 63, qp: 0, fsp: 0, cin: 0, kb: 1 };
@@ -210,7 +212,7 @@ unsafe fn stage1(p: *const u8, nb: usize, lastmask: u64, e: *mut u32, fl: *mut u
     }
     block(&mut st, p, nb - 1, lastmask, e, fl);
     let kb = st.kb;
-    let big = (nb * 64 + 1) as u32;
+    let big = (nb * 64) as u32;
     for i in 0..NSENT {
         *e.add(kb + i) = big;
         *fl.add(kb + i) = F_BAD;
@@ -220,15 +222,14 @@ unsafe fn stage1(p: *const u8, nb: usize, lastmask: u64, e: *mut u32, fl: *mut u
 
 // ---------------------------------------------------------------- stage 2
 
-/// The fields of the simple line whose first entry is k, as a `fastev::Cut`
-/// relative to the segment start: s_j = e[k+j-1] + q_j, n_j = e[k+j] -
-/// e[k+j-1] - 1 - 2 q_j (q_j = flag bit 0 of entry k+j), lanes 0..3 and 3..6.
+/// The fields of the simple line whose first entry is k, into `*c` (a
+/// `fastev::Cut` relative to the segment start): s_j = e[k+j-1] + 1 + q_j,
+/// n_j = e[k+j] - s_j - q_j (q_j = flag bit 0 of entry k+j), lanes 0..3 and
+/// 3..6. Entries are sign-extended (the virtual entry is -1).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn cut(e: *const u32, fl: *const u8, k: usize) -> fastev::Cut {
-    let mut c = MaybeUninit::<fastev::Cut>::uninit();
-    let cp = c.as_mut_ptr();
-    let ld = |i: usize| _mm256_cvtepu32_epi64(_mm_loadu_si128(e.add(i) as *const __m128i));
+unsafe fn cut_into(c: *mut fastev::Cut, e: *const u32, fl: *const u8, k: usize) {
+    let ld = |i: usize| _mm256_cvtepi32_epi64(_mm_loadu_si128(e.add(i) as *const __m128i));
     let one = _mm256_set1_epi64x(1);
     // fields 0..3: flags of entries k..k+3 are 0 or 1 (simple line)
     let alo = ld(k - 1);
@@ -238,19 +239,16 @@ unsafe fn cut(e: *const u32, fl: *const u8, k: usize) -> fastev::Cut {
     let ahi = ld(k + 2);
     let bhi = ld(k + 3);
     let qhi = _mm256_and_si256(_mm256_cvtepu8_epi64(_mm_cvtsi32_si128(rd32(fl.add(k + 3)) as i32)), one);
-    let slo = _mm256_add_epi64(alo, qlo);
-    let shi = _mm256_add_epi64(ahi, qhi);
-    let nlo = _mm256_sub_epi64(_mm256_sub_epi64(blo, _mm256_add_epi64(slo, qlo)), one);
-    let nhi = _mm256_sub_epi64(_mm256_sub_epi64(bhi, _mm256_add_epi64(shi, qhi)), one);
-    let sp = addr_of_mut!((*cp).s) as *mut usize;
-    let np = addr_of_mut!((*cp).n) as *mut usize;
+    let slo = _mm256_add_epi64(_mm256_add_epi64(alo, qlo), one);
+    let shi = _mm256_add_epi64(_mm256_add_epi64(ahi, qhi), one);
+    let nlo = _mm256_sub_epi64(_mm256_sub_epi64(blo, slo), qlo);
+    let nhi = _mm256_sub_epi64(_mm256_sub_epi64(bhi, shi), qhi);
+    let sp = addr_of_mut!((*c).s) as *mut usize;
+    let np = addr_of_mut!((*c).n) as *mut usize;
     _mm256_storeu_si256(sp as *mut __m256i, slo);
     _mm256_storeu_si256(sp.add(3) as *mut __m256i, shi);
     _mm256_storeu_si256(np as *mut __m256i, nlo);
     _mm256_storeu_si256(np.add(3) as *mut __m256i, nhi);
-    addr_of_mut!((*cp).ok).write(true);
-    addr_of_mut!((*cp).len).write(0);
-    c.assume_init()
 }
 
 // ---------------------------------------------------------------- task
@@ -300,6 +298,9 @@ unsafe fn task_k6<S: EvSink, const P2: bool>(b: &[u8], task: Task, ctx: &Ctx, si
     let mut ring = MaybeUninit::<Ring>::uninit();
     let e = addr_of_mut!((*ring.as_mut_ptr()).e) as *mut u32;
     let fl = addr_of_mut!((*ring.as_mut_ptr()).fl) as *mut u8;
+    // the cut of the current line (written by cut_into, read by the decode)
+    let mut cut = fastev::Cut { ok: true, s: [0; 7], n: [0; 7], len: 0 };
+    let cp: *mut fastev::Cut = &mut cut;
     let mut off = start;
     let mut slow = 0usize;
     'seg: while off < end && off <= lim {
@@ -316,18 +317,18 @@ unsafe fn task_k6<S: EvSink, const P2: bool>(b: &[u8], task: Task, ctx: &Ctx, si
         loop {
             let x = rd64(fl.add(k));
             if x & PAT_M == PAT {
-                let c = cut(e, fl, k);
-                if k4::decode_body::<S, P2>(kp, ctx, p, &c, sink) {
+                cut_into(cp, e, fl, k);
+                if k4::decode_body::<S, P2>(kp, ctx, p, &*cp, sink) {
                     st.fast += 1;
                 } else {
                     st.line_fb += 1;
-                    k4::line_fb(p, &c, ctx, sink);
+                    k4::line_fb(p, &*cp, ctx, sink);
                 }
                 k += 7;
                 continue;
             }
             // not simple: the line's newline among the entries, if any
-            let ls = a + *e.add(k - 1) as usize;
+            let ls = a + (*e.add(k - 1)).wrapping_add(1) as usize;
             let mut j = k;
             while j < cnt && *fl.add(j) & F_NL == 0 {
                 j += 1;
@@ -339,7 +340,7 @@ unsafe fn task_k6<S: EvSink, const P2: bool>(b: &[u8], task: Task, ctx: &Ctx, si
                 }
                 slow += 1;
                 let nx = k4::slow_line::<S, P2>(b, ls, task.file, kp, ctx, sink, safe_end, &mut st);
-                debug_assert_eq!(nx, a + *e.add(j) as usize);
+                debug_assert_eq!(nx, a + *e.add(j) as usize + 1);
                 let _ = nx;
                 k = j + 1;
             } else {
