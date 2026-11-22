@@ -624,7 +624,7 @@ fn event_line<'a, const WIDE: bool, S: EvSink, F: scan::Fields<'a>>(f: &F, f0: &
     let f3 = f.get(3);
     let ing = if WIDE && ctx.tsw { unsafe { ctx.tsp.parse_wide_f1(f3) } } else { ctx.tsp.parse(f3) };
     let Some(ing) = ing else { return };
-    let eid = keys::mix(if WIDE { unsafe { keys::key_of_wide(f0) } } else { keys::key_of(f0) });
+    let eid = keys::mix(if WIDE { unsafe { keys::key_of_ev_wide(f0) } } else { keys::key_of_ev(f0) });
     let ingest = ingest_rel(ing, ctx.ws_s);
     let valid = 'v: {
         let f1 = f.get(1);
@@ -1672,7 +1672,7 @@ fn kill(loc: u32, sb: &[BOut], lb: LocBits) {
 /// ingest (on a tie, the one already there; equal-ingest copies are
 /// identical) and marks the loser's SRec dead.
 #[inline(always)]
-fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocBits) {
+fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocBits, multi: &mut Vec<u64>) {
     let mut i = r.eid as usize & mask;
     loop {
         let slot = unsafe { table.get_unchecked_mut(i) };
@@ -1681,6 +1681,12 @@ fn dedup_insert(table: &mut [ARec], mask: usize, r: &ARec, sb: &[BOut], lb: LocB
             return;
         }
         if slot.eid == r.eid {
+            // a long event ID met more than once: its log entries are compared
+            // (keys::verify_ev_longs)
+            let k = keys::unmix(r.eid);
+            if keys::is_long(k) {
+                multi.push(k);
+            }
             if r.ingest < slot.ingest {
                 kill(slot.loc, sb, lb);
                 slot.ingest = r.ingest;
@@ -1699,12 +1705,14 @@ fn phase_threads(name: &str, ctx: &Ctx) -> usize {
     env_usize(&format!("SS_{}_THREADS", name)).filter(|&n| n > 0).unwrap_or(ctx.threads).min(ctx.threads.max(1))
 }
 
-fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) {
+/// Returns the long event-ID keys met more than once (for keys::verify_ev_longs).
+fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
     let pe = 1usize << ctx.pe_bits;
     let mut order: Vec<(usize, usize)> = (0..pe).map(|p| (sb.iter().map(|t| t.a.len(p)).sum::<usize>(), p)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
-    par(phase_threads("DEDUP", ctx), |_| {
+    let multis = par(phase_threads("DEDUP", ctx), |_| {
+        let mut multi: Vec<u64> = Vec::new();
         let mut table: Vec<ARec> = Vec::new();
         let mut scratch: Vec<ARec> = Vec::new();
         let mut counts: Vec<usize> = Vec::new();
@@ -1726,7 +1734,7 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) {
                 for t in sb {
                     for sl in t.a.get(p) {
                         for r in sl {
-                            dedup_insert(&mut table, mask, r, sb, lb);
+                            dedup_insert(&mut table, mask, r, sb, lb, &mut multi);
                         }
                     }
                 }
@@ -1766,11 +1774,16 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) {
                 }
                 let mask = reset(&mut table, bucket.len());
                 for r in bucket {
-                    dedup_insert(&mut table, mask, r, sb, lb);
+                    dedup_insert(&mut table, mask, r, sb, lb, &mut multi);
                 }
             }
         }
+        multi
     });
+    let mut m: Vec<u64> = multis.into_iter().flatten().collect();
+    m.sort_unstable();
+    m.dedup();
+    m
 }
 
 // ---------------------------------------------------------------- sessions
@@ -2581,8 +2594,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
             if gt.is_some() {
                 pipeline = "B-table";
                 apply_kills(&bouts, &ctx, lb);
+                keys::verify_ev_longs(threads, None);
             } else {
-                dedup_b(&bouts, &ctx, lb);
+                let multi = dedup_b(&bouts, &ctx, lb);
+                keys::verify_ev_longs(threads, Some(&multi));
             }
             marks.mark("dedup");
             b_result = Some((lt, bouts));
@@ -2598,6 +2613,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         marks.mark("parse");
         let (ebufs, cbufs): (Vec<Parts<ERec>>, Vec<Parts<CRec>>) = pouts.into_iter().map(|po| (po.e.0, po.c)).unzip();
         let sbufs = dedup(&ebufs, &lt, &ctx);
+        keys::verify_ev_longs(threads, None);
         marks.mark("dedup");
         // Not freed: unmapping costs more than it saves; the process exits soon.
         std::mem::forget(ebufs);
@@ -3063,7 +3079,7 @@ fn ev_batch_flush<S: EvSink>(bt: &mut EvBatch, base: *const u8, ctx: &Ctx, sink:
     }
     if upto >= 2 {
         for i in 0..n {
-            bt.eid[i] = keys::mix(unsafe { keys::key_of_wide(bfield(bt, base, 0, i)) });
+            bt.eid[i] = keys::mix(unsafe { keys::key_of_ev_wide(bfield(bt, base, 0, i)) });
         }
     }
     if upto >= 3 {

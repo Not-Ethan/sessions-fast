@@ -174,14 +174,40 @@ pub fn key_of(s: &[u8]) -> u64 {
 /// Key of a string that does not pack: long form or interned.
 #[inline(always)]
 fn other(s: &[u8]) -> u64 {
+    other_in::<false>(s)
+}
+
+/// `other` for event IDs (EV): long ones are logged to the event log, which
+/// is checked only for the keys dedup met more than once (`verify_ev_longs`):
+/// event IDs are compared only there and never decoded.
+#[inline(always)]
+fn other_in<const EV: bool>(s: &[u8]) -> u64 {
     if s.len() == 33 && !LONG_OFF.load(AO::Relaxed) {
         if let Some((hi, lo)) = hex32(&s[1..]) {
             if CODE[s[0] as usize] & INVALID == 0 {
-                return long_key(s[0], hi, lo);
+                return long_key::<EV>(s[0], hi, lo);
             }
         }
     }
     intern(s)
+}
+
+/// `key_of` for an event_id (see `other_in`).
+#[inline(always)]
+pub fn key_of_ev(s: &[u8]) -> u64 {
+    match pack(s) {
+        Some(k) => k,
+        None => other_in::<true>(s),
+    }
+}
+
+/// `key_of_wide` for an event_id (see `other_in`).
+#[inline(always)]
+pub unsafe fn key_of_ev_wide(s: &[u8]) -> u64 {
+    match pack_wide(s) {
+        Some(k) => k,
+        None => other_in::<true>(s),
+    }
 }
 
 // ---------------------------------------------------------------- long IDs
@@ -227,8 +253,13 @@ thread_local! {
     /// (a RefCell<Option<..>> went through LocalKey::try_with every time).
     static LOG: std::cell::Cell<*mut Parts<LEnt>> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
+thread_local! {
+    /// This thread's log of long event IDs (as LOG).
+    static EVLOG: std::cell::Cell<*mut Parts<LEnt>> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
 /// Logs of finished threads (`flush_thread`).
 static LOGS: Mutex<Vec<Parts<LEnt>>> = Mutex::new(Vec::new());
+static EVLOGS: Mutex<Vec<Parts<LEnt>>> = Mutex::new(Vec::new());
 
 /// One partition of the decode table: the distinct long IDs of the partition
 /// and an open-addressing index over them (entry index + 1; 0 = empty).
@@ -318,12 +349,13 @@ fn long_hash(pre: u64, hi: u64, lo: u64) -> u64 {
 }
 
 #[inline(always)]
-fn long_key(pre: u8, hi: u64, lo: u64) -> u64 {
+fn long_key<const EV: bool>(pre: u8, hi: u64, lo: u64) -> u64 {
     let h = long_hash(pre as u64, hi, lo) >> 4;
     let bits = LONG_BITS.load(AO::Relaxed);
     let h = if bits >= 60 { h } else { h & ((1u64 << bits) - 1) };
     let key = (h << 4) | 0xE;
-    LOG.with(|l| {
+    let log = if EV { &EVLOG } else { &LOG };
+    log.with(|l| {
         let mut p = l.get();
         if p.is_null() {
             p = new_log();
@@ -348,24 +380,33 @@ pub fn is_long(k: u64) -> bool {
 /// Moves this thread's log of long IDs to the shared list (main::par calls
 /// it at the end of every worker; also before a verification).
 pub fn flush_thread() {
-    let p = LOG.with(|l| l.replace(std::ptr::null_mut()));
-    if !p.is_null() {
-        let mut v = unsafe { Box::from_raw(p) };
-        v.finish();
-        if v.total() > 0 {
-            LOGS.lock().unwrap().push(*v);
+    for (log, logs) in [(&LOG, &LOGS), (&EVLOG, &EVLOGS)] {
+        let p = log.with(|l| l.replace(std::ptr::null_mut()));
+        if !p.is_null() {
+            let mut v = unsafe { Box::from_raw(p) };
+            v.finish();
+            if v.total() > 0 {
+                logs.lock().unwrap().push(*v);
+            }
         }
+    }
+}
+
+/// Drops this thread's unflushed logs and every flushed one.
+fn clear_logs() {
+    for (log, logs) in [(&LOG, &LOGS), (&EVLOG, &EVLOGS)] {
+        let p = log.with(|l| l.replace(std::ptr::null_mut()));
+        if !p.is_null() {
+            drop(unsafe { Box::from_raw(p) });
+        }
+        logs.lock().unwrap().clear();
     }
 }
 
 /// Start of a job (main::run): logs and table of a previous job (the far
 /// ingest_ts rerun) are dropped; seed and interner mode are kept.
 pub fn new_run() {
-    let p = LOG.with(|l| l.replace(std::ptr::null_mut()));
-    if !p.is_null() {
-        drop(unsafe { Box::from_raw(p) });
-    }
-    LOGS.lock().unwrap().clear();
+    clear_logs();
     TAB.store(std::ptr::null_mut(), AO::Release);
 }
 
@@ -401,11 +442,7 @@ pub fn collision() -> bool {
 /// Before a rerun after a collision: next seed (or the interner after
 /// LONG_TRIES seeds), logs and tables cleared. Returns the attempt number.
 pub fn reset_longs(attempt: u64) {
-    let p = LOG.with(|l| l.replace(std::ptr::null_mut()));
-    if !p.is_null() {
-        drop(unsafe { Box::from_raw(p) });
-    }
-    LOGS.lock().unwrap().clear();
+    clear_logs();
     TAB.store(std::ptr::null_mut(), AO::Release);
     COLLISION.store(false, AO::Relaxed);
     if attempt >= LONG_TRIES {
@@ -435,9 +472,11 @@ pub static LONG_DISTINCT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// "long_entries=.. long_distinct=.. long_verify_ms=.." for the verbose report.
 pub fn long_stats() -> String {
     format!(
-        "long_entries={} long_distinct={} long_verify_ms={:.1}",
+        "long_entries={} long_distinct={} long_ev_entries={} long_ev_checked={} long_verify_ms={:.1}",
         LONG_ENTRIES.load(AO::Relaxed),
         LONG_DISTINCT.load(AO::Relaxed),
+        EV_ENTRIES.load(AO::Relaxed),
+        EV_CHECKED.load(AO::Relaxed),
         VERIFY_NS.load(AO::Relaxed) as f64 / 1e6
     )
 }
@@ -510,6 +549,64 @@ fn verify_longs_inner(threads: usize) -> usize {
     let tab = std::hint::black_box(Box::into_raw(Box::new(LongTab { parts })));
     TAB.store(tab, AO::Release);
     distinct
+}
+
+pub static EV_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static EV_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The check of long event IDs (logged by key_of_ev). With `multi` (the
+/// keys that dedup met more than once): only their entries are compared.
+/// That is complete: two different event IDs with one key would be two
+/// records with one key in dedup, so the key would be in `multi`. Without
+/// (pipelines whose dedup does not collect them): every entry, as
+/// verify_longs. Sets `collision()` like verify_longs.
+pub fn verify_ev_longs(threads: usize, multi: Option<&[u64]>) {
+    let t0 = std::time::Instant::now();
+    flush_thread();
+    let lists = EVLOGS.lock().unwrap();
+    let total: usize = lists.iter().map(|v| v.total()).sum();
+    EV_ENTRIES.store(total as u64, AO::Relaxed);
+    if total == 0 {
+        return;
+    }
+    let set: Option<std::collections::HashSet<u64>> = multi.map(|m| m.iter().copied().collect());
+    if set.as_ref().is_some_and(|s| s.is_empty()) {
+        return;
+    }
+    // the entries to compare, per partition, then a sort and run check
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let coll = AtomicBool::new(false);
+    let checked = std::sync::atomic::AtomicU64::new(0);
+    crate::par(threads, |_| {
+        let mut v: Vec<LEnt> = Vec::new();
+        loop {
+            let p = next.fetch_add(1, AO::Relaxed);
+            if p >= NPART {
+                break;
+            }
+            v.clear();
+            for l in lists.iter() {
+                for sl in l.get(p) {
+                    match &set {
+                        Some(s) => v.extend(sl.iter().filter(|e| s.contains(&e.key))),
+                        None => v.extend_from_slice(sl),
+                    }
+                }
+            }
+            checked.fetch_add(v.len() as u64, AO::Relaxed);
+            v.sort_unstable_by_key(|e| e.key);
+            for i in 1..v.len() {
+                if v[i].key == v[i - 1].key && v[i] != v[i - 1] {
+                    coll.store(true, AO::Relaxed);
+                }
+            }
+        }
+    });
+    EV_CHECKED.store(checked.load(AO::Relaxed), AO::Relaxed);
+    if coll.load(AO::Relaxed) {
+        COLLISION.store(true, AO::Relaxed);
+    }
+    VERIFY_NS.fetch_add(t0.elapsed().as_nanos() as u64, AO::Relaxed);
 }
 
 /// (first byte, hi, lo) of a long key, from the decode table.
@@ -799,6 +896,48 @@ mod tests {
         assert!(LONG_OFF.load(AO::Relaxed));
         LONG_BITS.store(60, AO::Relaxed);
         LONG_OFF.store(false, AO::Relaxed);
+        reset_longs(0);
+    }
+
+    /// Event-ID log: a collision is found by the full check and by the check
+    /// of the keys met more than once, and not reported for equal IDs.
+    #[test]
+    fn event_long_keys_checked() {
+        let _g = LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        reset_longs(0);
+        LONG_OFF.store(false, AO::Relaxed);
+        LONG_BITS.store(4, AO::Relaxed);
+        let ids: Vec<Vec<u8>> = (0..100u64).map(|i| hex_id(b'e', mix(i + 7), mix(i + 77))).collect();
+        let keys: Vec<u64> = ids.iter().map(|s| key_of_ev(s)).collect();
+        // the same ID again (a duplicate copy) never counts as a collision
+        let again = key_of_ev(&ids[0]);
+        assert_eq!(again, keys[0]);
+        // keys met more than once: with 4 bits, distinct IDs share keys
+        let mut multi: Vec<u64> = keys.clone();
+        multi.sort_unstable();
+        let dup: Vec<u64> = multi.windows(2).filter(|w| w[0] == w[1]).map(|w| w[0]).collect();
+        assert!(!dup.is_empty());
+        verify_ev_longs(2, Some(&[]));
+        assert!(!collision());
+        verify_ev_longs(2, Some(&[keys[0]]));
+        let c0 = collision();
+        COLLISION.store(false, AO::Relaxed);
+        verify_ev_longs(2, Some(&dup));
+        assert!(collision(), "targeted check must find the shared keys");
+        COLLISION.store(false, AO::Relaxed);
+        verify_ev_longs(2, None);
+        assert!(collision(), "full check must find the shared keys");
+        // keys[0] alone: a collision iff another ID has its key
+        assert_eq!(c0, keys.iter().skip(1).any(|&k| k == keys[0]));
+        // exact keys (60 bits): no collision
+        reset_longs(0);
+        LONG_BITS.store(60, AO::Relaxed);
+        let keys: Vec<u64> = ids.iter().map(|s| key_of_ev(s)).collect();
+        let _ = key_of_ev(&ids[3]);
+        verify_ev_longs(2, Some(&keys));
+        assert!(!collision());
+        verify_ev_longs(2, None);
+        assert!(!collision());
         reset_longs(0);
     }
 
