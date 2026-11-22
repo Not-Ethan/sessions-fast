@@ -7,8 +7,8 @@
 //! string equality.
 //!
 //! A "long" ID, exactly one byte of that alphabet followed by exactly 32
-//! lowercase hexadecimal digits (`[0-9a-f]`, the generator's 128-bit suffix
-//! form), gets `(h << 4) | 0xE` with h a 60-bit keyed hash of (first byte,
+//! lowercase hexadecimal digits (`[0-9a-f]`; one ID in eight in the current
+//! data), gets `(h << 4) | 0xE` with h a 60-bit keyed hash of (first byte,
 //! 128-bit value), computed without any shared state. Every thread logs
 //! (key, first byte, value) of each long ID it keys; `verify_longs` (after the
 //! links are parsed, and after all parsing) checks that no key stands for two
@@ -200,7 +200,6 @@ static LOG_HINT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 pub fn set_log_hint(n: usize) {
     LOG_HINT.store(n.clamp(1024, 1 << 26), AO::Relaxed);
 }
-static ANY_LONG: AtomicBool = AtomicBool::new(false);
 
 /// One logged long ID: key, first byte, the 32 hex digits as two u64.
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -320,7 +319,6 @@ pub fn is_long(k: u64) -> bool {
 pub fn flush_thread() {
     let v = LOG.with(|l| std::mem::take(&mut *l.borrow_mut()));
     if !v.is_empty() {
-        ANY_LONG.store(true, AO::Relaxed);
         LOGS.lock().unwrap().push(v);
     }
 }
@@ -328,10 +326,6 @@ pub fn flush_thread() {
 /// A key collision was seen by a verification (the job must run again).
 pub fn collision() -> bool {
     COLLISION.load(AO::Relaxed)
-}
-
-pub fn any_long() -> bool {
-    ANY_LONG.load(AO::Relaxed)
 }
 
 /// Before a rerun after a collision: next seed (or the interner after

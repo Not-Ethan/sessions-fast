@@ -7,12 +7,7 @@ mod lookup;
 mod parquet;
 mod prof;
 mod cbench;
-mod dense;
-mod densep;
 mod fastev;
-mod k3;
-#[cfg(test)]
-mod k3test;
 mod sess;
 mod scan;
 mod sys;
@@ -441,9 +436,9 @@ fn link_worker(
     let lt = cell.get().unwrap();
     {
         // insert both IDs of every link (slots prefetched ahead), then union
-        // by dense index (union-find entries prefetched ahead)
+        // by compact index (union-find entries prefetched ahead)
         let v = pairs[t].lock().unwrap();
-        let mut alloc = links::DenseAlloc::new();
+        let mut alloc = links::IdxAlloc::new();
         let mut dv: Vec<(u32, u32)> = Vec::with_capacity(v.len());
         const AHEAD: usize = const_usize(option_env!("SS_LINKAHEAD"), 8);
         for k in 0..v.len() {
@@ -455,10 +450,10 @@ fn link_worker(
         }
         for k in 0..dv.len() {
             if k + AHEAD < dv.len() {
-                lt.prefetch_dense(dv[k + AHEAD].0);
-                lt.prefetch_dense(dv[k + AHEAD].1);
+                lt.prefetch_idx(dv[k + AHEAD].0);
+                lt.prefetch_idx(dv[k + AHEAD].1);
             }
-            lt.union_dense(dv[k].0, dv[k].1);
+            lt.union_idx(dv[k].0, dv[k].1);
         }
     }
     bar.wait();
@@ -2535,21 +2530,6 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         fastev::check(&events_in, &ctx);
         std::process::exit(0);
     }
-    if std::env::var("SS_DENSEBENCH").is_ok() {
-        dense::bench(&links_in, &events_in, &ctx);
-        std::process::exit(0);
-    }
-    // k3 kernels in the dense pipeline (default on, AVX2 path only; SS_K3=0
-    // = densep's own kernels); SS_K3CHECK / SS_K3BENCH
-    k3::ON.store(std::env::var("SS_K3").map_or(true, |v| v != "0"), Ordering::Relaxed);
-    if let Ok(what) = std::env::var("SS_K3CHECK") {
-        k3::check(&what, &events_in, &clicks_in, &ctx);
-        std::process::exit(0);
-    }
-    if let Ok(what) = std::env::var("SS_K3BENCH") {
-        k3::bench(&what, &events_in, &clicks_in, &ctx);
-        std::process::exit(0);
-    }
     if std::env::var("SS_DECOMP").is_ok() {
         decomp_bench(&events_in, &links_in, &ctx);
         std::process::exit(0);
@@ -2576,31 +2556,6 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     // Pipeline B unless disabled (SS_LEGACY) or unusable (location bits);
     // if a location index ever overflows, B's results are discarded and the
     // legacy pipeline runs from scratch.
-    // dense pipeline (densep.rs) unless SS_DENSE=0, when the input is big
-    // enough and has the generator's ID structure; else the general pipeline
-    if let Some(d) = densep::decide(&events_in, &ctx) {
-        let ud = out_dir.join("user_daily");
-        let cd = out_dir.join("campaign_daily");
-        std::fs::create_dir_all(&ud).unwrap_or_else(|e| fail(&format!("{}: {}", ud.display(), e)));
-        std::fs::create_dir_all(&cd).unwrap_or_else(|e| fail(&format!("{}: {}", cd.display(), e)));
-        let mut outs = densep::run(&links_in, &events_in, &clicks_in, &ctx, d, &ud, &mut marks);
-        sess::write_campaign_daily2(&cd.join("part-0.parquet"), &mut outs, &ctx);
-        marks.mark("write");
-        if verbose {
-            let rows: usize = outs.iter().map(|o| o.nrows).sum();
-            return format!(
-                "sessions: {} | pipeline=dense threads={} user_rows={} peak_rss={}MB wc_over_lines={} {}{}",
-                marks.report(),
-                threads,
-                rows,
-                sys::peak_rss_mb(),
-                parts::WC_OVER_LINES.load(Ordering::Relaxed),
-                densep::stats(),
-                prof::report()
-            );
-        }
-        return String::new();
-    }
     let mut pipeline = "B";
     let lb = if std::env::var("SS_LEGACY").is_ok() { None } else { LocBits::new(threads, ps_bits) };
     let mut b_result = None;

@@ -1,9 +1,9 @@
 //! Identity resolution: a concurrent open-addressing table of linked IDs plus
-//! a lock-free union-find over dense indices.
+//! a lock-free union-find over compact indices.
 //!
-//! Every linked ID gets a slot in the table (key -> value) and a dense index
+//! Every linked ID gets a slot in the table (key -> value) and a compact index
 //! (assigned on first insertion). Union-find runs on a compact parent array
-//! indexed by dense index, so it stays in cache instead of chasing pointers
+//! indexed by compact index, so it stays in cache instead of chasing pointers
 //! through the table. Roots are always hooked under the root with the smaller
 //! key, so keys strictly decrease along parent pointers and every component's
 //! root is its byte-wise smallest ID: the person's name. Finalize writes each
@@ -13,7 +13,7 @@ use crate::keys;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub struct LinkTable {
-    /// [key, val] per slot. While building, val = dense index + 1 (0 while
+    /// [key, val] per slot. While building, val = compact index + 1 (0 while
     /// the inserting thread has not published it yet); after `finalize_vals`
     /// val = the person key.
     slots: &'static [[AtomicU64; 2]],
@@ -22,13 +22,13 @@ pub struct LinkTable {
     /// so one prefetched cache line usually covers the whole probe (insert
     /// and lookup use the same start, so this is exact either way)
     amask: usize,
-    /// dense index -> parent dense index + 1 (0 = root)
+    /// compact index -> parent compact index + 1 (0 = root)
     parent: &'static [AtomicU32],
-    /// dense index -> key
+    /// compact index -> key
     dkey: &'static [AtomicU64],
-    /// dense index -> person key (the root's key; finalize scratch)
+    /// compact index -> person key (the root's key; finalize scratch)
     dpkey: &'static [AtomicU64],
-    /// next free block of dense indices
+    /// next free block of compact indices
     next_block: AtomicU32,
     /// after finalize, slot values hold keys::mix(person key) instead of the
     /// person key (SS_OLDPH=1: raw keys, mixed at every lookup, as before)
@@ -36,22 +36,22 @@ pub struct LinkTable {
 }
 
 pub const FINALIZE_BLOCK: usize = 1 << 16;
-const DENSE_BLOCK: u32 = 4096;
+const IDX_BLOCK: u32 = 4096;
 
 fn arena<T>(n: usize) -> &'static [T] {
     let p = crate::sys::alloc_arena(n * std::mem::size_of::<T>()) as *const T;
     unsafe { std::slice::from_raw_parts(p, n) }
 }
 
-/// A thread's current block of dense indices.
-pub struct DenseAlloc {
+/// A thread's current block of compact indices.
+pub struct IdxAlloc {
     next: u32,
     end: u32,
 }
 
-impl DenseAlloc {
+impl IdxAlloc {
     pub fn new() -> Self {
-        DenseAlloc { next: 0, end: 0 }
+        IdxAlloc { next: 0, end: 0 }
     }
 }
 
@@ -70,8 +70,8 @@ impl LinkTable {
         let f = std::env::var("SS_LINKCAP").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).max(2);
         let cap = (total_pairs * f + 16).next_power_of_two();
         // at most 2 new IDs per pair, plus partly used blocks
-        let nd = 2 * total_pairs + (threads + 1) * DENSE_BLOCK as usize + 64;
-        assert!(nd < u32::MAX as usize - DENSE_BLOCK as usize * 2, "too many links");
+        let nd = 2 * total_pairs + (threads + 1) * IDX_BLOCK as usize + 64;
+        assert!(nd < u32::MAX as usize - IDX_BLOCK as usize * 2, "too many links");
         LinkTable {
             slots: arena(cap),
             mask: cap - 1,
@@ -85,12 +85,12 @@ impl LinkTable {
     }
 
     #[inline(always)]
-    fn alloc(&self, a: &mut DenseAlloc) -> u32 {
+    fn alloc(&self, a: &mut IdxAlloc) -> u32 {
         if a.next == a.end {
-            let b = self.next_block.fetch_add(DENSE_BLOCK, Ordering::Relaxed);
+            let b = self.next_block.fetch_add(IDX_BLOCK, Ordering::Relaxed);
             a.next = b;
-            a.end = b + DENSE_BLOCK;
-            assert!((a.end as usize) <= self.parent.len(), "dense index space exhausted");
+            a.end = b + IDX_BLOCK;
+            assert!((a.end as usize) <= self.parent.len(), "compact index space exhausted");
         }
         let d = a.next;
         a.next += 1;
@@ -103,9 +103,9 @@ impl LinkTable {
         h as usize & self.mask & self.amask
     }
 
-    /// Dense index of key k, inserting it if absent.
+    /// Compact index of key k, inserting it if absent.
     #[inline(always)]
-    fn insert(&self, k: u64, a: &mut DenseAlloc) -> u32 {
+    fn insert(&self, k: u64, a: &mut IdxAlloc) -> u32 {
         let mut i = self.start(keys::mix(k));
         loop {
             let cur = self.slots[i][0].load(Ordering::Acquire);
@@ -117,19 +117,19 @@ impl LinkTable {
                         self.slots[i][1].store(d as u64 + 1, Ordering::Release);
                         return d;
                     }
-                    Err(actual) if actual == k => return self.wait_dense(i),
+                    Err(actual) if actual == k => return self.wait_idx(i),
                     Err(_) => {}
                 }
             } else if cur == k {
-                return self.wait_dense(i);
+                return self.wait_idx(i);
             }
             i = (i + 1) & self.mask;
         }
     }
 
-    /// The dense index of slot i, once its inserting thread has published it.
+    /// The compact index of slot i, once its inserting thread has published it.
     #[inline(always)]
-    fn wait_dense(&self, i: usize) -> u32 {
+    fn wait_idx(&self, i: usize) -> u32 {
         loop {
             let v = self.slots[i][1].load(Ordering::Acquire);
             if v != 0 {
@@ -182,7 +182,7 @@ impl LinkTable {
     /// Joins two IDs. Safe to call from many threads at once.
     #[inline(always)]
     #[allow(dead_code)]
-    pub fn link(&self, a: u64, b: u64, alloc: &mut DenseAlloc) {
+    pub fn link(&self, a: u64, b: u64, alloc: &mut IdxAlloc) {
         let da = self.insert(a, alloc);
         let db = self.insert(b, alloc);
         if da != db {
@@ -190,29 +190,29 @@ impl LinkTable {
         }
     }
 
-    /// Dense indices of both IDs of a link, inserting them if absent.
+    /// Compact indices of both IDs of a link, inserting them if absent.
     #[inline(always)]
-    pub fn insert_pair(&self, a: u64, b: u64, alloc: &mut DenseAlloc) -> (u32, u32) {
+    pub fn insert_pair(&self, a: u64, b: u64, alloc: &mut IdxAlloc) -> (u32, u32) {
         (self.insert(a, alloc), self.insert(b, alloc))
     }
 
-    /// Joins two inserted IDs by dense index. Safe to call from many threads
+    /// Joins two inserted IDs by compact index. Safe to call from many threads
     /// at once, also while other threads are still inserting.
     #[inline(always)]
-    pub fn union_dense(&self, da: u32, db: u32) {
+    pub fn union_idx(&self, da: u32, db: u32) {
         if da != db {
             self.union(da, db);
         }
     }
 
-    /// Prefetches the union-find entries of a dense index.
+    /// Prefetches the union-find entries of a compact index.
     #[inline(always)]
-    pub fn prefetch_dense(&self, d: u32) {
+    pub fn prefetch_idx(&self, d: u32) {
         crate::prefetch(self.parent.as_ptr().wrapping_add(d as usize) as *const u8);
         crate::prefetch(self.dkey.as_ptr().wrapping_add(d as usize) as *const u8);
     }
 
-    /// Number of blocks for `finalize_roots` (dense indices).
+    /// Number of blocks for `finalize_roots` (compact indices).
     pub fn root_blocks(&self) -> usize {
         (self.next_block.load(Ordering::Acquire) as usize).min(self.parent.len()).div_ceil(FINALIZE_BLOCK)
     }
@@ -223,7 +223,7 @@ impl LinkTable {
     }
 
     /// Finalize, step 1 (after all links): person key (key of the root) of
-    /// every dense index in block `b`. Blocks may run on any threads,
+    /// every compact index in block `b`. Blocks may run on any threads,
     /// concurrently.
     pub fn finalize_roots(&self, b: usize) {
         let n = (self.next_block.load(Ordering::Acquire) as usize).min(self.parent.len());
@@ -243,18 +243,6 @@ impl LinkTable {
                 let d = (self.slots[i][1].load(Ordering::Relaxed) - 1) as usize;
                 let pk = self.dpkey[d].load(Ordering::Relaxed);
                 self.slots[i][1].store(if self.mixed { keys::mix(pk) } else { pk }, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Calls `f(key, person key)` for every occupied slot in block `b`
-    /// (blocks as for `finalize_vals`), after finalize.
-    pub fn entries(&self, b: usize, mut f: impl FnMut(u64, u64)) {
-        let n = self.slots.len();
-        for i in b * FINALIZE_BLOCK..((b + 1) * FINALIZE_BLOCK).min(n) {
-            let k = self.slots[i][0].load(Ordering::Relaxed);
-            if k != 0 {
-                f(k, self.val_key(self.slots[i][1].load(Ordering::Relaxed)));
             }
         }
     }
@@ -429,7 +417,7 @@ mod tests {
         let key = |n: u64| keys::key_of(format!("u{:x}", n).as_bytes());
         for &(declared, actual, space) in &[(1000usize, 1800usize, 5000u64), (1000, 400, 3000), (50, 90, 1 << 40)] {
             let t = LinkTable::with_pairs(declared, 1);
-            let mut a = DenseAlloc::new();
+            let mut a = IdxAlloc::new();
             let mut pairs = Vec::new();
             let mut inserted = Vec::new();
             for _ in 0..actual {
@@ -440,7 +428,7 @@ mod tests {
                 inserted.push(v);
             }
             for &(du, dv) in &pairs {
-                t.union_dense(du, dv);
+                t.union_idx(du, dv);
             }
             for b in 0..t.root_blocks() {
                 t.finalize_roots(b);

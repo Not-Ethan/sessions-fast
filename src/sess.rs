@@ -475,11 +475,10 @@ impl St {
     /// persons in `cs` are skipped); `name`: keys::mix of the person key.
     fn person(&mut self, p: u64, name: u64, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
         self.acc.start();
-        // events in ts order (the dense pipeline feeds most persons in
-        // event-number order, which is time order in generated data): one
-        // scan, a new session at every gap over W; equal timestamps have gap
-        // 0. The same sessions, counts and purchases as the slot walk below
-        // (SS_NOSORTED=1: always the slot walk).
+        // events already in ts order: one scan, a new session at every gap
+        // over W; equal timestamps have gap 0. The same sessions, counts and
+        // purchases as the slot walk below (SS_NOSORTED=1: always the slot
+        // walk).
         if self.sorted_fast && !es.is_empty() && es.windows(2).all(|w| w[0].ts <= w[1].ts) {
             self.sess.clear();
             let mut last = es[0].ts;
@@ -616,14 +615,11 @@ impl St {
         }
         self.acc.lap(P_ATTR);
         // 5. one row per day
-        // name 0 (key 0 is never produced): the caller has set ubuf
-        if name != 0 {
-            self.ubuf.clear();
-            self.ubuf.extend_from_slice(&[0; 4]);
-            keys::decode_into(keys::unmix(name), &mut self.ubuf);
-            let ulen = (self.ubuf.len() - 4) as u32;
-            self.ubuf[..4].copy_from_slice(&ulen.to_le_bytes());
-        }
+        self.ubuf.clear();
+        self.ubuf.extend_from_slice(&[0; 4]);
+        keys::decode_into(keys::unmix(name), &mut self.ubuf);
+        let ulen = (self.ubuf.len() - 4) as u32;
+        self.ubuf[..4].copy_from_slice(&ulen.to_le_bytes());
         let mut i = 0;
         while i < ns {
             let j = self.sess[i].dend as usize;
@@ -782,51 +778,6 @@ impl St {
 /// window length (at most 24 days: 1152 slots, 18 bitmap words).
 const SLOTS_ALL: usize = 2432;
 const _: () = assert!(((u32::MAX / W) as usize) < SLOTS_ALL && SLOTS_ALL % 64 == 0 && SLOTS_ALL / 64 <= 64);
-
-/// One thread's per-person sessions state for the dense pipeline (dense.rs):
-/// the same exact per-person routine as `sessions2`, fed one person at a
-/// time (all its surviving events and all its clicks).
-pub(crate) struct PersonSess(St);
-
-impl PersonSess {
-    pub(crate) fn new(ctx: &Ctx, est_rows: usize) -> Self {
-        if prof::ON.load(Ordering::Relaxed) {
-            name_slots();
-        }
-        PersonSess(St::new(ctx, est_rows, 64, 64))
-    }
-
-    /// One person: `es` all its surviving events (any order; only ts and
-    /// pay are read), `cs` all its clicks (person field = `p`); `name` =
-    /// keys::mix(person key).
-    #[inline]
-    pub(crate) fn person(&mut self, p: u64, name: u64, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
-        self.0.person(p, name, es, cs, ctx)
-    }
-
-    /// The next person's name as its ID string (then `person` with name 0).
-    #[inline]
-    pub(crate) fn set_name(&mut self, id: &[u8]) {
-        let u = &mut self.0.ubuf;
-        u.clear();
-        u.extend_from_slice(&(id.len() as u32).to_le_bytes());
-        u.extend_from_slice(id);
-    }
-
-    /// Writes this thread's user_daily part (thread 0 always) and returns
-    /// its campaign accumulators, as `sessions2` does.
-    pub(crate) fn finish(mut self, ud: &Path, t: usize) -> Out2 {
-        let st = &mut self.0;
-        if t == 0 || st.cols.n > 0 {
-            st.acc.start();
-            st.write(&ud.join(format!("part-{}.parquet", t)));
-            st.acc.lap(P_WRITE);
-        }
-        st.acc.commit();
-        st.out.nrows = st.cols.n;
-        std::mem::replace(&mut st.out, Out2 { nrows: 0, cred: Vec::new(), assist: Vec::new() })
-    }
-}
 
 /// Sessions, attribution and aggregation per person partition; each thread
 /// then writes its own user_daily part file.

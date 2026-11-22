@@ -30,7 +30,7 @@ nrun() {  # nrun DATA OUT [VAR=VAL ...]: the native binary
 }
 echo "image: $($L sudo docker build -q -t ss-$N . 2>&1 | tail -1)"
 echo "unit tests: $($L env RUSTFLAGS='-C target-cpu=x86-64-v2' cargo test --release -q 2>&1 | grep -E 'test result|FAILED|panicked' | tr '\n' ' ')"
-for e in "-" "SS_NOAVX2=1" "SS_LONGOFF=1" "SS_LONGBITS=4" "SS_WIDECUT=0" "SS_DENSE=force" "SS_DENSE=force SS_NOAVX2=1"; do
+for e in "-" "SS_NOAVX2=1" "SS_LONGOFF=1" "SS_LONGBITS=4" "SS_WIDECUT=0" "SS_FASTEV=0 SS_CLICKFAST=0" "SS_LONGBITS=4 SS_NOAVX2=1"; do
   set -- ; [ "$e" != "-" ] && set -- $e
   echo "fixtures native [$e]: $(env "$@" $PY $T/run_fixtures.py fixtures -- ~/bin/$N 2>&1 | tail -1)"
 done
@@ -38,7 +38,7 @@ for e in "-" "SS_NOAVX2=1" "SS_LONGBITS=4"; do
   x=""; [ "$e" != "-" ] && x=$e
   echo "fixtures image [$e]: $($L sudo IMAGE=ss-$N EXTRA_ENV=$x $PY $T/run_fixtures.py fixtures -- bash $T/docker_run.sh 2>&1 | tail -1)"
 done
-for e in "-" "SS_NOAVX2=1" "SS_LONGOFF=1" "SS_LONGBITS=6" "SS_LONGBITS=20" "SS_WIDECUT=0" "SS_FASTEV=0 SS_CLICKFAST=0" "SS_WIDECUT=0 SS_NOAVX2=1" "SS_DENSE=force" "SS_DENSE=1"; do
+for e in "-" "SS_NOAVX2=1" "SS_LONGOFF=1" "SS_LONGBITS=6" "SS_LONGBITS=20" "SS_WIDECUT=0" "SS_FASTEV=0 SS_CLICKFAST=0" "SS_WIDECUT=0 SS_NOAVX2=1" "SS_NOSORTED=1"; do
   set -- ; [ "$e" != "-" ] && set -- $e
   p=$(drun /mnt/data/dev5 ~/v5g_dev "$@")
   echo "dev5 image [$e] $p: $($PY $T/compare.py ~/v5g_dev $DEVANS | tail -1)"

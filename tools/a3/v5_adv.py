@@ -29,7 +29,7 @@ Modes (columns; each compared with the default run "base", NCPU=--ncpu):
   mixD    SS_LONGBITS=6 SS_NOAVX2=1 NCPU=1
   quiet   SS_VERBOSE unset (every other run has SS_VERBOSE=1)
 
-Usage (venv python with polars; dense_adv.py next to this file or in the tree):
+Usage (venv python with polars; advlib.py next to this file or in the tree):
   v5_adv.py --tree SS_DIR --bin BIN --gen GEN --scratch DIR [--flock /tmp/bench.lock]
             [--cases 1,2,3] [--sizes 1000,3000,200000] [--modes off,b6] [--no-ref] [--keep] [--list]
 """
@@ -61,11 +61,11 @@ def _tree():
 
 SS = _tree()
 sys.path.insert(0, str(SS / "tools"))
-import compare as _compare  # noqa: E402,F401  (dense_adv imports from it)
+import compare as _compare  # noqa: E402,F401  (advlib imports from it)
 
 sys.path.insert(0, str(SS / "tools" / "a3"))
 sys.path.insert(0, str(HERE))
-import dense_adv as D  # noqa: E402
+import advlib as D  # noqa: E402
 
 DS, split, join, rand_q, CsvFile = D.DS, D.split, D.join, D.rand_q, D.CsvFile
 parse_ts, fmt_f1, NCOLS, ID_COLS = D.parse_ts, D.fmt_f1, D.NCOLS, D.ID_COLS
@@ -618,7 +618,7 @@ def long_links(ds, idx, rng):
 
 
 def add_dups_long(ds, idx, rng, rate=0.15):
-    """Case 7: extra copies of `rate` of the long-ID events (dense_adv.add_dups
+    """Case 7: extra copies of `rate` of the long-ID events (advlib.add_dups
     restricted to long event IDs, other users mostly long)."""
     files = ds.load("events")
     longs = idx.longs(idx.us)
@@ -1126,7 +1126,7 @@ CASES = {
     8: ("click ties: long vs short, last-digit twins, at session starts", Harness.c08_ties),
     9: ("long / exact-length lines, CRLF, small files, quote-all", Harness.c09_lines),
     10: ("every ID long (+ near-twin clusters, padded lines)", Harness.c10_all_long),
-    11: ("generic dense_adv ID mutations (upper, pad, lead0, over-long)", Harness.c11_generic),
+    11: ("generic ID mutations (upper, pad, lead0, over-long)", Harness.c11_generic),
     12: ("generic link mutations", Harness.c12_link_mut),
     13: ("times backwards in read order", Harness.c13_backwards),
     14: ("two generated sets concatenated (two ID keys)", Harness.c14_two_sets),
