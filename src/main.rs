@@ -15,6 +15,9 @@ mod k4test;
 mod k5;
 #[cfg(test)]
 mod k5test;
+mod k6;
+#[cfg(test)]
+mod k6test;
 mod sess;
 mod scan;
 mod sys;
@@ -680,6 +683,11 @@ fn event_line_slow<S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut S) {
 /// The line-local fast splitter (fastev.rs) when enabled, else the scanner.
 #[inline(always)]
 fn event_task<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
+    // the chunk-first splitter (k6.rs, decode from k4.rs) when enabled (AVX2 only)
+    #[cfg(target_arch = "x86_64")]
+    if AVX2 && k6::ON.load(Ordering::Relaxed) {
+        return unsafe { k6::event_task_k6::<S>(b, task, ctx, sink, safe_end) };
+    }
     // the fused kernel (k4.rs) when enabled (AVX2 only)
     #[cfg(target_arch = "x86_64")]
     if AVX2 && k4::ON.load(Ordering::Relaxed) {
@@ -3122,6 +3130,13 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     }
     k4::PACK2.store(std::env::var("SS_K4PACK2").map_or(true, |v| v != "0"), Ordering::Relaxed);
     k4::SPLIT_B.store(std::env::var("SS_K4SHAPEB").map_or(true, |v| v != "0"), Ordering::Relaxed);
+    // event lines through the chunk-first splitter (k6.rs; AVX2 only) with SS_K6=1
+    k6::ON.store(ctx.avx2 && std::env::var("SS_K6").map_or(false, |v| v != "0"), Ordering::Relaxed);
+    if std::env::var("SS_K6CHECK").is_ok() {
+        k6::COUNT.store(true, Ordering::Relaxed);
+        k6::check(&events_in, &ctx);
+        std::process::exit(0);
+    }
     if std::env::var("SS_K4CHECK").is_ok() {
         k4::COUNT.store(true, Ordering::Relaxed);
         k4::check(&events_in, &ctx);
