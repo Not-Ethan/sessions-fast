@@ -1,15 +1,16 @@
 # STATUS of the main engineer (branch ss-opt4, worktree .claude/worktrees/opt4)
 
-Updated: Sun 05:20 ET.
+Updated: Sun 05:50 ET.
 
 ## Now
-- Tags: ss-milestone-18 = 1651a22 (real 0.9154 s), ss-milestone-19 = c870b9c (real 0.8278 s).
-- m20 candidate = 0ed00d5: c7c5560 (m19 + #8 + #10 + #9 reverted + probe dedup + overflow counter) +
-  2d599cd lean sink + 9a0a833 SS_SUBB switch + ea78806 #18 general path + k4-v2e (a7c1171..5a230de) +
-  0ed00d5 SUB_B 32768. Image ss-a3-x12; ~/xgate20.sh x12 running (log ~/xgate_x12.log). Tag when it passes.
-- PGO: measured slower (e60 +26 ms, e23 +5.7 ms): rejected.
-- Next: row 7 (table layout) after the orchestrator's engine note; q-r 3b7f029 / 87966c4 and ss-q 649e137
-  when the orchestrator confirms.
+- Tags: m18 = 1651a22 (0.9154 s), m19 = c870b9c (0.8278 s), m20 = 0ed00d5 (gate 73 lines MATCH/OK).
+- 6a871fb: decode table single-probe (long_value 1.1% of perf). Image x13 timing vs m20 (sess3.sh:
+  e23 10 ABBA rounds, e60 3).
+- Partition counts re-measured on m20: defaults (pe 12, ps 10) stay (pe10 +52 ms e60, ps9 +21).
+- Waiting for the orchestrator's note on the top-cluster click path (deferred click resolution after
+  dedup: compact per-thread buffer, bulk probe + scatter). Row 7 / person-map shrink: not now (r9).
+- Integration queue (from the orchestrator): quick-wins rows 3 and 6, s1 build flags, r9 if exact by
+  8:30, k6 if it clears its bar at 7:00.
 
 ## Measured (ss-bench, a3-m17 = cdadcff, SS_VERBOSE + SS_MEMACCT, one run each)
 - e23: user-ID log 3.35M entries / 184K distinct long IDs; event-ID log 2.69M entries; long verify
@@ -45,6 +46,9 @@ Updated: Sun 05:20 ET.
   fetch_add in worker code (05:25): fastev SLOW/WIDE_N/CWIDE_N/CSLOW, k4 N_*, k5 N_* are all behind
   COUNT / COUNT_SLOW flags (off unless a check mode); prof only with SS_PROF; keys counters once per
   verification; link compact-index blocks once per 4096 IDs. No other shared counter in a hot loop.
+
+- Partition counts on m20 (x12), 6 mirrored samples: e60 default 2083.4, pe11 +5.4, pe10 +52.4, ps9 +20.7;
+  e23 all within 2.5 ms.
 
 ## Known slow-but-exact paths (do not "fix" the order)
 - Click IDs that do not pack are references (file, length, offset) into the click file mapping. The
