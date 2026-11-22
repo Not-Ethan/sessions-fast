@@ -34,6 +34,10 @@ pub struct Parts<T: Copy> {
     wc: Vec<Line>,
     /// write combining was on: `lens` counts every record, overflow included
     wc_mode: bool,
+    /// staged lines that went to an overflow vector (added to WC_OVER_LINES
+    /// once, in `finish`: a shared counter bumped per line by every thread
+    /// bounced its cache line between the cores)
+    over_lines: usize,
 }
 
 unsafe impl<T: Copy + Send> Send for Parts<T> {}
@@ -70,6 +74,7 @@ impl<T: Copy> Parts<T> {
             over: (0..nparts).map(|_| UnsafeCell::new(Vec::new())).collect(),
             wc: if wc { vec![Line([0; WCB / 8]); nparts] } else { Vec::new() },
             wc_mode: wc,
+            over_lines: 0,
         }
     }
 
@@ -144,7 +149,7 @@ impl<T: Copy> Parts<T> {
     #[cold]
     #[inline(never)]
     fn line_over(&mut self, p: usize) {
-        WC_OVER_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.over_lines += 1;
         if OLD_LINE_OVER.load(std::sync::atomic::Ordering::Relaxed) {
             // previous version (SS_OLDOVER=1): through a temporary Vec
             let recs = unsafe { std::slice::from_raw_parts(self.wc[p].0.as_ptr() as *const T, Self::WC_RECS) };
@@ -176,6 +181,7 @@ impl<T: Copy> Parts<T> {
         if self.wc.is_empty() {
             return;
         }
+        WC_OVER_LINES.fetch_add(std::mem::take(&mut self.over_lines), std::sync::atomic::Ordering::Relaxed);
         for p in 0..self.lens.len() {
             let l = self.lens[p] as usize;
             let k = l % Self::WC_RECS;
