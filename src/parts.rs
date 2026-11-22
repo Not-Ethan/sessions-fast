@@ -122,6 +122,15 @@ impl<T: Copy> Parts<T> {
         self.push(p, v);
     }
 
+    /// Prefetches partition p's staging line (write combining), so that a
+    /// push a little later does not wait for it.
+    #[inline(always)]
+    pub fn prefetch_stage(&self, p: usize) {
+        if !self.wc.is_empty() {
+            crate::prefetch(unsafe { self.wc.as_ptr().add(p) } as *const u8);
+        }
+    }
+
     /// `len` without bounds checks, for a write-combining Parts.
     ///
     /// # Safety
