@@ -12,6 +12,8 @@ writes `/output/user_daily/*.parquet` and `/output/campaign_daily/*.parquet`.
 | `src/main.rs` | Pipeline phases, records, sessionization, attribution, output |
 | `src/scan.rs` | CSV dialect scanner (SIMD masks, branch-light line splitting) |
 | `src/fastev.rs` | Line-local splitters for event and click lines (general scanner as fallback) |
+| `src/k4.rs` | Fused event-line kernel (split + decode in one pass, exact fallbacks), its checker (`SS_K4CHECK=1`) |
+| `src/k4test.rs` | k4 against the old path: generated, adversarial and mutated lines in guard-paged buffers |
 | `src/ts.rs` | Timestamp forms F1/F2/F3, prices; fast SWAR path + general path |
 | `src/keys.rs` | IDs as exact 64-bit keys (order-preserving packing, verified hash keys for 33-byte hex IDs, interned fallback) |
 | `src/links.rs` | Lock-free concurrent union-find for linked IDs |
@@ -70,6 +72,20 @@ counters); phases are separated by joins.
    first window. The quote rule is checked with a carry trick. Any line of
    another shape goes through the general scanner on its own (`SS_FASTEV=0` uses
    the scanner for everything, `SS_WIDECUT=0` disables the 128-byte cut).
+   With AVX2 and `SS_K4=1`, event lines go through the fused kernel
+   `src/k4.rs` (off by default: exact, but at most 0.5% faster on e23): the
+   same splitter rule (`SS_K4SPLIT=1/2`: window 2 taken from the masks of the 128 bytes
+   at the line start, the 128-byte cut sharing them), then one
+   branch-light decode of the line: both timestamps' `HH:MM:SS` in one ymm, the
+   date `YYYY-MM-DDT` looked up byte-exact in a 28-date table built from the
+   window (checked against the general parser), 13-digit F3 in SIMD, type,
+   window and late limit on offsets from window_start, IDs packed by
+   `keys::pack_wide` (`SS_K4PACK2=1`: both in one ymm; other IDs through the same long-ID /
+   interner routines as `key_of_wide`), purchases through `event_pay`. A copy
+   is produced only when every input of it is certain; every other cut line
+   goes to `event_line` with its fields, and uncut lines to the scanner, so
+   the copies are exactly those of the old path (`SS_K4CHECK=1` compares them
+   on every task; `src/k4test.rs`).
 6. **Clicks.** Split from one 64-byte (else 128-byte) window per line, with the
    general scanner as fallback; parsed, validated (ts in the click window,
    campaign known),
@@ -108,6 +124,7 @@ python3 tools/run_fixtures.py fixtures -- python3 reference/reference.py
 python3 tools/compare.py OUT_DIR path/to/dev-answer                     # exact diff
 python3 tools/crosscheck.py GENERATE_BIN target/release/sessions WORKDIR 2:1000000:250000 ...
 cargo test --release                                                    # unit + fuzz tests
+SS_K4CHECK=1 target/release/sessions DATA_DIR OUT                       # k4 vs old path, copy by copy
 ```
 
 `crosscheck.py` generates datasets with the published generator, runs the Python

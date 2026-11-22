@@ -154,11 +154,11 @@ unsafe fn masks64<const AVX2: bool>(p: *const u8) -> (u64, u64, u64) {
 /// from the line start (already unquoted); `len` is the line length
 /// including its newline. Meaningful only if `ok`.
 #[derive(Clone, Copy)]
-struct Cut {
-    ok: bool,
-    s: [usize; 7],
-    n: [usize; 7],
-    len: usize,
+pub(crate) struct Cut {
+    pub(crate) ok: bool,
+    pub(crate) s: [usize; 7],
+    pub(crate) n: [usize; 7],
+    pub(crate) len: usize,
 }
 
 /// Lowest set bit of `x` and everything below it (all bits if `x == 0`).
@@ -205,7 +205,7 @@ fn window(d: u64, q: u64, r: u64) -> (u64, u64, u64) {
 /// Cuts the line at `p` (a line start with MARGIN readable bytes).
 /// Branch-free; positions use wrapping arithmetic and are garbage unless ok.
 #[inline(always)]
-unsafe fn cut<const AVX2: bool>(p: *const u8) -> Cut {
+pub(crate) unsafe fn cut<const AVX2: bool>(p: *const u8) -> Cut {
     // window 1: fields 0..=2 (its region ends at the third delimiter)
     let (c1, n1, q1) = masks64::<AVX2>(p);
     let d1 = c1 | n1;
@@ -267,7 +267,7 @@ unsafe fn fields<'a>(p: *const u8, c: &Cut) -> [&'a [u8]; 7] {
 /// Readable bytes from a line start for the wide event cut: window 1 (128),
 /// window 2 at most 129 bytes in (64), 32 bytes from any field start (field
 /// 6 starts at most 129 + 64), with slack.
-const MARGIN_W: usize = 256;
+pub(crate) const MARGIN_W: usize = 256;
 /// The same for the wide click cut: the window (128) + 32 from a field start.
 const MARGIN_CW: usize = 192;
 
@@ -307,7 +307,7 @@ unsafe fn masks128<const AVX2: bool>(p: *const u8) -> (u128, u128, u128) {
 
 /// `cut` with a 128-byte window 1 (a line start with MARGIN_W readable bytes).
 #[inline(never)]
-unsafe fn cut_wide<const AVX2: bool>(p: *const u8) -> Cut {
+pub(crate) unsafe fn cut_wide<const AVX2: bool>(p: *const u8) -> Cut {
     let (c1, n1, q1) = masks128::<AVX2>(p);
     let d1 = c1 | n1;
     let d1c = blsr128(blsr128(d1));

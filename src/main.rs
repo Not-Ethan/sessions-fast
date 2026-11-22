@@ -8,6 +8,9 @@ mod parquet;
 mod prof;
 mod cbench;
 mod fastev;
+mod k4;
+#[cfg(test)]
+mod k4test;
 mod k5;
 #[cfg(test)]
 mod k5test;
@@ -28,6 +31,9 @@ pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 const GAP: u32 = 1_800_000;
 const LATE: i64 = 86_400_000;
+/// k4 (fused event-line kernel, k4.rs) when SS_K4 is not set: off. It is
+/// exact (SS_K4CHECK, k4test) but measured at most 0.5% faster on e23.
+const K4_DEFAULT: bool = false;
 
 #[inline(always)]
 pub fn prefetch(p: *const u8) {
@@ -673,6 +679,11 @@ fn event_line_slow<S: EvSink>(f: &[&[u8]; 7], ctx: &Ctx, sink: &mut S) {
 /// The line-local fast splitter (fastev.rs) when enabled, else the scanner.
 #[inline(always)]
 fn event_task<const AVX2: bool, S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, safe_end: usize) {
+    // the fused kernel (k4.rs) when enabled (AVX2 only)
+    #[cfg(target_arch = "x86_64")]
+    if AVX2 && k4::ON.load(Ordering::Relaxed) {
+        return unsafe { k4::event_task_k4::<S>(b, task, ctx, sink, safe_end) };
+    }
     if fastev::ON.load(Ordering::Relaxed) {
         return fastev::event_task_fast::<AVX2, S>(b, task, ctx, sink, safe_end);
     }
@@ -2669,6 +2680,17 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     }
     if std::env::var("SS_EVCHECK").is_ok() {
         fastev::check(&events_in, &ctx);
+        std::process::exit(0);
+    }
+    // event lines through the fused kernel (k4.rs; AVX2 only) with SS_K4=1
+    k4::ON.store(ctx.avx2 && std::env::var("SS_K4").map_or(K4_DEFAULT, |v| v != "0"), Ordering::Relaxed);
+    if let Some(v) = env_usize("SS_K4SPLIT") {
+        k4::SPLIT.store(v, Ordering::Relaxed);
+    }
+    k4::PACK2.store(std::env::var("SS_K4PACK2").map_or(true, |v| v != "0"), Ordering::Relaxed);
+    if std::env::var("SS_K4CHECK").is_ok() {
+        k4::COUNT.store(true, Ordering::Relaxed);
+        k4::check(&events_in, &ctx);
         std::process::exit(0);
     }
     if std::env::var("SS_DECOMP").is_ok() {

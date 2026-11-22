@@ -196,6 +196,22 @@ fn other_in<const EV: bool>(s: &[u8]) -> u64 {
     intern(s)
 }
 
+/// `other` for a user ID that `pack_wide` did not pack: `key_of_wide(s)`
+/// is exactly `pack_wide(s).unwrap_or_else(|| other_main(s))` (k4.rs).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[inline(never)]
+pub fn other_main(s: &[u8]) -> u64 {
+    other_in::<false>(s)
+}
+
+/// `other_in::<true>` for an event ID that `pack_wide` did not pack:
+/// `key_of_ev_wide(s)` is exactly `pack_wide(s).unwrap_or_else(|| other_ev(s))`.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[inline(never)]
+pub fn other_ev(s: &[u8]) -> u64 {
+    other_in::<true>(s)
+}
+
 /// `key_of` for an event_id (see `other_in`).
 #[inline(always)]
 pub fn key_of_ev(s: &[u8]) -> u64 {
@@ -1052,6 +1068,11 @@ pub fn unmix(h: u64) -> u64 {
     z ^ (z >> 30) ^ (z >> 60)
 }
 
+/// Tests that change or depend on the global long-key state (seed, bits,
+/// interner mode) hold this: one at a time (keys tests, k4test).
+#[cfg(test)]
+pub(crate) static LONG_TEST: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,8 +1137,7 @@ mod tests {
         }
     }
 
-    /// Long-ID tests share the global long-key state: one at a time.
-    static LONG_TEST: Mutex<()> = Mutex::new(());
+    use super::LONG_TEST;
 
     fn hex_id(pre: u8, hi: u64, lo: u64) -> Vec<u8> {
         let mut s = vec![pre];
