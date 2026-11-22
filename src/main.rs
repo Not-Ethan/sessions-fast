@@ -33,7 +33,7 @@ const GAP: u32 = 1_800_000;
 const LATE: i64 = 86_400_000;
 /// k4 (fused event-line kernel, k4.rs) when SS_K4 is not set: off. It is
 /// exact (SS_K4CHECK, k4test) but measured at most 0.5% faster on e23.
-const K4_DEFAULT: bool = false;
+const K4_DEFAULT: bool = true;
 
 #[inline(always)]
 pub fn prefetch(p: *const u8) {
