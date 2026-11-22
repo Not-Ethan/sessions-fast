@@ -43,6 +43,8 @@ while i < len(out):
 
 RULES = [
     # (file, function regex, stage); first frame (innermost first) that matches wins
+    ('k6.rs', r'k6::block|k6::stage1', 'k6-s1'),
+    ('k6.rs', r'k6::cut', 'k6-cut'),
     ('k4.rs', r'k4::date|k4::tvec|k4::f3_13', 'ts'),
     ('k4.rs', r'k4::pack2|k4::key_ev|k4::key_user', 'ids'),
     ('k4.rs', r'k4::split|k4::window|k4::masks64|k4::shift128|k4::upto|k4::blsr|k4::tz', 'split'),
@@ -71,6 +73,8 @@ def classify(a):
             return k4_decode_stage(ln)
         if f == 'main.rs' and 'event_line' in fn:
             return 'validity'
+        if f == 'k6.rs':
+            return 'k6-loop'
         if f == 'k4.rs' or f == 'fastev.rs':
             return 'loop'
         if f == 'main.rs':
