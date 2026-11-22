@@ -1074,6 +1074,14 @@ class Harness:
         self.per_size(9, "crlf-small-files", m_crlf)
         self.per_size(9, "quote-all", m_quote)
 
+    def c10_all_long(self):
+        def m(ds, idx, rng):
+            a = longify(ds, idx, rng, 1.0)
+            b = cluster_rename(ds, Index(ds), rng, 0.5)
+            c = pad_lines(ds, rng, frac=0.05)
+            return f"every u/e/k ID long {a}; clusters {b}; pad {c}"
+        self.per_size(10, "all-ids-long", m)
+
     def c11_generic(self):
         for label, fn, rate, crate in (("upper", D.f_upper, 0.01, 0.005), ("space-pad", D.f_pad, 0.005, 0.0025),
                                        ("leading-zero", D.f_lead0, 0.005, 0.0025),
@@ -1117,6 +1125,7 @@ CASES = {
     7: ("duplicate events with long event IDs", Harness.c07_dups),
     8: ("click ties: long vs short, last-digit twins, at session starts", Harness.c08_ties),
     9: ("long / exact-length lines, CRLF, small files, quote-all", Harness.c09_lines),
+    10: ("every ID long (+ near-twin clusters, padded lines)", Harness.c10_all_long),
     11: ("generic dense_adv ID mutations (upper, pad, lead0, over-long)", Harness.c11_generic),
     12: ("generic link mutations", Harness.c12_link_mut),
     13: ("times backwards in read order", Harness.c13_backwards),
