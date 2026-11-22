@@ -1167,4 +1167,66 @@ mod x86 {
             }
         }
     }
+    /// The end of the first 4096-byte segment at every byte of a chosen line:
+    /// inside an unquoted field, at and inside a quoted field's quotes,
+    /// exactly on the newline and just after it; for a fully quoted, an
+    /// unquoted and a malformed line; with the lines before it simple (a
+    /// padded event line makes the total exact) or not; and the same buffers
+    /// cut so that the last line has no newline.
+    #[test]
+    fn k6test_segment_end_in_every_byte_of_a_line() {
+        if !have_cpu() {
+            return;
+        }
+        let _g = crate::keys::LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = &envs()[0];
+        let mut r = Rng::new(31);
+        let f = gen_fields(ctx, &mut r);
+        let probes: Vec<Vec<u8>> = vec![join(&f, 0x7F), join(&f, 0), join(&f, 0b0010101), {
+            let mut l = join(&f, 0b0000100);
+            let k = l.len() / 2;
+            l.insert(k, b'"');
+            l
+        }];
+        for (pi, probe) in probes.iter().enumerate() {
+            for o in 0..=probe.len() + 1 {
+                for simple_pad in [true, false] {
+                    let target = 4096 - o;
+                    let mut text: Vec<u8> = Vec::new();
+                    while text.len() + 300 < target {
+                        let g = gen_fields(ctx, &mut r);
+                        text.extend_from_slice(&join(&g, rand_q(&mut r)));
+                        text.push(b'\n');
+                    }
+                    // a line of exactly target - text.len() bytes with its newline
+                    let want = target - text.len() - 1;
+                    let pad = if simple_pad {
+                        let mut g = gen_fields(ctx, &mut r);
+                        let base = join(&g, 0).len();
+                        assert!(base <= want, "pad line too long");
+                        g[5] = format!("{}{}", g[5], "z".repeat(want - base));
+                        join(&g, 0)
+                    } else {
+                        vec![b'y'; want]
+                    };
+                    assert_eq!(pad.len(), want);
+                    text.extend_from_slice(&pad);
+                    text.push(b'\n');
+                    assert_eq!(text.len(), target);
+                    text.extend_from_slice(probe);
+                    text.push(b'\n');
+                    for _ in 0..6 {
+                        let g = gen_fields(ctx, &mut r);
+                        text.extend_from_slice(&join(&g, rand_q(&mut r)));
+                        text.push(b'\n');
+                    }
+                    check_text(ctx, &text, &[1 << 40, 4096], &format!("segment end probe {} offset {} simple pad {}", pi, o, simple_pad));
+                    // the probe as the last line, without its newline (and with)
+                    let cut = target + probe.len();
+                    check_text(ctx, &text[..cut], &[1 << 40], &format!("segment end probe {} offset {} last line, no newline", pi, o));
+                    check_text(ctx, &text[..cut + 1], &[1 << 40], &format!("segment end probe {} offset {} last line", pi, o));
+                }
+            }
+        }
+    }
 }
