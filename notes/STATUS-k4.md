@@ -68,5 +68,33 @@ ts+validity 154.3, sink 10.9, other 16.4, scanner 4.7.
 Floor estimate for this design with perfect codegen (estimate, not measured):
 masks 36 + split 45 + positions 30 + ts 81 + validity 20 + ids 84 + loop/sink 15 = ~310.
 
+## Round 3 (tag k4-v2a = 9d485b7; rebased squash d4a72ba on ss-opt4 41c0a81)
+lean + pack2 + unclamped prefetch: 544.3 instr/line (split+loop 237.9, ids 95.2,
+ts+validity 178.3, sink 10.0, other+scanner 21.1); line bench 63.2-64.3 ms vs old
+79.3-80.2. tests 35 OK; SS_K4CHECK OK dev5 e7 e23 e60 d23; outputs = references
+dev5 e7 e23 e60. Lifetime A/B (image ss-k4v2a, SS_K4=0 vs 1): running.
+
+## Streaming masks over the chunk (the ~300 design; not started, for a second engineer)
+1. Stage 1, per 64-byte block of the task chunk (sequential, branch-free, AVX2): comma, quote
+   and newline masks (2 loads, 6 cmp, 6 movemask, 3 shl/or = ~17 instr per 64 B, ~22 per line)
+   written to a small ring of u64 triples (L1-resident, e.g. 64 blocks = 4 KB of input).
+2. Lines are indexed by a running bit cursor: the next line start = previous le + 1; its
+   128-bit window is two consecutive ring words shifted by (start & 63) (shrd x3 classes).
+3. Better: stage 1 also flattens delimiter (comma|newline) positions into a u16 array per
+   ring (popcnt + tzcnt/blsr, ~2.5 instr per delimiter, ~18 per line), so field j of the line
+   whose first delimiter index is k is [pos[k+j-1]+1, pos[k+j]); line k+7 is the next line.
+4. Per-line work becomes: 2 ymm loads of 8 positions (or scalar loads), check pos[k+6] is a
+   newline bit (bt on the newline ring word) and no newline among the 6 before (popcnt of n
+   between), quote rule from qs at field starts / ends (bt on the quote ring, ~2 per field),
+   then the same decode (ts ~85, ids ~80, validity ~20). No per-line masks, no u128 shifts,
+   no tz chains, no lean/wide shape split (any line up to the ring size).
+5. Estimate: stage 1 ~40 per line + split/quotes ~35 + decode ~185 + loop/sink ~15 = ~275-300.
+6. Main risk: the per-line quote check without masks costs as much as it saves (2 bt + logic
+   per field = ~25), and chunk/ring boundaries (lines straddling a ring refill, task ends)
+   need a careful exact fallback; second risk: stage 1 and stage 2 in one loop interleave
+   badly (stage 1 every 64 B, lines every ~80 B: a data-dependent inner loop = mispredicts),
+   so stage 1 should run ahead over a whole ring (4 KB) and stage 2 consume it.
+
 ## Next
-- round 3: unclamped prefetch, pack2 (SS_K4PACK2=1) in the lean loop.
+- lifetimes; rebased validation; scorecard under x86-64-v3; then v2b (spills, lazy 5/6,
+  long-ID path, ts masks), each tagged with count + 10-round e23 timing.
