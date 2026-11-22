@@ -414,8 +414,42 @@ impl St {
     #[inline(never)]
     fn mixed(&mut self, es: &mut [SRec], cs: &mut [Cl], ctx: &Ctx) {
         self.acc.count(C_MIXED, 1);
-        // the bucket's records are this thread's own copies: sorted in place
+        // the bucket's records are this thread's own copies: grouped in place.
+        // A few persons: one branch-free two-way partition per person (Lomuto:
+        // [i, k) holds person p, [k, j) the others), at most 8 rounds, then
+        // the rest by sorting
         let me = es;
+        let (mut i, mut ci) = (0usize, 0usize);
+        let mut rounds = 0;
+        while i < me.len() && rounds < 8 {
+            let p = me[i].person;
+            let mut k = i;
+            for j in i..me.len() {
+                let x = me[j];
+                me[j] = me[k];
+                me[k] = x;
+                k += (x.person == p) as usize;
+            }
+            let mut l = ci;
+            for j in ci..cs.len() {
+                let x = cs[j];
+                cs[j] = cs[l];
+                cs[l] = x;
+                l += (x.person == p) as usize;
+            }
+            self.person(p, p, &me[i..k], &mut cs[ci..l], true, ctx);
+            i = k;
+            ci = l;
+            rounds += 1;
+        }
+        if i < me.len() {
+            self.mixed_sorted(&mut me[i..], &mut cs[ci..], ctx);
+        }
+    }
+
+    /// `mixed` for a bucket with more than 8 persons left: sort events and
+    /// clicks by person.
+    fn mixed_sorted(&mut self, me: &mut [SRec], cs: &mut [Cl], ctx: &Ctx) {
         me.sort_unstable_by_key(|r| r.person);
         cs.sort_unstable_by_key(|c| c.person);
         let mut i = 0;
