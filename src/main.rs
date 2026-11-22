@@ -1721,7 +1721,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
         let tbase = ((t as u64) << (lb.qbits + lb.ibits)) as u32;
         let batched = std::env::var("SS_BATCH").is_ok();
         let mut ccache = PCache::new();
-        let defer = std::env::var("SS_CDEFER").map_or(false, |v| v == "1");
+        let defer = env_usize("SS_CDEFER").unwrap_or(0).min(2) as u8;
         let tl = TaskLoop { ev, cl, ctx, lt, next: &next, ntasks, populate, release, batched, defer, est_clicks: est_clicks / ctx.threads * 5 / 4 + 1024 };
         // the lean sink unless a mode needs BSink (table mode, person cache,
         // ring instead of bulk queue, batched parsing) or SS_LEAN=0
@@ -1791,9 +1791,10 @@ struct TaskLoop<'a> {
     populate: bool,
     release: bool,
     batched: bool,
-    /// clicks parsed with their person unresolved, resolved after the
-    /// thread's last task (SS_CDEFER=1, experiment; see `DeferC`)
-    defer: bool,
+    /// clicks parsed with their person unresolved (experiment): 1 = all
+    /// resolved after the thread's last task (`DeferC`), 2 = resolved in
+    /// batches of BATCH_C (`BatchC`); 0 = while parsing (SS_CDEFER)
+    defer: u8,
     est_clicks: usize,
 }
 
@@ -1840,6 +1841,46 @@ impl DeferC {
     }
 }
 
+/// Clicks resolved in batches (SS_CDEFER=2): as `DeferC`, but the buffer
+/// holds BATCH_C clicks (cache-resident) and is resolved when full and at
+/// the end of each task; the same records in the same order.
+const BATCH_C: usize = 512;
+struct BatchC<'a> {
+    buf: Vec<CRec>,
+    lt: &'a LinkTable,
+    c: &'a mut Parts<CRec>,
+    ps_shift: u32,
+}
+
+impl BatchC<'_> {
+    #[inline(never)]
+    fn flush(&mut self) {
+        let a = &self.buf;
+        const D: usize = 16;
+        let n = a.len();
+        for i in 0..n {
+            if i + D < n {
+                self.lt.prefetch_h(a[i + D].person);
+            }
+            let r = a[i];
+            let h = r.person;
+            let person = person_hash(self.lt, keys::unmix(h), h);
+            self.c.push_click((person >> self.ps_shift) as usize, CRec { person, ..r });
+        }
+        self.buf.clear();
+    }
+}
+
+impl CSink for BatchC<'_> {
+    #[inline(always)]
+    fn push_click(&mut self, _q: usize, r: CRec) {
+        self.buf.push(r);
+        if self.buf.len() == BATCH_C {
+            self.flush();
+        }
+    }
+}
+
 impl CSink for DeferC {
     #[inline(always)]
     fn push_click(&mut self, _q: usize, r: CRec) {
@@ -1859,7 +1900,7 @@ impl TaskLoop<'_> {
         let (ev, cl, ctx, lt) = (self.ev, self.cl, self.ctx, self.lt);
         let avx2 = ctx.avx2;
         let mut evb = if self.batched { Some(EvBatch::new()) } else { None };
-        let defer = self.defer && !cache.on;
+        let defer = if cache.on { 0 } else { self.defer };
         let empty = LinkTable::empty();
         let mut dc: Option<DeferC> = None;
         loop {
@@ -1904,7 +1945,18 @@ impl TaskLoop<'_> {
                 if self.populate {
                     sys::populate_read(b.as_ptr() as usize + task.start, task.end - task.start);
                 }
-                if defer {
+                if defer == 2 {
+                    let mut d = BatchC { buf: Vec::with_capacity(BATCH_C), lt, c: &mut *c, ps_shift: 64 - ctx.ps_bits };
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            click_task_avx2(b, task, ctx, &empty, &mut d, safe_end, cache)
+                        }
+                    } else {
+                        click_task::<false, _>(b, task, ctx, &empty, &mut d, safe_end, cache)
+                    }
+                    d.flush();
+                } else if defer == 1 {
                     let d = dc.get_or_insert_with(|| DeferC::new(self.est_clicks));
                     if avx2 {
                         #[cfg(target_arch = "x86_64")]
@@ -1968,6 +2020,32 @@ fn cdefer_check(links_in: &Input, cl: &Input, ctx: &Ctx) {
                 click_task::<false, _>(b, task, ctx, &empty, &mut d, safe_end, &mut cache);
             }
             d.resolve(&lt, ps_shift, &mut got);
+            // batched mode into a click partition set, compared partition by partition
+            let mut pb: Parts<CRec> = Parts::new(1 << ctx.ps_bits, 64);
+            {
+                let mut bc = BatchC { buf: Vec::with_capacity(BATCH_C), lt: &lt, c: &mut pb, ps_shift };
+                if ctx.avx2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        click_task_avx2(b, task, ctx, &empty, &mut bc, safe_end, &mut cache)
+                    }
+                } else {
+                    click_task::<false, _>(b, task, ctx, &empty, &mut bc, safe_end, &mut cache)
+                }
+                bc.flush();
+            }
+            let mut by_q: Vec<Vec<(u64, u64, u32, u32)>> = vec![Vec::new(); 1 << ctx.ps_bits];
+            for &(q, p, ck, ts, camp) in want.0.iter() {
+                by_q[q].push((p, ck, ts, camp));
+            }
+            for (q, v) in by_q.iter().enumerate() {
+                let got_q: Vec<(u64, u64, u32, u32)> = pb.get(q).iter().flat_map(|sl| sl.iter().map(|r| (r.person, r.ck, r.ts, r.camp))).collect();
+                let norm4 = |v: &[(u64, u64, u32, u32)]| -> Vec<(u64, u64, u32, u32)> { v.iter().map(|&(p, ck, ts, camp)| (p, if ck & 0xF == 0 && ck >> 54 == 1023 { 1023 << 54 } else { ck }, ts, camp)).collect() };
+                if norm4(v) != norm4(&got_q) {
+                    eprintln!("cdefercheck: MISMATCH (batched) file {} [{}, {}) partition {}: {} direct vs {} batched records", task.file, task.start, task.end, q, v.len(), got_q.len());
+                    std::process::exit(1);
+                }
+            }
             let (w, g) = (k5::norm(want.0), k5::norm(got.0));
             if w != g {
                 let k = w.iter().zip(&g).position(|(a, b)| a != b).unwrap_or(w.len().min(g.len()));
