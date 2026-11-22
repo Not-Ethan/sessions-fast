@@ -156,6 +156,10 @@ pub unsafe fn pack_wide(s: &[u8]) -> Option<u64> {
 /// `key_of(s)` with the 16-byte readability guarantee of `pack_wide`.
 #[inline(always)]
 pub unsafe fn key_of_wide(s: &[u8]) -> u64 {
+    // length first: a long ID never packs
+    if s.len() > 10 {
+        return other(s);
+    }
     match pack_wide(s) {
         Some(k) => k,
         None => other(s),
@@ -204,6 +208,9 @@ pub fn key_of_ev(s: &[u8]) -> u64 {
 /// `key_of_wide` for an event_id (see `other_in`).
 #[inline(always)]
 pub unsafe fn key_of_ev_wide(s: &[u8]) -> u64 {
+    if s.len() > 10 {
+        return other_in::<true>(s);
+    }
     match pack_wide(s) {
         Some(k) => k,
         None => other_in::<true>(s),
