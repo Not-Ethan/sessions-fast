@@ -67,7 +67,25 @@ ts 87.4, validity 86.9, sink 13.9, other 13.2, scanner 4.7).
 | v1 (stage1 out of line, Cut in place) | 520.3 | 128.0 | 23.0 | 14.2 | 29.2 | 86.9 | 106.0 | 97.1 | 12.9 | 18.3 | 62.7-63.7 / 58.8-59.4 (5 rounds) |
 ("loop" = k4.rs decode helpers dslot/sel/rd* ~25 + prefetch; split+loop for k6 v1 = 128+23+14.2+29.2 = 194.4
 vs k4 237.9. The decode costs +19 in validity inside the k6 loop: Cut read from memory + spills.)
-Exactness: k6test 14/14; SS_K6CHECK OK dev5 (slow_line 0.040%), e7 (21.6M lines, slow_line 0.042%).
+| v1b (1401707: stage-1 state in fewer registers) | 511.3 | 122.9 | 23.0 | 14.2 | 29.2 | 86.9 | 104.8 | 97.1 | 12.9 | 15.6 | v1 58.7-59.9 / v1b 59.2-60.3 / k4 62.5-63.3 (4 rounds) |
+Exactness k6-v1 (978adc9): k6test 14/14; SS_K6CHECK OK dev5 (slow_line 0.040%), e7 (21.6M lines, 0.042%),
+e23 (21.5M, 0.0421%), e60 (62.9M, 0.0414%). Tagged k6-v1.
+Stage 1 per 64-byte block (v1b, v2 build, ~95 instr): masks 23 (4 loads: v2 tuning splits 32-byte loads,
+6 cmpeq, 6 movemask, 6 shl/or, 1 or), quote rule ~17 (3 shld, op, not+addcarry, od, 7 for bad), popcnt + 2
+branches 6, flatten 32 (8 x tzcnt/add/store/blsr), flags 8 (2 pext, 2 pdep, or, store, 2 movabs), loop 5,
+prefetch 1, carried state ~3. Floor of this design about 90.
+NB=128 segments: no gain (line bench 59.3-60.7 ms).
+
+## Lifetimes (ab_env.sh, one image, flag-free otherwise; ms)
+ss-k6-v1 (978adc9, shipped Dockerfile, Rust 1.100, v3 binary):
+- e23 x10 (k4/k6): 836.4/829.7 826.7/840.5 825.9/822.7 821.6/820.6 822.4/817.9 823.7/814.3 827.1/819.0
+  819.4/823.6 837.8/817.0 822.4/822.3. Medians 824.8 / 821.5 (-3.3); means 826.3 / 822.8; k6 faster 7/10.
+- e60 x4: 3145.9/2318.9 (k4 first run cold) 2315.8/2304.4 2307.5/2311.7 2372.8/2324.0. Medians 2344.3 /
+  2315.3; rounds 2-4 means 2332.0 / 2313.4. Too noisy; more rounds queued (v2 image, 8 rounds).
+So the line-bench gain (-6%, single thread, NullSink) shrinks to ~0.4% in the 8-thread program: under SMT
+the instruction count decides, and k6 v1 removes only 19/line (v1b 28).
+Note: an outside build of f35b7a6 (= v0, 558/line, Cut copied 3x per line) measured k6 slower (73.6-75.2
+ms line bench); v0 was never the candidate. v1 = 978adc9.
 
 ## Next
 - e23/e60 checker -> tag k6-v1 -> image ss-k6-v1, lifetimes 10x e23 + 4x e60 (k4 vs k6 one image).
