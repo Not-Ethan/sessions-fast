@@ -42,6 +42,12 @@ pub static SLOW: AtomicUsize = AtomicUsize::new(0);
 pub static CLICKS: AtomicBool = AtomicBool::new(false);
 /// Click lines handed to the general scanner (statistics).
 pub static CSLOW: AtomicUsize = AtomicUsize::new(0);
+/// SLOW / CSLOW are counted only while set (the checks): a shared counter
+/// bumped by every thread for every slow line costs far more than the line.
+pub static COUNT_SLOW: AtomicBool = AtomicBool::new(false);
+/// The 128-byte splitters for lines the 64-byte windows cannot cut (long
+/// IDs, scorer version 5) unless SS_WIDECUT=0.
+pub static WIDE: AtomicBool = AtomicBool::new(true);
 
 /// Readable bytes needed from a line start for the fast path: window 1 (64),
 /// window 2 at most 65 bytes further (64), and 32 bytes from the start of
@@ -239,12 +245,124 @@ unsafe fn fields<'a>(p: *const u8, c: &Cut) -> [&'a [u8]; 7] {
     [f(0), f(1), f(2), f(3), f(4), f(5), f(6)]
 }
 
+// ---------------------------------------------------------------- wide lines
+//
+// Lines with long IDs (scorer version 5: 33-byte IDs) do not fit the 64-byte
+// windows. The wide splitters use the same rule over 128 bits (`window128`,
+// identical to `window` but on u128): event window 1 covers the 128 bytes at
+// the line start and must hold fields 0..=2; window 2 (64 bytes at the start
+// of field 3) is unchanged. A click line must fit 128 bytes. Then, as for
+// the narrow cut, the line has exactly its fields and they are exactly the
+// scanner's; anything else still goes to the scanner.
+
+/// Readable bytes from a line start for the wide event cut: window 1 (128),
+/// window 2 at most 129 bytes in (64), 32 bytes from any field start (field
+/// 6 starts at most 129 + 64), with slack.
+const MARGIN_W: usize = 256;
+/// The same for the wide click cut: the window (128) + 32 from a field start.
+const MARGIN_CW: usize = 192;
+
+#[inline(always)]
+fn upto128(x: u128) -> u128 {
+    x ^ x.wrapping_sub(1)
+}
+
+#[inline(always)]
+fn blsr128(x: u128) -> u128 {
+    x & x.wrapping_sub(1)
+}
+
+#[inline(always)]
+fn tz128(x: u128) -> usize {
+    x.trailing_zeros() as usize
+}
+
+/// `window` on a 128-byte window.
+#[inline(always)]
+fn window128(d: u128, q: u128, r: u128) -> (u128, u128, u128) {
+    let fs = (d << 1) | 1;
+    let qs = q & fs & r;
+    let cl = ((!d).wrapping_add(qs) & d) >> 1;
+    let bad = ((q ^ (qs | cl)) | (qs & cl)) & r;
+    let cs = (fs & !q) | (qs << 1);
+    let ce = (d & !(cl << 1)) | cl;
+    (bad, cs, ce)
+}
+
+#[inline(always)]
+unsafe fn masks128<const AVX2: bool>(p: *const u8) -> (u128, u128, u128) {
+    let (c0, n0, q0) = masks64::<AVX2>(p);
+    let (c1, n1, q1) = masks64::<AVX2>(p.add(64));
+    (c0 as u128 | ((c1 as u128) << 64), n0 as u128 | ((n1 as u128) << 64), q0 as u128 | ((q1 as u128) << 64))
+}
+
+/// `cut` with a 128-byte window 1 (a line start with MARGIN_W readable bytes).
+#[inline(never)]
+unsafe fn cut_wide<const AVX2: bool>(p: *const u8) -> Cut {
+    let (c1, n1, q1) = masks128::<AVX2>(p);
+    let d1 = c1 | n1;
+    let d1c = blsr128(blsr128(d1));
+    let r1 = upto128(d1c);
+    let (b1, cs1, ce1) = window128(d1, q1, r1);
+    let w = tz128(d1c) + 1; // <= 129
+    let (c2, n2, q2) = masks64::<AVX2>(p.add(w));
+    let d2 = c2 | n2;
+    let d2d = blsr(blsr(blsr(d2)));
+    let r2 = upto(d2d);
+    let (b2, cs2, ce2) = window(d2, q2, r2);
+    let last = d2d & d2d.wrapping_neg();
+    let bad = (b1 != 0) | (n1 & r1 != 0) | ((b2 | ((n2 ^ last) & r2)) != 0);
+    let ok = (d1c != 0) & (d2d != 0) & !bad;
+    let mut s = [0usize; 7];
+    let mut n = [0usize; 7];
+    let (mut cs, mut ce) = (cs1, ce1);
+    for j in 0..3 {
+        s[j] = tz128(cs);
+        n[j] = tz128(ce).wrapping_sub(tz128(cs));
+        cs = blsr128(cs);
+        ce = blsr128(ce);
+    }
+    let (mut cs, mut ce) = (cs2, ce2);
+    for j in 3..7 {
+        s[j] = w + tz(cs);
+        n[j] = tz(ce).wrapping_sub(tz(cs));
+        cs = blsr(cs);
+        ce = blsr(ce);
+    }
+    Cut { ok, s, n, len: w + tz(d2d) + 1 }
+}
+
+/// `cut4` on a 128-byte window (MARGIN_CW readable bytes).
+#[inline(never)]
+unsafe fn cut4_wide<const AVX2: bool>(p: *const u8) -> Cut4 {
+    let (c, n, q) = masks128::<AVX2>(p);
+    let d = c | n;
+    let d3 = blsr128(blsr128(blsr128(d)));
+    let r = upto128(d3);
+    let (b, cs, ce) = window128(d, q, r);
+    let last = d3 & d3.wrapping_neg();
+    let nl = (n ^ last) & r;
+    let ok = (d3 != 0) & ((b | nl) == 0);
+    let mut s = [0usize; 4];
+    let mut ln = [0usize; 4];
+    let (mut cs, mut ce) = (cs, ce);
+    for j in 0..4 {
+        s[j] = tz128(cs);
+        ln[j] = tz128(ce).wrapping_sub(tz128(cs));
+        cs = blsr128(cs);
+        ce = blsr128(ce);
+    }
+    Cut4 { ok, s, n: ln, len: tz128(d3) + 1 }
+}
+
 /// End of the line at `off` (the position after its newline, or the end of
 /// `b`): a line the fast path did not cut.
 #[cold]
 #[inline(never)]
 fn slow_end(b: &[u8], off: usize) -> usize {
-    SLOW.fetch_add(1, Ordering::Relaxed);
+    if COUNT_SLOW.load(Ordering::Relaxed) {
+        SLOW.fetch_add(1, Ordering::Relaxed);
+    }
     scan::next_line_start(b, off)
 }
 
@@ -277,6 +395,8 @@ pub fn for_each_line2<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FR: FnMut
     }
     // last line start for the fast path
     let lim = b.len() - MARGIN;
+    let lim_w = b.len().saturating_sub(MARGIN_W);
+    let wide = WIDE.load(Ordering::Relaxed) && b.len() >= MARGIN_W;
     let base = b.as_ptr();
     let mut off = start;
     while off < end && off <= lim {
@@ -287,6 +407,14 @@ pub fn for_each_line2<'a, const AVX2: bool, FF: FnMut(&[&'a [u8]; 7]), FR: FnMut
                 ff(&fields(p, &c));
                 off += c.len;
             } else {
+                if wide && off <= lim_w {
+                    let c = cut_wide::<AVX2>(p);
+                    if c.ok {
+                        ff(&fields(p, &c));
+                        off += c.len;
+                        continue;
+                    }
+                }
                 let e = slow_end(b, off);
                 fr(off, e);
                 off = e;
@@ -401,6 +529,8 @@ pub fn for_each_click<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 4])>(b: &'a [u8
         return;
     }
     let lim = b.len() - MARGIN_C;
+    let lim_w = b.len().saturating_sub(MARGIN_CW);
+    let wide = WIDE.load(Ordering::Relaxed) && b.len() >= MARGIN_CW;
     let base = b.as_ptr();
     let mut off = start;
     while off < end && off <= lim {
@@ -411,7 +541,17 @@ pub fn for_each_click<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 4])>(b: &'a [u8
                 f(&fields4(p, &c));
                 off += c.len;
             } else {
-                CSLOW.fetch_add(1, Ordering::Relaxed);
+                if wide && off <= lim_w {
+                    let c = cut4_wide::<AVX2>(p);
+                    if c.ok {
+                        f(&fields4(p, &c));
+                        off += c.len;
+                        continue;
+                    }
+                }
+                if COUNT_SLOW.load(Ordering::Relaxed) {
+                    CSLOW.fetch_add(1, Ordering::Relaxed);
+                }
                 let e = scan::next_line_start(b, off);
                 click_scan::<AVX2, F>(b, off, e, f);
                 off = e;
@@ -427,6 +567,7 @@ pub fn for_each_click<'a, const AVX2: bool, F: FnMut(&[&'a [u8]; 4])>(b: &'a [u8
 /// general scanner and with the click splitter; the click records must be
 /// identical, in the same order. Exits nonzero on a difference.
 pub fn click_check(links_in: &super::Input, cl: &super::Input, ctx: &Ctx) {
+    COUNT_SLOW.store(true, Ordering::Relaxed);
     use super::{CRec, CSink, PCache};
     struct RecC(Vec<(usize, u64, u64, u32, u32)>);
     impl CSink for RecC {
@@ -505,6 +646,7 @@ pub fn task_fast_any<S: EvSink>(b: &[u8], task: Task, ctx: &Ctx, sink: &mut S, s
 /// path; the copies must be identical, in the same order. Exits nonzero on
 /// a difference.
 pub fn check(ev: &super::Input, ctx: &Ctx) {
+    COUNT_SLOW.store(true, Ordering::Relaxed);
     let mut lines = 0usize;
     let mut copies = 0usize;
     for task in &ev.tasks {
@@ -571,8 +713,10 @@ mod tests {
         let ms = ws - 3 * 86_400_000 + (r() % (20 * 86_400_000)) as i64;
         match j {
             0 | 1 => {
-                let n = 1 + r() % 13;
-                let alpha: &[u8] = if r() % 20 == 0 { b"aZ_-09 \xc3\xa9" } else { b"abcdefghij0123456789" };
+                // a quarter of the IDs in the version 5 long form (prefix +
+                // 32 hex digits), sometimes one digit more or less
+                let n = if r() % 4 == 0 { 31 + r() % 5 } else { 1 + r() % 13 };
+                let alpha: &[u8] = if r() % 20 == 0 { b"aZ_-09 \xc3\xa9" } else if n > 30 { b"0123456789abcdef" } else { b"abcdefghij0123456789" };
                 let mut v: Vec<u8> = (0..n).map(|_| alpha[(r() % alpha.len() as u64) as usize]).collect();
                 v[0] = if j == 0 { b'e' } else { b'u' };
                 v
@@ -737,6 +881,12 @@ mod tests {
                     (_, 0) => (0..r() % 30).map(|_| b"ab,\"\n\r 0Z-:T"[(r() % 12) as usize]).collect(),
                     (_, 1) => Vec::new(),
                     (_, 2) => (0..40 + r() % 40).map(|_| b"xyz019"[(r() % 6) as usize]).collect(),
+                    (0, 3..=9) | (1, 3..=9) => {
+                        // version 5 long form, sometimes a digit more or less
+                        let mut v: Vec<u8> = (0..31 + r() % 5).map(|_| b"0123456789abcdef"[(r() % 16) as usize]).collect();
+                        v[0] = if j == 0 { b'k' } else { b'u' };
+                        v
+                    }
                     (0, _) | (1, _) => (0..1 + r() % 12).map(|_| b"kuabcdefghij0123456789"[(r() % 22) as usize]).collect(),
                     (2, _) => format!("c_{}", r() % 2500).into_bytes(),
                     _ => value(2, r),

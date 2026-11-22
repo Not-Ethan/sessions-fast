@@ -2522,6 +2522,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     fastev::ON.store(std::env::var("SS_FASTEV").map_or(true, |v| v != "0"), Ordering::Relaxed);
     // click lines through the one-window splitter unless SS_CLICKFAST=0
     fastev::CLICKS.store(std::env::var("SS_CLICKFAST").map_or(true, |v| v != "0"), Ordering::Relaxed);
+    // 128-byte splitters for lines with long IDs unless SS_WIDECUT=0
+    fastev::WIDE.store(std::env::var("SS_WIDECUT").map_or(true, |v| v != "0"), Ordering::Relaxed);
     if std::env::var("SS_CLICKCHECK").is_ok() {
         fastev::click_check(&links_in, &clicks_in, &ctx);
         std::process::exit(0);

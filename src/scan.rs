@@ -181,8 +181,19 @@ pub fn for_each_record_x_v2<'a, const N: usize, F: FnMut(&[&'a [u8]; N]), const 
     end: usize,
     f: F,
 ) {
-    scan_v2::<N, _, AVX2>(buf, start, end, &mut SliceSink(f))
+    if end - start <= SMALL_RANGE {
+        scan_v2::<N, _, AVX2, 4, { 4 * 64 + 96 }, { 4 * 64 + 16 }>(buf, start, end, &mut SliceSink(f))
+    } else {
+        scan_v2::<N, _, AVX2, 64, { 64 * 64 + 96 }, { 64 * 64 + 16 }>(buf, start, end, &mut SliceSink(f))
+    }
 }
+
+/// Ranges up to this many bytes (single fallback lines) use the scanner
+/// with a 256-byte window: its arrays are zeroed on every call, 1.5 KB
+/// instead of 35 KB (the 4 KB window), which dominated when a quarter of
+/// the lines took this path (long IDs, scorer version 5). Same lines and
+/// fields: the window size only bounds how much is indexed at a time.
+const SMALL_RANGE: usize = 256;
 
 /// What the v2 scanner hands each well-formed line to: regular lines by
 /// their delimiter positions, the final unterminated line as slices.
@@ -292,19 +303,28 @@ pub fn for_each_line_x<'a, const N: usize, FL: FnMut(&Line<'a, N>), FS: FnMut(&[
     if USE_V1.load(std::sync::atomic::Ordering::Relaxed) {
         for_each_record_x_v1::<N, FS, AVX2>(buf, start, end, fs)
     } else {
-        scan_v2::<N, _, AVX2>(buf, start, end, &mut LazySink(fl, fs))
+        if end - start <= SMALL_RANGE {
+            scan_v2::<N, _, AVX2, 4, { 4 * 64 + 96 }, { 4 * 64 + 16 }>(buf, start, end, &mut LazySink(fl, fs))
+        } else {
+            scan_v2::<N, _, AVX2, 64, { 64 * 64 + 96 }, { 64 * 64 + 16 }>(buf, start, end, &mut LazySink(fl, fs))
+        }
     }
 }
 
 #[inline(always)]
-fn scan_v2<'a, const N: usize, H: LineSink<'a, N>, const AVX2: bool>(buf: &'a [u8], start: usize, end: usize, h: &mut H) {
+fn scan_v2<'a, const N: usize, H: LineSink<'a, N>, const AVX2: bool, const WBLK: usize, const DLN: usize, const NLN: usize>(
+    buf: &'a [u8],
+    start: usize,
+    end: usize,
+    h: &mut H,
+) {
     assert!(end <= buf.len() && end - start < (u32::MAX as usize) - 8192);
-    const WBLK: usize = 64;
-    const WIN: usize = WBLK * 64;
+    let win: usize = WBLK * 64;
+    assert!(DLN == win + 96 && NLN == win + 16);
     let r = &buf[start..];
     let rlen = end - start;
-    let mut dl = [0u32; WIN + 96];
-    let mut nlp = [0u32; WIN + 16];
+    let mut dl = [0u32; DLN];
+    let mut nlp = [0u32; NLN];
     let mut dmask = [0u64; WBLK];
     let mut nmask = [0u64; WBLK];
     let mut qmask = [0u64; WBLK];
@@ -317,7 +337,7 @@ fn scan_v2<'a, const N: usize, H: LineSink<'a, N>, const AVX2: bool>(buf: &'a [u
     let mut v_open = false; // the unfinished line at the window start had a violation
     let mut w = 0usize;
     while w < rlen {
-        let wend = (w + WIN).min(rlen);
+        let wend = (w + win).min(rlen);
         let nblk = (wend - w).div_ceil(64);
         let mut nd = carry;
         let mut nn = 0usize;
