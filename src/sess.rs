@@ -160,6 +160,8 @@ struct St {
     mixed_e: Vec<SRec>,
     /// persons with at most this many clicks use `attribute_small`
     bf_max: usize,
+    /// time-sorted events take the one-scan path (SS_NOSORTED=1: off)
+    sorted_fast: bool,
 
     /// per campaign: id of the last session it assisted (attribute_small)
     stamp: Vec<u32>,
@@ -236,6 +238,7 @@ impl St {
             cl: Buf::new(max_cl),
             mixed_e: Vec::new(),
             bf_max: crate::env_usize("SS_BF").unwrap_or(16),
+            sorted_fast: std::env::var("SS_NOSORTED").is_err(),
 
             stamp: vec![0; ctx.ncamp.max(1)],
             stamp_id: 0,
@@ -472,53 +475,101 @@ impl St {
     /// persons in `cs` are skipped); `name`: keys::mix of the person key.
     fn person(&mut self, p: u64, name: u64, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
         self.acc.start();
-        // 1. slots
-        self.pur.clear();
-        // bit w: bitmap word w is non-zero
-        let mut summary = 0u64;
-        {
-            let slot = &mut self.slot[..SLOTS_ALL];
-            let bits = &mut self.bits[..SLOTS_ALL / 64];
+        // events in ts order (the dense pipeline feeds most persons in
+        // event-number order, which is time order in generated data): one
+        // scan, a new session at every gap over W; equal timestamps have gap
+        // 0. The same sessions, counts and purchases as the slot walk below
+        // (SS_NOSORTED=1: always the slot walk).
+        if self.sorted_fast && !es.is_empty() && es.windows(2).all(|w| w[0].ts <= w[1].ts) {
+            self.sess.clear();
+            let mut last = es[0].ts;
+            let day = ((ctx.ws_mod_day + last as u64) / DAY as u64) as u32;
+            self.sess.push(Sess { start: last, day, cnt: 0, purch: 0, rev: 0, dend: 0 });
             for r in es {
                 let t = r.ts;
-                let s = (t / W) as usize;
-                // s <= u32::MAX / W < SLOTS_ALL
-                let a = unsafe { slot.get_unchecked_mut(s) };
-                a.mn = a.mn.min(t);
-                a.mx = a.mx.max(t);
-                a.cnt += 1;
-                unsafe { *bits.get_unchecked_mut(s >> 6) |= 1u64 << (s & 63) };
-                summary |= 1u64 << (s >> 6);
+                if t - last > W {
+                    let day = ((ctx.ws_mod_day + t as u64) / DAY as u64) as u32;
+                    self.sess.push(Sess { start: t, day, cnt: 0, purch: 0, rev: 0, dend: 0 });
+                }
+                last = t;
+                let k = self.sess.len() - 1;
+                let s = &mut self.sess[k];
+                s.cnt += 1;
                 if r.pay != 0 {
-                    self.pur.push((t, r.pay));
+                    let pay = r.pay;
+                    let price = (pay & 0xFF_FFFF) as u64;
+                    s.rev += price;
+                    s.purch = 1;
+                    let idx = s.day as usize * 256 + (pay >> 24) as usize;
+                    if self.catsum[idx] == 0 {
+                        self.touched.push(idx as u32);
+                    }
+                    self.catsum[idx] += price;
                 }
             }
-        }
-        self.acc.lap(P_SLOTS);
-        // 2. sessions: runs of occupied slots, split at gaps over W
-        self.sess.clear();
-        let mut last_slot = usize::MAX - 1;
-        let mut last_max = 0u32;
-        while summary != 0 {
-            let w = summary.trailing_zeros() as usize;
-            summary &= summary - 1;
-            let mut word = self.bits[w];
-            self.bits[w] = 0;
-            while word != 0 {
-                let s = w * 64 + word.trailing_zeros() as usize;
-                word &= word - 1;
-                let a = self.slot[s];
-                // lo > last_max: every ts of slot s is above every ts of an earlier slot
-                if s == last_slot + 1 && a.mn - last_max <= W {
-                    let k = self.sess.len() - 1;
-                    self.sess[k].cnt += a.cnt;
-                } else {
-                    let day = ((ctx.ws_mod_day + a.mn as u64) / DAY as u64) as u32;
-                    self.sess.push(Sess { start: a.mn, day, cnt: a.cnt, purch: 0, rev: 0, dend: 0 });
+        } else {
+            // 1. slots
+            self.pur.clear();
+            // bit w: bitmap word w is non-zero
+            let mut summary = 0u64;
+            {
+                let slot = &mut self.slot[..SLOTS_ALL];
+                let bits = &mut self.bits[..SLOTS_ALL / 64];
+                for r in es {
+                    let t = r.ts;
+                    let s = (t / W) as usize;
+                    // s <= u32::MAX / W < SLOTS_ALL
+                    let a = unsafe { slot.get_unchecked_mut(s) };
+                    a.mn = a.mn.min(t);
+                    a.mx = a.mx.max(t);
+                    a.cnt += 1;
+                    unsafe { *bits.get_unchecked_mut(s >> 6) |= 1u64 << (s & 63) };
+                    summary |= 1u64 << (s >> 6);
+                    if r.pay != 0 {
+                        self.pur.push((t, r.pay));
+                    }
                 }
-                self.slot[s] = Slot { sidx: (self.sess.len() - 1) as u32, ..IDLE };
-                last_slot = s;
-                last_max = a.mx;
+            }
+            self.acc.lap(P_SLOTS);
+            // 2. sessions: runs of occupied slots, split at gaps over W
+            self.sess.clear();
+            let mut last_slot = usize::MAX - 1;
+            let mut last_max = 0u32;
+            while summary != 0 {
+                let w = summary.trailing_zeros() as usize;
+                summary &= summary - 1;
+                let mut word = self.bits[w];
+                self.bits[w] = 0;
+                while word != 0 {
+                    let s = w * 64 + word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    let a = self.slot[s];
+                    // lo > last_max: every ts of slot s is above every ts of an earlier slot
+                    if s == last_slot + 1 && a.mn - last_max <= W {
+                        let k = self.sess.len() - 1;
+                        self.sess[k].cnt += a.cnt;
+                    } else {
+                        let day = ((ctx.ws_mod_day + a.mn as u64) / DAY as u64) as u32;
+                        self.sess.push(Sess { start: a.mn, day, cnt: a.cnt, purch: 0, rev: 0, dend: 0 });
+                    }
+                    self.slot[s] = Slot { sidx: (self.sess.len() - 1) as u32, ..IDLE };
+                    last_slot = s;
+                    last_max = a.mx;
+                }
+            }
+            // purchases: revenue per session, category sums per day
+            for k in 0..self.pur.len() {
+                let (t, pay) = self.pur[k];
+                let si = self.slot[(t / W) as usize].sidx as usize;
+                let price = (pay & 0xFF_FFFF) as u64;
+                let s = &mut self.sess[si];
+                s.rev += price;
+                s.purch = 1;
+                let idx = s.day as usize * 256 + (pay >> 24) as usize;
+                if self.catsum[idx] == 0 {
+                    self.touched.push(idx as u32);
+                }
+                self.catsum[idx] += price;
             }
         }
         // day runs (sessions are in time order, so days are non-decreasing)
@@ -529,20 +580,6 @@ impl St {
                 end = i as u32 + 1;
             }
             self.sess[i].dend = end;
-        }
-        // purchases: revenue per session, category sums per day
-        for k in 0..self.pur.len() {
-            let (t, pay) = self.pur[k];
-            let si = self.slot[(t / W) as usize].sidx as usize;
-            let price = (pay & 0xFF_FFFF) as u64;
-            let s = &mut self.sess[si];
-            s.rev += price;
-            s.purch = 1;
-            let idx = s.day as usize * 256 + (pay >> 24) as usize;
-            if self.catsum[idx] == 0 {
-                self.touched.push(idx as u32);
-            }
-            self.catsum[idx] += price;
         }
         self.acc.lap(P_WALK);
         // 3. the person's clicks (the bucket's clicks of person p), by ts
