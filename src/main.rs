@@ -1946,6 +1946,8 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
     let mut order: Vec<(usize, usize)> = (0..pe).map(|p| (sb.iter().map(|t| t.a.len(p)).sum::<usize>(), p)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
+    // records per sub-bucket of the in-cache split (SS_SUBB overrides, experiment)
+    let sub_b = env_usize("SS_SUBB").filter(|&v| v > 0).unwrap_or(SUB_B);
     let multis = par(phase_threads("DEDUP", ctx), |_| {
         let mut multi: Vec<u64> = Vec::new();
         let mut table: Vec<ARec> = Vec::new();
@@ -1963,7 +1965,7 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
             if n == 0 {
                 continue;
             }
-            let sub_bits = ceil_log2(n.div_ceil(SUB_B)).min(12);
+            let sub_bits = ceil_log2(n.div_ceil(sub_b)).min(12);
             if sub_bits == 0 {
                 let mask = reset(&mut table, n);
                 for t in sb {
