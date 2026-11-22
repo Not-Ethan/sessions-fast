@@ -13,6 +13,10 @@ How it works:
 - **Per click, any order.** The click's qualifying sessions are found 8 per ymm: start <= ts <= start + 7 days, in
   the same offsets as attribute_small, with unsigned min/max_epu32 compares. Pad lanes have lo = MAX and hi = 0, so
   they never qualify.
+- **Registers.** Up to 16 sessions (`bm_clicks_reg::<1 or 2>`), the lanes stay in ymm registers for all of the
+  person's clicks. Above that, `bm_click` loads and stores them per click. In the v3 assembly that loop has no
+  spills: about 32 instructions per click and active block, 10 per block with no qualifying session.
+- **Lane update.** The candidate is ts + 1, masked to the qualifying lanes; "later" means max_epu32 changed.
 - **Per session state.** Each session keeps:
   - its latest qualifying ts + 1 (0 = no click yet);
   - the campaign of the first click seen at that ts;
