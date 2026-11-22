@@ -31,28 +31,38 @@ for e in SS_DENSE=0 SS_DENSE=force; do
   echo "fixtures native sse  [$e]: $(env $e SS_NOAVX2=1 $PY $T/run_fixtures.py fixtures -- ~/bin/$N 2>&1 | tail -1)"
   echo "fixtures image avx2  [$e]: $($L sudo IMAGE=ss-$N EXTRA_ENV=$e $PY $T/run_fixtures.py fixtures -- bash $T/docker_run.sh 2>&1 | tail -1)"
 done
+echo "fixtures native avx2 [SS_DENSE=force SS_K3=0]: $(env SS_DENSE=force SS_K3=0 $PY $T/run_fixtures.py fixtures -- ~/bin/$N 2>&1 | tail -1)"
+echo "fixtures native avx2 [default]: $($PY $T/run_fixtures.py fixtures -- ~/bin/$N 2>&1 | tail -1)"
+echo "fixtures image avx2 [SS_K3=0]: $($L sudo IMAGE=ss-$N EXTRA_ENV=SS_K3=0 $PY $T/run_fixtures.py fixtures -- bash $T/docker_run.sh 2>&1 | tail -1)"
 echo "fixtures image default: $($L sudo IMAGE=ss-$N $PY $T/run_fixtures.py fixtures -- bash $T/docker_run.sh 2>&1 | tail -1)"
 echo "fixtures image sse default: $($L sudo IMAGE=ss-$N EXTRA_ENV=SS_NOAVX2=1 $PY $T/run_fixtures.py fixtures -- bash $T/docker_run.sh 2>&1 | tail -1)"
 # dev: dense (default) and general variants, image and native
-for envs in "-" "SS_NOAVX2=1" "SS_DENSE=0 SS_X=1" "SS_DENSE=0 SS_NOAVX2=1" "SS_DENSE=0 SS_FASTEV=0" "SS_DENSE=0"; do
+for envs in "-" "SS_NOAVX2=1" "SS_K3=0" "SS_DENSE=force" "SS_DENSE=0 SS_X=1" "SS_DENSE=0 SS_NOAVX2=1" "SS_DENSE=0 SS_FASTEV=0" "SS_DENSE=0"; do
   set -- ; [ "$envs" != "-" ] && set -- $envs
   p=$(drun /mnt/data/dev ~/a3_odev "$@")
   echo "dev image [$envs] $p: $($PY $T/compare.py ~/a3_odev $DEVANS | tail -1)"
 done
-for envs in "-" "SS_NOAVX2=1" "SS_DENSE=0 SS_X=1" "SS_DENSE=0 SS_NOAVX2=1"; do
+for envs in "-" "SS_NOAVX2=1" "SS_K3=0" "SS_K3=0 SS_NOAVX2=1" "SS_DENSE=0 SS_X=1" "SS_DENSE=0 SS_NOAVX2=1"; do
   set -- ; [ "$envs" != "-" ] && set -- $envs
-  rm -rf ~/a3_odev
-  env "$@" $L ~/bin/$N /mnt/data/dev ~/a3_odev > /dev/null 2>&1
-  echo "dev native [$envs]: $($PY $T/compare.py ~/a3_odev $DEVANS | tail -1)"
+  sudo rm -rf ~/a3_ndev
+  p=$(env "$@" SS_VERBOSE=1 NCPU=8 $L ~/bin/$N /mnt/data/dev ~/a3_ndev 2>&1; echo "exit=$?")
+  p=$(echo "$p" | grep -o "pipeline=[a-z]*\|exit=[0-9]*" | tr '\n' ' ')
+  echo "dev native [$envs] $p: $($PY $T/compare.py ~/a3_ndev $DEVANS | tail -1)"
 done
 [ "$2" = quick ] && exit 0
 for d in d7 d11 d23 d60; do
   p=$(drun /mnt/data/$d ~/a3_c)
   echo "compare $d ref vs $N $p: $($L $PY $T/compare.py ~/ref_$d ~/a3_c | tail -1)"
 done
-for envs in "SS_NOAVX2=1" "SS_DENSE=0" "SS_DENSE=0 SS_NOAVX2=1"; do
+for envs in "SS_NOAVX2=1" "SS_K3=0" "SS_DENSE=0" "SS_DENSE=0 SS_NOAVX2=1"; do
   p=$(drun /mnt/data/d23 ~/a3_c $envs)
   echo "compare d23 ref vs $N [$envs] $p: $($L $PY $T/compare.py ~/ref_d23 ~/a3_c | tail -1)"
 done
-sudo rm -rf ~/a3_c ~/a3_odev
+for d in d7 d11 d23 d60; do
+  sudo rm -rf ~/a3_c
+  p=$(env SS_VERBOSE=1 NCPU=8 $L ~/bin/$N /mnt/data/$d ~/a3_c 2>&1; echo "exit=$?")
+  p=$(echo "$p" | grep -o "pipeline=[a-z]*\|exit=[0-9]*" | tr '\n' ' ')
+  echo "compare $d ref vs native $N $p: $($L $PY $T/compare.py ~/ref_$d ~/a3_c | tail -1)"
+done
+sudo rm -rf ~/a3_c ~/a3_odev ~/a3_ndev
 echo A3-DGATE-DONE
