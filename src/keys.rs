@@ -300,6 +300,7 @@ pub fn long_settings() {
     }
     VERIFY_OCC.store(std::env::var("SS_VERIFYOCC").map_or(false, |v| v == "1"), AO::Relaxed);
     KNOWN_REQ.store(std::env::var("SS_KNOWN").map_or(false, |v| v == "1"), AO::Relaxed);
+    EV_SET1.store(std::env::var("SS_EVSET1").map_or(false, |v| v == "1"), AO::Relaxed);
 }
 
 /// SS_VERIFYOCC=1: the verification index sized from occurrences (as before).
@@ -641,6 +642,40 @@ fn verify_longs_inner(threads: usize) -> usize {
     distinct
 }
 
+/// SS_EVSET1=1: the event-ID check builds one global key set on one thread.
+static EV_SET1: AtomicBool = AtomicBool::new(false);
+
+/// Open-addressing set of keys (keys are hashes already: their own bits
+/// index it; 0 = empty, never a key); returns (slots, mask).
+fn build_set(m: &[u64]) -> (Vec<u64>, usize) {
+    let size = (2 * m.len()).next_power_of_two().max(16);
+    let mask = size - 1;
+    let mut t = vec![0u64; size];
+    for &k in m {
+        let mut s = slot_of(k, mask);
+        while t[s] != 0 && t[s] != k {
+            s = (s + 1) & mask;
+        }
+        t[s] = k;
+    }
+    (t, mask)
+}
+
+#[inline(always)]
+fn set_has(t: &[u64], mask: usize, k: u64) -> bool {
+    let mut s = slot_of(k, mask);
+    loop {
+        let x = unsafe { *t.get_unchecked(s) };
+        if x == k {
+            return true;
+        }
+        if x == 0 {
+            return false;
+        }
+        s = (s + 1) & mask;
+    }
+}
+
 pub static EV_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static EV_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -659,29 +694,42 @@ pub fn verify_ev_longs(threads: usize, multi: Option<&[u64]>) {
     if total == 0 {
         return;
     }
-    // the keys as an open-addressing set (keys are hashes already: their own
-    // bits index it; 0 = empty, never a key)
-    let set: Option<(Vec<u64>, usize)> = multi.map(|m| {
-        let size = (2 * m.len()).next_power_of_two().max(16);
-        let mask = size - 1;
-        let mut t = vec![0u64; size];
-        for &k in m {
-            let mut s = slot_of(k, mask);
-            while t[s] != 0 && t[s] != k {
-                s = (s + 1) & mask;
-            }
-            t[s] = k;
-        }
-        (t, mask)
-    });
     if multi.is_some_and(|m| m.is_empty()) {
         return;
     }
+    // the keys met more than once, split by the log partition (top TAB_BITS
+    // bits; one counting pass): each partition then builds its own small set
+    // (cache-sized) on its own thread (SS_EVSET1=1: one global set and a
+    // bitmap built on this thread, as before)
+    let global = EV_SET1.load(AO::Relaxed);
+    let (mstart, mkeys): (Vec<usize>, Vec<u64>) = match multi {
+        Some(m) if !global => {
+            let mut cnt = vec![0usize; NPART + 1];
+            for &k in m {
+                cnt[(k >> (64 - TAB_BITS)) as usize + 1] += 1;
+            }
+            for p in 0..NPART {
+                cnt[p + 1] += cnt[p];
+            }
+            let mut cur = cnt.clone();
+            let mut keys = vec![0u64; m.len()];
+            for &k in m {
+                let p = (k >> (64 - TAB_BITS)) as usize;
+                keys[cur[p]] = k;
+                cur[p] += 1;
+            }
+            (cnt, keys)
+        }
+        _ => (Vec::new(), Vec::new()),
+    };
+    // global variant: the keys as an open-addressing set (keys are hashes
+    // already: their own bits index it; 0 = empty, never a key)
+    let set: Option<(Vec<u64>, usize)> = multi.filter(|_| global).map(|m| build_set(m));
     // a bitmap over other key bits in front of the set (256 KB, in cache;
     // most entries are not in the set and stop here)
     const BM_BITS: u32 = 21;
     let bm: Vec<u64> = match multi {
-        Some(m) => {
+        Some(m) if global => {
             let mut b = vec![0u64; 1 << (BM_BITS - 6)];
             for &k in m {
                 let i = ((k >> 24) & ((1 << BM_BITS) - 1)) as usize;
@@ -689,25 +737,11 @@ pub fn verify_ev_longs(threads: usize, multi: Option<&[u64]>) {
             }
             b
         }
-        None => Vec::new(),
+        _ => Vec::new(),
     };
     let maybe = |k: u64| -> bool {
         let i = ((k >> 24) & ((1 << BM_BITS) - 1)) as usize;
         bm[i >> 6] >> (i & 63) & 1 != 0
-    };
-    let has = |k: u64| -> bool {
-        let (t, mask) = set.as_ref().unwrap();
-        let mut s = slot_of(k, *mask);
-        loop {
-            let x = t[s];
-            if x == k {
-                return true;
-            }
-            if x == 0 {
-                return false;
-            }
-            s = (s + 1) & mask;
-        }
     };
     // the entries to compare, per partition, then a sort and run check
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -721,12 +755,25 @@ pub fn verify_ev_longs(threads: usize, multi: Option<&[u64]>) {
                 break;
             }
             v.clear();
-            for l in lists.iter() {
-                for sl in l.get(p) {
-                    if set.is_some() {
-                        v.extend(sl.iter().filter(|e| maybe(e.key) && has(e.key)));
-                    } else {
-                        v.extend_from_slice(sl);
+            if multi.is_some() && !global {
+                let mk = &mkeys[mstart[p]..mstart[p + 1]];
+                if mk.is_empty() {
+                    // no key of this partition was met twice: nothing to compare
+                    continue;
+                }
+                let (t, mask) = build_set(mk);
+                for l in lists.iter() {
+                    for sl in l.get(p) {
+                        v.extend(sl.iter().filter(|e| set_has(&t, mask, e.key)));
+                    }
+                }
+            } else {
+                for l in lists.iter() {
+                    for sl in l.get(p) {
+                        match &set {
+                            Some((t, mask)) => v.extend(sl.iter().filter(|e| maybe(e.key) && set_has(t, *mask, e.key))),
+                            None => v.extend_from_slice(sl),
+                        }
                     }
                 }
             }
