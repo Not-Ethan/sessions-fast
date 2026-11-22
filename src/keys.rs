@@ -382,15 +382,13 @@ fn long_key<const EV: bool>(pre: u8, hi: u64, lo: u64) -> u64 {
     if !EV && KNOWN_ON.load(AO::Relaxed) && known_exact(key, pre as u64, hi, lo) {
         return key;
     }
-    let log = if EV { &EVLOG } else { &LOG };
-    log.with(|l| {
-        let mut p = l.get();
-        if p.is_null() {
-            p = new_log(if EV { EV_HINT.load(AO::Relaxed) } else { LOG_HINT.load(AO::Relaxed) });
-            l.set(p);
-        }
-        unsafe { (*p).push_unchecked((key >> (64 - TAB_BITS)) as usize, LEnt { key, pre: pre as u64, hi, lo }) };
-    });
+    // each static accessed directly (a LocalKey chosen at run time went
+    // through LocalKey::try_with, about 70 instructions per long ID)
+    let mut p = if EV { EVLOG.get() } else { LOG.get() };
+    if p.is_null() {
+        p = new_log_for::<EV>();
+    }
+    unsafe { (*p).push_unchecked((key >> (64 - TAB_BITS)) as usize, LEnt { key, pre: pre as u64, hi, lo }) };
     key
 }
 
@@ -420,6 +418,19 @@ fn known_exact(key: u64, pre: u64, hi: u64, lo: u64) -> bool {
         }
         s = (s + 1) & pt.mask;
     }
+}
+
+/// This thread's first long ID of its kind: its log.
+#[cold]
+#[inline(never)]
+fn new_log_for<const EV: bool>() -> *mut Parts<LEnt> {
+    let p = new_log(if EV { EV_HINT.load(AO::Relaxed) } else { LOG_HINT.load(AO::Relaxed) });
+    if EV {
+        EVLOG.set(p);
+    } else {
+        LOG.set(p);
+    }
+    p
 }
 
 #[cold]
