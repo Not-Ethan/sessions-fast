@@ -130,6 +130,30 @@ impl<T: Copy> Parts<T> {
         self.push(p, v);
     }
 
+    /// `push` for a write-combining Parts, without the mode check and
+    /// without bounds checks (the lean event sink).
+    ///
+    /// # Safety
+    /// `p` must be below the number of partitions, write combining on and
+    /// `finish` not yet called.
+    #[inline(always)]
+    pub unsafe fn push_wc(&mut self, p: usize, v: T) {
+        debug_assert!(p < self.lens.len() && !self.wc.is_empty());
+        let l = *self.lens.get_unchecked(p) as usize;
+        let k = l % Self::WC_RECS;
+        (self.wc.get_unchecked_mut(p).0.as_mut_ptr() as *mut T).add(k).write(v);
+        *self.lens.get_unchecked_mut(p) = l as u32 + 1;
+        if k == Self::WC_RECS - 1 {
+            self.flush_line(p, l + 1 - Self::WC_RECS);
+        }
+    }
+
+    /// Whether write combining is on (and `finish` not yet called).
+    #[inline(always)]
+    pub fn is_wc(&self) -> bool {
+        !self.wc.is_empty()
+    }
+
     /// `len` without bounds checks, for a write-combining Parts.
     ///
     /// # Safety

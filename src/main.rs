@@ -1516,6 +1516,130 @@ impl EvSink for BSink<'_> {
     }
 }
 
+/// The default event sink of pipeline B: BSink's bulk mode (no table mode,
+/// no person cache, no benchmark modes) with no run-time mode checks. The
+/// same records in the same order as BSink: invalid copies' dedup records
+/// at once; valid copies queued in a 64-entry ring after their link-table
+/// slot is prefetched, the oldest BULK_RUN resolved and written whenever
+/// BULK_CAP are queued; write-combining pushes without checks. SS_LEAN=0:
+/// BSink.
+struct LeanSink<'a> {
+    a: Parts<ARec>,
+    s: Parts<SRec>,
+    q: [Pending; BULK_RING],
+    qh: usize,
+    qn: usize,
+    tbase: u32,
+    overflow: bool,
+    lt: &'a LinkTable,
+    /// AVX2 builds: the link table's group probe through its view
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    probe: k5::Probe<'a>,
+    /// link-table slot array (as u64 words) and the probe-start mask
+    /// (mask & amask); null when the table is empty
+    pf_base: *const u64,
+    pf_mask: usize,
+    pe_shift: u32,
+    ps_shift: u32,
+    ibits: u32,
+    imax: usize,
+}
+
+impl<'a> LeanSink<'a> {
+    fn new(a: Parts<ARec>, s: Parts<SRec>, lt: &'a LinkTable, tbase: u32, pe_bits: u32, ps_bits: u32, lb: LocBits) -> LeanSink<'a> {
+        assert!(a.is_wc() && s.is_wc(), "the lean sink needs write combining");
+        let (slots, mask, amask, _) = lt.view();
+        LeanSink {
+            a,
+            s,
+            q: [Pending::default(); BULK_RING],
+            qh: 0,
+            qn: 0,
+            tbase,
+            overflow: false,
+            lt,
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            probe: k5::Probe::new(lt),
+            pf_base: if mask == 0 { std::ptr::null() } else { slots },
+            pf_mask: mask & amask,
+            pe_shift: 64 - pe_bits,
+            ps_shift: 64 - ps_bits,
+            ibits: lb.ibits,
+            imax: lb.imax,
+        }
+    }
+
+    /// mix(person key) of user key `user` (hash `h`).
+    #[inline(always)]
+    fn person(&self, user: u64, h: u64) -> u64 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if !links::SCALAR_PROBE.load(Ordering::Relaxed) {
+            return unsafe { self.probe.person_hash(user, h) };
+        }
+        person_hash(self.lt, user, h)
+    }
+
+    /// Resolves the person of a queued valid copy and writes its session
+    /// record and dedup record.
+    #[inline(always)]
+    fn emit(&mut self, p: Pending) {
+        let person = self.person(p.user, p.h);
+        let q = (person >> self.ps_shift) as usize;
+        // q < 2^ps_bits = the number of session partitions; write combining on
+        let i = unsafe { self.s.len_wc_unchecked(q) };
+        unsafe { self.s.push_wc(q, SRec { person, ts: p.ts, pay: p.pay }) };
+        let loc = if i < self.imax {
+            self.tbase | ((q as u32) << self.ibits) | i as u32
+        } else {
+            self.overflow = true;
+            LOC_NONE
+        };
+        unsafe { self.a.push_wc((p.eid >> self.pe_shift) as usize, ARec { eid: p.eid, ingest: p.ingest, loc }) };
+    }
+
+    /// End of a task: every queued copy resolved.
+    fn flush(&mut self) {
+        for k in 0..self.qn {
+            let p = self.q[(self.qh + k) & (BULK_RING - 1)];
+            self.emit(p);
+        }
+        self.qh = 0;
+        self.qn = 0;
+    }
+
+    /// The oldest BULK_RUN queued copies (their slots were prefetched at
+    /// least BULK_CAP - BULK_RUN copies ago); the head moves past them.
+    #[inline(never)]
+    fn run(&mut self) {
+        for k in 0..BULK_RUN {
+            let p = self.q[(self.qh + k) & (BULK_RING - 1)];
+            self.emit(p);
+        }
+        self.qh = (self.qh + BULK_RUN) & (BULK_RING - 1);
+        self.qn = BULK_CAP - BULK_RUN;
+    }
+}
+
+impl EvSink for LeanSink<'_> {
+    #[inline(always)]
+    fn copy(&mut self, eid: u64, ingest: u32, valid: Option<(u64, u32, u32)>) {
+        match valid {
+            None => unsafe { self.a.push_wc((eid >> self.pe_shift) as usize, ARec { eid, ingest, loc: LOC_NONE }) },
+            Some((user, ts, pay)) => {
+                let h = keys::mix(user);
+                if !self.pf_base.is_null() {
+                    prefetch(self.pf_base.wrapping_add(2 * (h as usize & self.pf_mask)) as *const u8);
+                }
+                self.q[(self.qh + self.qn) & (BULK_RING - 1)] = Pending { eid, user, h, ingest, ts, pay };
+                self.qn += 1;
+                if self.qn == BULK_CAP {
+                    self.run();
+                }
+            }
+        }
+    }
+}
+
 struct BOut {
     a: Parts<ARec>,
     s: Parts<SRec>,
@@ -1567,7 +1691,6 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
     let populate = std::env::var("SS_POPULATE").is_ok();
     let ntasks = ev.tasks.len() + cl.tasks.len();
     let next = AtomicUsize::new(0);
-    let avx2 = ctx.avx2;
     let nl = ctx.threads;
     let lnext = AtomicUsize::new(0);
     let pairs: Vec<std::sync::Mutex<Vec<(u64, u64)>>> = (0..nl).map(|_| std::sync::Mutex::new(Vec::new())).collect();
@@ -1586,7 +1709,30 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
         let pa = Parts::with_wc(pe, cap_a, true);
         sys::set_label("p.srec");
         let pss = Parts::with_wc(ps, cap_s, true);
+        sys::set_label("p.crec");
+        let mut c: Parts<CRec> = Parts::with_wc(ps, cap_c, true);
         sys::set_label("other");
+        let tbase = ((t as u64) << (lb.qbits + lb.ibits)) as u32;
+        let batched = std::env::var("SS_BATCH").is_ok();
+        let mut ccache = PCache::new();
+        let tl = TaskLoop { ev, cl, ctx, lt, next: &next, ntasks, populate, release, batched };
+        // the lean sink unless a mode needs BSink (table mode, person cache,
+        // ring instead of bulk queue, batched parsing) or SS_LEAN=0
+        let lean = gt.is_none()
+            && !batched
+            && !ccache.on
+            && std::env::var("SS_RING").is_err()
+            && std::env::var("SS_LEAN").map_or(true, |v| v != "0")
+            && pa.is_wc()
+            && pss.is_wc();
+        if lean {
+            let mut sink = LeanSink::new(pa, pss, lt, tbase, ctx.pe_bits, ctx.ps_bits, lb);
+            tl.run(&mut sink, LeanSink::flush, &mut c, &mut ccache);
+            sink.a.finish();
+            sink.s.finish();
+            c.finish();
+            return BOut { a: sink.a, s: sink.s, c, overflow: sink.overflow, kills: Vec::new() };
+        }
         let mut sink = BSink {
             a: pa,
             s: pss,
@@ -1597,7 +1743,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
             bulk: [Pending::default(); BULK_RING],
             bh: 0,
             bn: 0,
-            tbase: ((t as u64) << (lb.qbits + lb.ibits)) as u32,
+            tbase,
             overflow: false,
             lt,
             pe_bits: ctx.pe_bits,
@@ -1615,66 +1761,7 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
         if gt.is_some() {
             sink.use_bulk = true;
         }
-        sys::set_label("p.crec");
-        let mut c: Parts<CRec> = Parts::with_wc(ps, cap_c, true);
-        sys::set_label("other");
-        let batched = std::env::var("SS_BATCH").is_ok();
-        let mut evb = EvBatch::new();
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= ntasks {
-                break;
-            }
-            if i < ev.tasks.len() {
-                let task = ev.tasks[i];
-                let b = ev.maps[task.file as usize].bytes();
-                let safe_end = b.as_ptr() as usize + b.len();
-                if populate {
-                    sys::populate_read(b.as_ptr() as usize + task.start, task.end - task.start);
-                }
-                if batched {
-                    if avx2 {
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe {
-                            event_task_batched_avx2(b, task, ctx, &mut sink, safe_end, &mut evb)
-                        }
-                    } else {
-                        event_task_batched::<false, _>(b, task, ctx, &mut sink, safe_end, &mut evb, 7);
-                    }
-                } else if avx2 {
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        event_task_avx2(b, task, ctx, &mut sink, safe_end)
-                    }
-                } else {
-                    event_task::<false, _>(b, task, ctx, &mut sink, safe_end)
-                }
-                sink.flush();
-                if release {
-                    // the chunk is parsed: drop its page mappings now, in
-                    // parallel, instead of in the single-threaded exit
-                    sys::release_inner(b.as_ptr() as usize + task.start, b.as_ptr() as usize + task.end);
-                }
-            } else {
-                let task = cl.tasks[i - ev.tasks.len()];
-                let b = cl.maps[task.file as usize].bytes();
-                let safe_end = b.as_ptr() as usize + b.len();
-                if populate {
-                    sys::populate_read(b.as_ptr() as usize + task.start, task.end - task.start);
-                }
-                if avx2 {
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        click_task_avx2(b, task, ctx, lt, &mut c, safe_end, &mut sink.cache)
-                    }
-                } else {
-                    click_task::<false, _>(b, task, ctx, lt, &mut c, safe_end, &mut sink.cache)
-                }
-                if release {
-                    sys::release_inner(b.as_ptr() as usize + task.start, b.as_ptr() as usize + task.end);
-                }
-            }
-        }
+        tl.run(&mut sink, BSink::flush, &mut c, &mut ccache);
         sink.a.finish();
         sink.s.finish();
         c.finish();
@@ -1684,6 +1771,84 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
         BOut { a: sink.a, s: sink.s, c, overflow: sink.overflow, kills: std::mem::take(&mut sink.kills) }
     });
     (cell.into_inner().unwrap(), outs)
+}
+
+/// The event and click tasks of one parse thread (parse_b), for any event sink.
+struct TaskLoop<'a> {
+    ev: &'a Input,
+    cl: &'a Input,
+    ctx: &'a Ctx,
+    lt: &'a LinkTable,
+    next: &'a AtomicUsize,
+    ntasks: usize,
+    populate: bool,
+    release: bool,
+    batched: bool,
+}
+
+impl TaskLoop<'_> {
+    /// Takes tasks until none is left: event tasks into `sink` (`end_task`
+    /// after each), click tasks into `c` (person cache `cache`).
+    fn run<S: EvSink>(&self, sink: &mut S, end_task: fn(&mut S), c: &mut Parts<CRec>, cache: &mut PCache) {
+        let (ev, cl, ctx, lt) = (self.ev, self.cl, self.ctx, self.lt);
+        let avx2 = ctx.avx2;
+        let mut evb = if self.batched { Some(EvBatch::new()) } else { None };
+        loop {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            if i >= self.ntasks {
+                break;
+            }
+            if i < ev.tasks.len() {
+                let task = ev.tasks[i];
+                let b = ev.maps[task.file as usize].bytes();
+                let safe_end = b.as_ptr() as usize + b.len();
+                if self.populate {
+                    sys::populate_read(b.as_ptr() as usize + task.start, task.end - task.start);
+                }
+                if let Some(evb) = evb.as_mut() {
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            event_task_batched_avx2(b, task, ctx, sink, safe_end, evb)
+                        }
+                    } else {
+                        event_task_batched::<false, _>(b, task, ctx, sink, safe_end, evb, 7);
+                    }
+                } else if avx2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        event_task_avx2(b, task, ctx, sink, safe_end)
+                    }
+                } else {
+                    event_task::<false, _>(b, task, ctx, sink, safe_end)
+                }
+                end_task(sink);
+                if self.release {
+                    // the chunk is parsed: drop its page mappings now, in
+                    // parallel, instead of in the single-threaded exit
+                    sys::release_inner(b.as_ptr() as usize + task.start, b.as_ptr() as usize + task.end);
+                }
+            } else {
+                let task = cl.tasks[i - ev.tasks.len()];
+                let b = cl.maps[task.file as usize].bytes();
+                let safe_end = b.as_ptr() as usize + b.len();
+                if self.populate {
+                    sys::populate_read(b.as_ptr() as usize + task.start, task.end - task.start);
+                }
+                if avx2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        click_task_avx2(b, task, ctx, lt, c, safe_end, cache)
+                    }
+                } else {
+                    click_task::<false, _>(b, task, ctx, lt, c, safe_end, cache)
+                }
+                if self.release {
+                    sys::release_inner(b.as_ptr() as usize + task.start, b.as_ptr() as usize + task.end);
+                }
+            }
+        }
+    }
 }
 
 /// Wall time of the links step of `parse_b` (verbose report).
@@ -3992,4 +4157,111 @@ fn bench_b(stage: &str, ev: &Input, links_in: &Input, ctx: &Ctx) {
         best = best.min(t.elapsed().as_secs_f64() * 1e3);
     }
     eprintln!("bench {:6} {:8.1} ms  (links {:.1} ms)", stage, best, link_ms);
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+
+    /// The lean sink writes exactly BSink's records (bulk mode) in the same
+    /// order: dedup records, session records and locations, with linked and
+    /// unlinked users, invalid copies, partitions that overflow into their
+    /// vectors, an empty link table, and task ends with 0..=47 copies queued.
+    #[test]
+    fn lean_sink_matches_bsink() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let key = |n: u64| keys::key_of(format!("u{:x}", n).as_bytes());
+        for &(npairs, ncopies, cap) in &[(0usize, 3000usize, 4usize), (400, 5000, 8), (2000, 20000, 2), (50, 777, 64)] {
+            // link table: users 1..=300 linked in chains of 3
+            let lt = if npairs == 0 { LinkTable::empty() } else { LinkTable::with_pairs(npairs, 1) };
+            if npairs > 0 {
+                let mut a = links::IdxAlloc::new();
+                let mut prs = Vec::new();
+                for i in 0..npairs as u64 {
+                    prs.push(lt.insert_pair(key(i + 1), key(i / 3 * 3 + 1000), &mut a));
+                }
+                for &(da, db) in &prs {
+                    lt.union_idx(da, db);
+                }
+                for b in 0..lt.root_blocks() {
+                    lt.finalize_roots(b);
+                }
+                for b in 0..lt.val_blocks() {
+                    lt.finalize_vals(b);
+                }
+            }
+            let (pe_bits, ps_bits) = (5u32, 3u32);
+            let lb = LocBits { qbits: ps_bits, ibits: 20, imax: (1 << 20) - 1 };
+            let tbase = 3u32 << (lb.qbits + lb.ibits);
+            let mut bs = BSink {
+                a: Parts::with_wc(1 << pe_bits, cap, true),
+                s: Parts::with_wc(1 << ps_bits, cap, true),
+                ring: [Pending::default(); BRING],
+                rh: 0,
+                rn: 0,
+                use_bulk: true,
+                bulk: [Pending::default(); BULK_RING],
+                bh: 0,
+                bn: 0,
+                tbase,
+                overflow: false,
+                lt: &lt,
+                pe_bits,
+                ps_bits,
+                lb,
+                nolookup: false,
+                direct: false,
+                cache: PCache { slots: vec![(0, 0); 2], shift: 63, on: false },
+                gt: None,
+                kills: Vec::new(),
+                fresh: 0,
+                batch_out: true,
+            };
+            let mut ls = LeanSink::new(Parts::with_wc(1 << pe_bits, cap, true), Parts::with_wc(1 << ps_bits, cap, true), &lt, tbase, pe_bits, ps_bits, lb);
+            let mut since_flush = 0usize;
+            let mut flush_at = (next() % 48) as usize;
+            for c in 0..ncopies as u64 {
+                let eid = keys::mix(c * 7 + 1) | 1;
+                let ingest = (next() % 1000) as u32;
+                let valid = if next() % 5 == 0 { None } else { Some((key(next() % 1500 + 1), (next() % 100_000) as u32, (next() % 3) as u32)) };
+                bs.copy(eid, ingest, valid);
+                ls.copy(eid, ingest, valid);
+                since_flush += 1;
+                if since_flush == flush_at {
+                    bs.flush();
+                    ls.flush();
+                    since_flush = 0;
+                    flush_at = (next() % 100) as usize;
+                }
+            }
+            bs.flush();
+            ls.flush();
+            for p in [&mut bs.a, &mut ls.a] {
+                p.finish();
+            }
+            for p in [&mut bs.s, &mut ls.s] {
+                p.finish();
+            }
+            assert_eq!(bs.overflow, ls.overflow);
+            for p in 0..1usize << pe_bits {
+                let (x, y) = (bs.a.get(p), ls.a.get(p));
+                let fx: Vec<(u64, u32, u32)> = x.iter().flat_map(|s| s.iter().map(|r| (r.eid, r.ingest, r.loc))).collect();
+                let fy: Vec<(u64, u32, u32)> = y.iter().flat_map(|s| s.iter().map(|r| (r.eid, r.ingest, r.loc))).collect();
+                assert_eq!(fx, fy, "dedup partition {}", p);
+            }
+            for q in 0..1usize << ps_bits {
+                let (x, y) = (bs.s.get(q), ls.s.get(q));
+                let fx: Vec<(u64, u32, u32)> = x.iter().flat_map(|s| s.iter().map(|r| (r.person, r.ts, r.pay))).collect();
+                let fy: Vec<(u64, u32, u32)> = y.iter().flat_map(|s| s.iter().map(|r| (r.person, r.ts, r.pay))).collect();
+                assert_eq!(fx, fy, "session partition {}", q);
+                assert!(cap > 8 || fx.len() > cap, "overflow exercised");
+            }
+        }
+    }
 }
