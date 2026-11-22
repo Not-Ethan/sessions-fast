@@ -228,10 +228,12 @@ static LOG_HINT_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// Expected long IDs per worker thread while parsing links, and while
 /// parsing events and clicks (sizing only: logs are partitioned arenas, and
 /// an arena much larger than its log would be zeroed for nothing).
-pub fn set_log_hints(links: usize, rest: usize) {
+pub fn set_log_hints(links: usize, rest: usize, ev: usize) {
     LOG_HINT.store(links.clamp(1024, 1 << 26), AO::Relaxed);
     LOG_HINT_NEXT.store(rest.clamp(1024, 1 << 26), AO::Relaxed);
+    EV_HINT.store(ev.clamp(1024, 1 << 26), AO::Relaxed);
 }
+static EV_HINT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1024);
 
 /// One logged long ID: key, first byte, the 32 hex digits as two u64.
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -358,7 +360,7 @@ fn long_key<const EV: bool>(pre: u8, hi: u64, lo: u64) -> u64 {
     log.with(|l| {
         let mut p = l.get();
         if p.is_null() {
-            p = new_log();
+            p = new_log(if EV { EV_HINT.load(AO::Relaxed) } else { LOG_HINT.load(AO::Relaxed) });
             l.set(p);
         }
         unsafe { (*p).push_unchecked((key >> (64 - TAB_BITS)) as usize, LEnt { key, pre: pre as u64, hi, lo }) };
@@ -368,8 +370,8 @@ fn long_key<const EV: bool>(pre: u8, hi: u64, lo: u64) -> u64 {
 
 #[cold]
 #[inline(never)]
-fn new_log() -> *mut Parts<LEnt> {
-    Box::into_raw(Box::new(Parts::with_wc(NPART, LOG_HINT.load(AO::Relaxed) / NPART * 5 / 4 + 64, true)))
+fn new_log(hint: usize) -> *mut Parts<LEnt> {
+    Box::into_raw(Box::new(Parts::with_wc(NPART, hint / NPART * 5 / 4 + 64, true)))
 }
 
 #[inline(always)]
