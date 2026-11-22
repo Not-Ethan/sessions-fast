@@ -170,6 +170,64 @@ pub fn alloc_arena(bytes: usize) -> *mut u8 {
     p as *mut u8
 }
 
+// ---------------------------------------------------------------- recycled memory
+//
+// Arenas of a finished phase are handed to later consumers instead of being
+// released and faulted in (zeroed) again. Recycled memory holds stale data:
+// only consumers that write everything before they read it may take it
+// (`alloc_arena_dirty`); SS_POISON=1 fills it with 0xA5 when handed out, to
+// prove that. Recycled arenas leave the arena list, so the parallel release
+// of dead memory never drops pages in use.
+
+static POOL: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+pub static POISON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Recycling on (SS_RECYCLE=0: off).
+pub static RECYCLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The arenas labelled with any of `labels` go to the pool (their data is dead).
+pub fn give_back_labels(labels: &[&str]) {
+    if !RECYCLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut lab = LABELS.lock().unwrap();
+    let mut ar = ARENAS.lock().unwrap();
+    let mut pool = POOL.lock().unwrap();
+    lab.retain(|&(a, l, name)| {
+        if labels.contains(&name) {
+            ar.retain(|&(x, _)| x != a);
+            pool.push((a, l));
+            false
+        } else {
+            true
+        }
+    });
+    // largest first: big consumers find a region
+    pool.sort_unstable_by(|x, y| y.1.cmp(&x.1));
+}
+
+/// Memory for a consumer that writes every byte before reading it: from the
+/// pool if a region is large enough (stale contents), else a fresh arena.
+pub fn alloc_arena_dirty(bytes: usize) -> *mut u8 {
+    let need = bytes.max(4096).div_ceil(4096) * 4096;
+    if RECYCLE.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut pool = POOL.lock().unwrap();
+        if let Some(i) = pool.iter().position(|&(_, l)| l >= need) {
+            let (a, l) = pool[i];
+            if l - need >= (2 << 20) {
+                pool[i] = (a + need, l - need);
+            } else {
+                pool.remove(i);
+            }
+            drop(pool);
+            if POISON.load(std::sync::atomic::Ordering::Relaxed) {
+                unsafe { std::ptr::write_bytes(a as *mut u8, 0xA5, need) };
+            }
+            return a as *mut u8;
+        }
+    }
+    alloc_arena(bytes)
+}
+
 /// Experiment (SS_POPW=1): parse arenas are populated for writing in one
 /// call by the thread that owns them (MADV_POPULATE_WRITE, Linux 5.14+)
 /// instead of one fault per page in the hot loop.

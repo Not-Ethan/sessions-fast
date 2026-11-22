@@ -75,13 +75,14 @@ struct Buf<T: Copy> {
 impl<T: Copy> Buf<T> {
     fn new(cap: usize) -> Self {
         let cap = cap.max(64);
-        Buf { ptr: sys::alloc_arena(cap * std::mem::size_of::<T>()) as *mut T, len: 0, cap }
+        // (written before read: recycled memory will do)
+        Buf { ptr: sys::alloc_arena_dirty(cap * std::mem::size_of::<T>()) as *mut T, len: 0, cap }
     }
     #[cold]
     #[inline(never)]
     fn grow(&mut self, need: usize) {
         let cap = (self.cap * 2).max(need);
-        let p = sys::alloc_arena(cap * std::mem::size_of::<T>()) as *mut T;
+        let p = sys::alloc_arena_dirty(cap * std::mem::size_of::<T>()) as *mut T;
         unsafe { std::ptr::copy_nonoverlapping(self.ptr, p, self.len) };
         self.ptr = p;
         self.cap = cap;

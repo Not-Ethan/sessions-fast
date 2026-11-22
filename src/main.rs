@@ -2589,6 +2589,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     fastev::PF2.store(std::env::var("SS_PF2").map_or(true, |v| v != "0"), Ordering::Relaxed);
     sess::SPF.store(std::env::var("SS_SPF").is_ok(), Ordering::Relaxed);
     sys::POPW.store(std::env::var("SS_POPW").is_ok(), Ordering::Relaxed);
+    sys::POISON.store(std::env::var("SS_POISON").is_ok(), Ordering::Relaxed);
+    sys::RECYCLE.store(std::env::var("SS_RECYCLE").map_or(true, |v| v != "0"), Ordering::Relaxed);
     // 128-byte splitters for lines with long IDs unless SS_WIDECUT=0
     fastev::WIDE.store(std::env::var("SS_WIDECUT").map_or(true, |v| v != "0"), Ordering::Relaxed);
     if std::env::var("SS_CLICKCHECK").is_ok() {
@@ -2665,6 +2667,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
                 keys::verify_ev_longs(threads, Some(&multi));
             }
             marks.mark("dedup");
+            // dead now: the dedup records, the long-ID logs (checked), the
+            // link table (persons resolved): later consumers reuse them
+            sys::give_back_labels(&["p.arec", "log", "links"]);
             if memacct {
                 eprintln!("{}", sys::mem_report("after-dedup"));
             }
