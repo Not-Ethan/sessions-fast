@@ -1780,10 +1780,8 @@ fn dedup_b(sb: &[BOut], ctx: &Ctx, lb: LocBits) -> Vec<u64> {
         }
         multi
     });
-    let mut m: Vec<u64> = multis.into_iter().flatten().collect();
-    m.sort_unstable();
-    m.dedup();
-    m
+    // (duplicates are fine: keys::verify_ev_longs builds a set)
+    multis.into_iter().flatten().collect()
 }
 
 // ---------------------------------------------------------------- sessions
