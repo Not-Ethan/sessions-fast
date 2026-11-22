@@ -58,3 +58,14 @@ One session per user at Oct 3 10:00, unless noted.
 | L2 | `u3,u9` and `u9,u2` in one file, `U7,u9` and `u10,u10` in another; events by `u3`, `u2` and `u10` only | Links chain, in either direction and across files; the person is named by the smallest ID even when no event uses it; a self-link changes nothing |
 | L3 | `u1,u2,u3`, `u1,`, `,u3`, `u1,u5"`, an empty line and `u1` (all dropped); `"u4","u1"`, `u4,u1` and `u6,u6` (kept); one event each by `u1` to `u6` | Malformed links and links with an empty side are dropped; quoted, repeated and self-links are fine. A data row equal to the header joins `user_id_a` to `user_id_b`, making an ID with a tab the name of `u4` and `u1` |
 | L4 | `u1,u2`. `k1` for `c_1` by `u2` at 09:00, `k2` for `c_2` by `u1` at 08:00 | A linked ID's click credits the session; the latest across all the person's IDs wins, and both assist |
+
+## Inputs outside the fast pipelines' limits
+
+Legal inputs that the generator never writes; the binary runs them on its general path (`src/general.rs`)
+instead of exiting. The expected rows were written by hand from the rules.
+
+| Case | Input | Catches |
+| --- | --- | --- |
+| G1 | Window Oct 1 to Nov 1 (31 days, over 2^31 ms). `u1`: a view Oct 28 10:00 and a purchase of p1 for 1000 at 10:20, `k1` for `c_1` Oct 27 09:00. `u2`: a view Oct 3 10:00, one at the window end (dropped), `k2` for `c_2` Oct 2 00:00 | Event offsets past 24.8 days; the window end still excludes |
+| G2 | 300 categories (`p1`..`p300` in `cat001`..`cat300`). One session: p1 for 500, p300 for 700, p299 for 300 and 400; `k1` for `c_2` | More than 255 categories; a tie at 700 goes to `cat299` |
+| G3 | 65,600 campaigns (`c_1`..`c_65600`, odd ones `search`). `u1`: `k1` for `c_65599` at 09:00, `k2` for `c_2` at 08:00; `u2`: `k3` for `c_70000` (not in the file) | Campaign indices past 16 bits; an unknown campaign still drops the click |

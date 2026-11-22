@@ -8,6 +8,7 @@ mod parquet;
 mod prof;
 mod cbench;
 mod fastev;
+mod general;
 mod k4;
 #[cfg(test)]
 mod k4test;
@@ -2743,8 +2744,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).unwrap_or_else(|e| fail(&format!("manifest: {}", e)));
     let ws = ts::parse_ts(manifest_value(&manifest, "window_start").as_bytes()).unwrap_or_else(|| fail("bad window_start"));
     let we = ts::parse_ts(manifest_value(&manifest, "window_end").as_bytes()).unwrap_or_else(|| fail("bad window_end"));
-    if we <= ws || we - ws >= (1i64 << 31) {
-        fail("unsupported window length (over 24 days)");
+    // the fast pipelines keep event offsets from window_start below 2^31 ms
+    // (24.8 days); a longer (or empty) window takes the general path
+    if we <= ws || we - ws >= (1i64 << 31) || std::env::var("SS_GENERAL").is_ok() {
+        return general::run(data_dir, out_dir, ws, we, "window length or SS_GENERAL");
     }
     let ptext = read_file(&data_dir.join("products.csv"));
     let prows = table_rows(&ptext);
@@ -2761,7 +2764,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
                     None => {
                         cat_list.push(c);
                         if cat_list.len() > 255 {
-                            fail("more than 255 categories is not supported");
+                            // category ranks are 8 bits in the fast pipelines
+                            return general::run(data_dir, out_dir, ws, we, "more than 255 categories");
                         }
                         (cat_list.len() - 1) as u32
                     }
@@ -2787,7 +2791,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let ctext = read_file(&data_dir.join("campaigns.csv"));
     let crows = table_rows(&ctext);
     if crows.len() >= NONE as usize {
-        fail("too many campaigns");
+        // campaign indices are 16 bits (NONE reserved) in the fast pipelines
+        return general::run(data_dir, out_dir, ws, we, "too many campaigns");
     }
     let centries: Vec<(&[u8], u16)> = crows.iter().enumerate().map(|(i, &(c, _))| (c, i as u16)).collect();
     marks.mark("lookups");
