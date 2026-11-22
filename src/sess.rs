@@ -159,7 +159,6 @@ struct St {
     ev: Buf<SRec>,
     chist: Vec<u32>,
     cl: Buf<Cl>,
-    mixed_e: Vec<SRec>,
     /// persons with at most this many clicks use `attribute_small`
     bf_max: usize,
     /// time-sorted events take the one-scan path (SS_NOSORTED=1: off)
@@ -235,10 +234,10 @@ impl St {
         St {
             hist: Vec::new(),
             cur: Vec::new(),
-            ev: Buf::new(max_ev),
+            // (+1: the spare slot for dead copies)
+            ev: Buf::new(max_ev + 1),
             chist: Vec::new(),
             cl: Buf::new(max_cl),
-            mixed_e: Vec::new(),
             bf_max: crate::env_usize("SS_BF").unwrap_or(16),
             sorted_fast: std::env::var("SS_NOSORTED").is_err(),
 
@@ -327,8 +326,11 @@ impl St {
         self.acc.lap(P_HIST);
         self.cur.clear();
         self.cur.extend_from_slice(&self.hist[..nb + 1]);
-        // every one of the n records is written below (dead ones to bucket nb)
-        self.ev.set_len_for_overwrite(n);
+        let live = self.hist[nb] as usize;
+        // the live records go to their buckets (0 .. live); every dead copy
+        // is written to the one spare slot `live` (bucket nb's cursor does not
+        // advance), so dead copies cost no memory traffic and no branch
+        self.ev.set_len_for_overwrite(live + 1);
         {
             let ev = self.ev.as_mut_slice();
             let cur = &mut self.cur[..nb + 1];
@@ -336,13 +338,14 @@ impl St {
                 for sl in t.get(q) {
                     for r in sl {
                         let b = bucket(r);
-                        // b <= nb < cur.len(); cur[b] < hist[b + 1] <= n = ev.len()
-                        // (same buckets as the histogram over the same records)
+                        let alive = (r.ts != DEAD) as u32;
+                        // b <= nb < cur.len(); for b < nb, cur[b] < hist[b + 1]
+                        // <= live; cur[nb] stays live: always < live + 1 = ev.len()
                         unsafe {
                             let c = *cur.get_unchecked(b) as usize;
                             debug_assert!(c < ev.len());
                             *ev.get_unchecked_mut(c) = *r;
-                            *cur.get_unchecked_mut(b) = c as u32 + 1;
+                            *cur.get_unchecked_mut(b) = c as u32 + alive;
                         }
                     }
                 }
@@ -384,14 +387,14 @@ impl St {
         let (clp, cln) = (self.cl.ptr, self.cl.len);
         // the buffers are not touched through `self` again until the next
         // partition; each bucket's click range is handed out once
-        let ev: &[SRec] = unsafe { std::slice::from_raw_parts(evp, evn) };
+        let ev: &mut [SRec] = unsafe { std::slice::from_raw_parts_mut(evp, evn) };
         let cl: &mut [Cl] = unsafe { std::slice::from_raw_parts_mut(clp, cln) };
         for b in 0..nb {
             let (e0, e1) = (self.hist[b] as usize, self.hist[b + 1] as usize);
             if e0 == e1 {
                 continue;
             }
-            let es = &ev[e0..e1];
+            let es = &mut ev[e0..e1];
             let cs = &mut cl[self.chist[b] as usize..self.chist[b + 1] as usize];
             let p0 = es[0].person;
             if es.iter().all(|r| r.person == p0) {
@@ -405,11 +408,10 @@ impl St {
     /// A bucket holding several persons: sort events and clicks by person.
     #[cold]
     #[inline(never)]
-    fn mixed(&mut self, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
+    fn mixed(&mut self, es: &mut [SRec], cs: &mut [Cl], ctx: &Ctx) {
         self.acc.count(C_MIXED, 1);
-        let mut me = std::mem::take(&mut self.mixed_e);
-        me.clear();
-        me.extend_from_slice(es);
+        // the bucket's records are this thread's own copies: sorted in place
+        let me = es;
         me.sort_unstable_by_key(|r| r.person);
         cs.sort_unstable_by_key(|c| c.person);
         let mut i = 0;
@@ -431,7 +433,6 @@ impl St {
             i = k;
             j = l;
         }
-        self.mixed_e = me;
     }
 
     /// Campaign `c` enters the window while session `si` is being set up.
