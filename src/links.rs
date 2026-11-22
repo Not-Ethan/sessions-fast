@@ -36,6 +36,9 @@ pub struct LinkTable {
 }
 
 pub const FINALIZE_BLOCK: usize = 1 << 16;
+
+/// SS_SCALARPROBE=1: the scalar group probe in AVX2 builds too (A/B).
+pub static SCALAR_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const IDX_BLOCK: u32 = 4096;
 
 fn arena<T>(n: usize) -> &'static [T] {
@@ -342,6 +345,33 @@ impl LinkTable {
         }
         if self.amask != !3 {
             return self.probe_slots(k, h);
+        }
+        // AVX2 builds (x86-64-v3): the 4-slot group in two ymm registers,
+        // one compare per register against the key and against 0, key lanes
+        // only (same rule as below: the first matching key of the first group
+        // holding a match or an empty slot)
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            if !SCALAR_PROBE.load(Ordering::Relaxed) {
+                let base = self.slots.as_ptr() as *const u64;
+                let kk = _mm256_set1_epi64x(k as i64);
+                let z = _mm256_setzero_si256();
+                let mut i = self.start(h);
+                loop {
+                    // [key0 val0 key1 val1], [key2 val2 key3 val3]
+                    let g = base.add(2 * i) as *const __m256i;
+                    let a = _mm256_loadu_si256(g);
+                    let b = _mm256_loadu_si256(g.add(1));
+                    let m = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, kk))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, kk))) << 4)) as u32 & 0x55;
+                    let e = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, z))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, z))) << 4)) as u32 & 0x55;
+                    if m | e != 0 {
+                        // bit 2j of m: slot j holds the key; its value follows it
+                        return if m != 0 { Some(*base.add(2 * i + m.trailing_zeros() as usize + 1)) } else { None };
+                    }
+                    i = (i + 4) & self.mask;
+                }
+            }
         }
         let mut i = self.start(h);
         loop {
