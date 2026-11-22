@@ -13,6 +13,9 @@ Updated: Sun 07:05 ET (local clock).
   (64/64 v3 tests, dev5/e23/e60 MATCH); vs rc1 ABBA e60 1944.0 vs 1958.7 (-14.6, 12 samples), e23 716.5
   vs 714.8 (+1.7 noise, 20 samples); inside one image LINKPREF on vs off: e60 -14.8, e23 -13.
 - Finalize prefetch d659217 reverted (no effect).
+- Link prefix one-run e60 sub-phases (x20): LINKPREF on union 49.3 ms / parse 26.9; off union 57.9 / parse 25.7.
+- Extra checks on x20 (rc1 + prefix): dev5 LONGBITS=4/6, e23 LONGBITS=6 (3 reruns each), dev5/e23 NOEXEC,
+  dev5 NCPU=1: all MATCH.
 - The public mirror of the top cluster carries an opt-out notice on every source file: not read, not used,
   not credited (orchestrator withdrew the instruction).
 
