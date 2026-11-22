@@ -904,6 +904,7 @@ pub fn sessions2(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: 
 /// Merges the threads' accumulators (into the first one's arrays, already
 /// resident) and writes campaign_daily from huge-page column buffers.
 pub fn write_campaign_daily2(path: &Path, outs: &mut [Out2], ctx: &Ctx) {
+    let t0 = std::time::Instant::now();
     let ndays = ctx.ndays;
     let ncamp = ctx.ncamp;
     let nc1 = ncamp + 1;
@@ -918,6 +919,7 @@ pub fn write_campaign_daily2(path: &Path, outs: &mut [Out2], ctx: &Ctx) {
             *a += *b;
         }
     }
+    let t1 = t0.elapsed();
     let est = nc1 * ndays;
     let mut ids: Buf<u8> = Buf::new(est * 16);
     let mut chs: Buf<u8> = Buf::new(est * 24);
@@ -959,5 +961,10 @@ pub fn write_campaign_daily2(path: &Path, outs: &mut [Out2], ctx: &Ctx) {
         Raw::Req { name: "revenue_cents", ty: parquet::T_INT64, conv: None, body: parquet::le_bytes(rv.as_slice()) },
         Raw::Req { name: "assisted_sessions", ty: parquet::T_INT64, conv: None, body: parquet::le_bytes(av.as_slice()) },
     ];
+    let t2 = t0.elapsed();
     parquet::write_raw(path, days.len, &cols).unwrap_or_else(|e| fail(&format!("{}: {}", path.display(), e)));
+    if std::env::var_os("SS_VERBOSE").is_some() {
+        let t3 = t0.elapsed();
+        eprintln!("campaign_daily: merge {:.2} ms, rows {:.2} ms, write {:.2} ms ({} rows)", t1.as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3, (t3 - t2).as_secs_f64() * 1e3, days.len);
+    }
 }
