@@ -18,13 +18,16 @@
 //!   `HH:MM:SS` + offset decoded in one 128-bit vector; F3 13 digits in one
 //!   vector. Any other shape, or a date not in the table, goes to
 //!   `ctx.tsp.parse` (the old routine).
-//! * campaign: `ctx.campaigns.get_wide` (the old routine).
+//! * campaign: an exact (bytes, length) hash table of the campaign IDs
+//!   (`CTab`, built from `ctx.campaigns.get` itself; IDs are opaque bytes).
 //! * both IDs packed at once, one per 128-bit lane (`pack2`, the same
 //!   operations as `keys::pack_wide`). A user ID that does not pack goes to
 //!   `keys::key_of`, a click ID that does not pack to `keys::click_key`,
 //!   only for valid lines, in line order (their side effects as before).
-//! * person: the same 16-deep FIFO ring (prefetch at parse, `person_hash`
-//!   16 lines later), so records reach the sink in line order, as before.
+//! * person: the same 16-deep FIFO ring (prefetch at parse, lookup 16
+//!   valid lines later), so records reach the sink in line order, as
+//!   before; the lookup is `LinkTable::person_hash` with the 4-slot group
+//!   compared in two ymm registers (`Probe`, through `LinkTable::view`).
 //!
 //! Every line the kernel does not cut (any other shape, a line within
 //! MARGIN bytes of the end of the buffer) goes through the general scanner
@@ -104,6 +107,69 @@ pub struct K5 {
     ws: i64,
     we: i64,
     tab: DTab,
+    camp: CTab,
+}
+
+/// Campaign IDs of at most 16 bytes as exact (bytes, length) -> index:
+/// every ID of ctx.camp_ids with its `ctx.campaigns.get` value. A string
+/// that is not one of them gets NONE from `ctx.campaigns.get` too (map
+/// mode: exact keys; direct mode: prefix + canonical decimal, a unique
+/// spelling), so a miss here is NONE. IDs are compared as opaque bytes.
+struct CTab {
+    slots: Vec<CSlot>,
+    shift: u32,
+    mask: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct CSlot {
+    w0: u64,
+    w1: u64,
+    /// length; u32::MAX for an empty slot
+    len: u32,
+    v: u32,
+}
+
+#[inline(always)]
+fn chash(w0: u64, w1: u64, len: usize) -> u64 {
+    (w0 ^ w1.rotate_left(31) ^ ((len as u64) << 58)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+impl CTab {
+    fn new(ctx: &Ctx) -> CTab {
+        let n = ctx.camp_ids.len();
+        let size = (n * 2).next_power_of_two().max(16);
+        let bits = size.trailing_zeros();
+        let mut t = CTab { slots: vec![CSlot { w0: 0, w1: 0, len: u32::MAX, v: 0 }; size], shift: 64 - bits, mask: size - 1 };
+        for id in &ctx.camp_ids {
+            if id.len() > 16 {
+                continue;
+            }
+            let v = ctx.campaigns.get(id);
+            if v == NONE {
+                continue;
+            }
+            let mut b = [0u8; 16];
+            b[..id.len()].copy_from_slice(id);
+            let w0 = u64::from_le_bytes(b[..8].try_into().unwrap());
+            let w1 = u64::from_le_bytes(b[8..].try_into().unwrap());
+            let mut i = (chash(w0, w1, id.len()) >> t.shift) as usize;
+            loop {
+                let e = &mut t.slots[i];
+                if e.len == u32::MAX {
+                    *e = CSlot { w0, w1, len: id.len() as u32, v: v as u32 };
+                    break;
+                }
+                if e.w0 == w0 && e.w1 == w1 && e.len as usize == id.len() {
+                    assert_eq!(e.v, v as u32, "k5: one campaign ID, two indices");
+                    break;
+                }
+                i = (i + 1) & t.mask;
+            }
+        }
+        t
+    }
 }
 
 static PARAMS: Mutex<Vec<(usize, &'static K5)>> = Mutex::new(Vec::new());
@@ -129,7 +195,7 @@ fn build(ctx: &Ctx) -> K5 {
         assert!(t.0[k].dd == 0xFFFF_FFFF, "k5: date slot collision");
         t.0[k] = DEnt { pat: u64::from_le_bytes(tb[..8].try_into().unwrap()), dd: u32::from_le_bytes([tb[8], tb[9], tb[10], 0]), _p: 0, ms, _q: 0 };
     }
-    K5 { ws: ctx.ws, we: ctx.we, tab: t }
+    K5 { ws: ctx.ws, we: ctx.we, tab: t, camp: CTab::new(ctx) }
 }
 
 /// The (cached) parameters for `ctx` (keyed by its window and the address
@@ -357,6 +423,81 @@ mod imp {
         (key(a01, a2, na), oka, key(b01, b2, nb), okb)
     }
 
+    /// `ctx.campaigns.get` of the field at q (n bytes, 16 readable).
+    #[inline(always)]
+    unsafe fn campaign(k: &K5, ctx: &Ctx, q: *const u8, n: usize) -> u16 {
+        if n > 16 {
+            return ctx.campaigns.get(std::slice::from_raw_parts(q, n));
+        }
+        let w0 = _bzhi_u64(rd64(q), (n * 8) as u32);
+        let w1 = if n > 8 { _bzhi_u64(rd64(q.add(8)), (n * 8 - 64) as u32) } else { 0 };
+        let t = &k.camp;
+        let mut i = (chash(w0, w1, n) >> t.shift) as usize;
+        loop {
+            let e = t.slots.get_unchecked(i);
+            if (e.w0 == w0) & (e.w1 == w1) & (e.len as usize == n) {
+                return e.v as u16;
+            }
+            if e.len == u32::MAX {
+                return NONE;
+            }
+            i = (i + 1) & t.mask;
+        }
+    }
+
+    /// The link table through its view: `LinkTable::person_hash` with the
+    /// 4-slot group compared in two ymm registers (same probe sequence,
+    /// same rule: the first matching key of the first group holding a match
+    /// or an empty slot). Usable by the event path as well (call from an
+    /// AVX2 `#[target_feature]` function so that it inlines).
+    pub(crate) struct Probe<'a> {
+        lt: &'a LinkTable,
+        slots: *const u64,
+        mask: usize,
+        amask: usize,
+        mixed: bool,
+        own: bool,
+    }
+
+    impl<'a> Probe<'a> {
+        pub(crate) fn new(lt: &'a LinkTable) -> Probe<'a> {
+            let (slots, mask, amask, mixed) = lt.view();
+            Probe { lt, slots, mask, amask, mixed, own: mask != 0 && amask == !3 }
+        }
+        #[inline(always)]
+        pub(crate) unsafe fn prefetch(&self, h: u64) {
+            if self.own {
+                crate::prefetch(self.slots.wrapping_add(2 * (h as usize & self.mask & self.amask)) as *const u8);
+            } else {
+                self.lt.prefetch_h(h);
+            }
+        }
+        #[inline(always)]
+        pub(crate) unsafe fn person_hash(&self, k: u64, h: u64) -> u64 {
+            if !self.own {
+                return self.lt.person_hash(k, h);
+            }
+            let kk = _mm256_set1_epi64x(k as i64);
+            let z = _mm256_setzero_si256();
+            let mut i = h as usize & self.mask & self.amask;
+            loop {
+                let g = self.slots.add(2 * i) as *const __m256i;
+                let a = _mm256_loadu_si256(g);
+                let b = _mm256_loadu_si256(g.add(1));
+                let m = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, kk))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, kk))) << 4)) as u32 & 0x55;
+                let e = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, z))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, z))) << 4)) as u32 & 0x55;
+                if m != 0 {
+                    let v = *self.slots.add(2 * i + m.trailing_zeros() as usize + 1);
+                    return if self.mixed { v } else { keys::mix(v) };
+                }
+                if e != 0 {
+                    return h;
+                }
+                i = (i + 4) & self.mask;
+            }
+        }
+    }
+
     /// A valid click before its person lookup.
     #[derive(Clone, Copy, Default)]
     struct Ent {
@@ -375,13 +516,13 @@ mod imp {
 
     impl Ring {
         #[inline(always)]
-        fn emit<C: CSink>(lt: &LinkTable, ps_shift: u32, c: &mut C, e: Ent) {
+        unsafe fn emit<C: CSink>(lt: &Probe, ps_shift: u32, c: &mut C, e: Ent) {
             let person = lt.person_hash(e.user, e.h);
             c.push_click((person >> ps_shift) as usize, CRec { person, ck: e.ck, ts: e.ts, camp: e.camp, _pad: 0 });
         }
         #[inline(always)]
-        fn push<C: CSink>(&mut self, lt: &LinkTable, ps_shift: u32, c: &mut C, e: Ent) {
-            lt.prefetch_h(e.h);
+        unsafe fn push<C: CSink>(&mut self, lt: &Probe, ps_shift: u32, c: &mut C, e: Ent) {
+            lt.prefetch(e.h);
             let i = self.n % RING;
             if self.n >= RING {
                 Self::emit(lt, ps_shift, c, self.e[i]);
@@ -390,7 +531,7 @@ mod imp {
             self.n += 1;
         }
         #[inline(always)]
-        fn finish<C: CSink>(&mut self, lt: &LinkTable, ps_shift: u32, c: &mut C) {
+        unsafe fn finish<C: CSink>(&mut self, lt: &Probe, ps_shift: u32, c: &mut C) {
             for k in self.n.saturating_sub(RING)..self.n {
                 Self::emit(lt, ps_shift, c, self.e[k % RING]);
             }
@@ -401,7 +542,7 @@ mod imp {
     /// Per-task constants.
     struct Env<'a> {
         ctx: &'a Ctx,
-        lt: &'a LinkTable,
+        lt: Probe<'a>,
         k: &'static K5,
         file: u32,
         base: *const u8,
@@ -429,7 +570,7 @@ mod imp {
         let user = keys::key_of(f[1]);
         let h = keys::mix(user);
         let ck = keys::click_key(env.file, env.base, f[0], false);
-        ring.push(env.lt, env.ps_shift, c, Ent { user, h, ck, ts: (t - env.cws) as u32, camp: camp as u32 });
+        unsafe { ring.push(&env.lt, env.ps_shift, c, Ent { user, h, ck, ts: (t - env.cws) as u32, camp: camp as u32 }) };
     }
 
     /// Lines b[from..to) through the general scanner and `slow_fields`.
@@ -454,7 +595,7 @@ mod imp {
         if (t < env.cws) | (t >= env.we) {
             return;
         }
-        let camp = ctx.campaigns.get_wide(std::slice::from_raw_parts(p.add(s[2]), l[2]));
+        let camp = campaign(env.k, ctx, p.add(s[2]), l[2]);
         if camp == NONE {
             return;
         }
@@ -462,7 +603,7 @@ mod imp {
         let user = if oku { ku } else { user_slow(std::slice::from_raw_parts(p.add(s[1]), l[1])) };
         let ck = if okc { kc } else { keys::click_key(env.file, env.base, std::slice::from_raw_parts(p.add(s[0]), l[0]), true) };
         let h = keys::mix(user);
-        ring.push(env.lt, env.ps_shift, c, Ent { user, h, ck, ts: (t - env.cws) as u32, camp: camp as u32 });
+        ring.push(&env.lt, env.ps_shift, c, Ent { user, h, ck, ts: (t - env.cws) as u32, camp: camp as u32 });
     }
 
     /// The key of a user ID that does not pack (long or interned; logs).
@@ -478,7 +619,7 @@ mod imp {
         assert!(task.start <= task.end && task.end <= b.len());
         let env = Env {
             ctx,
-            lt,
+            lt: Probe::new(lt),
             k: params(ctx),
             file: task.file,
             base: b.as_ptr(),
@@ -557,9 +698,13 @@ mod imp {
         if off < task.end {
             slow_range(&env, &mut ring, c, b, off, task.end);
         }
-        ring.finish(lt, env.ps_shift, c);
+        ring.finish(&env.lt, env.ps_shift, c);
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_imports)]
+pub(crate) use imp::Probe;
 
 /// Whether `main::click_task_avx2` should take k5 for this task.
 #[inline(always)]

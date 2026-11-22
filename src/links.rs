@@ -410,6 +410,14 @@ impl LinkTable {
         }
     }
 
+    /// Read-only view for a kernel's own group probe (k5.rs): (slot array
+    /// base as [key, val] u64 pairs, mask, amask, mixed); mask 0 when empty.
+    /// Valid after finalize; same probe rule as `probe`.
+    #[inline(always)]
+    pub fn view(&self) -> (*const u64, usize, usize, bool) {
+        (self.slots.as_ptr() as *const u64, if self.slots.is_empty() { 0 } else { self.mask }, self.amask, self.mixed)
+    }
+
     #[inline(always)]
     pub fn prefetch_h(&self, h: u64) {
         if self.slots.is_empty() {
