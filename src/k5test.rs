@@ -230,18 +230,7 @@ mod x86 {
             let b = g.bytes();
             for &c in chunks {
                 for t in chunk_tasks(b, c) {
-                    let (mut a, mut k) = run_one(ctx, &lt, b, t);
-                    // keys::tests change the global long-ID settings
-                    // (LONG_BITS, LONG_OFF) while they run in parallel with
-                    // these tests, which changes long user keys between
-                    // the two runs: a difference must persist over reruns
-                    for _ in 0..3 {
-                        if a == k {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        (a, k) = run_one(ctx, &lt, b, t);
-                    }
+                    let (a, k) = run_one(ctx, &lt, b, t);
                     if a != k {
                         let mut rep = format!(
                             "k5test {} [{}, chunk {}]: MISMATCH in task [{}, {}) of a {}-byte buffer (window {}..{})\n  old: {}\n  k5:  {}\n",
@@ -432,6 +421,8 @@ mod x86 {
         if !have_cpu() {
             return;
         }
+        // keys::tests change the global long-ID settings: hold their lock
+        let _g = crate::keys::LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let mut r = Rng::new(seed0());
         let mut tot = 0;
         for (ei, ctx) in envs().iter().enumerate() {
@@ -451,6 +442,8 @@ mod x86 {
         if !have_cpu() {
             return;
         }
+        // keys::tests change the global long-ID settings: hold their lock
+        let _g = crate::keys::LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let mut tot = 0;
         for (ei, ctx) in envs().iter().enumerate() {
             let cws = ctx.ws - 7 * DAY;
@@ -474,6 +467,8 @@ mod x86 {
         if !have_cpu() {
             return;
         }
+        // keys::tests change the global long-ID settings: hold their lock
+        let _g = crate::keys::LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let big = "u".repeat(5000);
         let long = format!("u{}", "a".repeat(32));
         let mut lines: Vec<String> = vec![
@@ -529,6 +524,8 @@ mod x86 {
         if !have_cpu() {
             return;
         }
+        // keys::tests change the global long-ID settings: hold their lock
+        let _g = crate::keys::LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let mut r = Rng::new(seed0() ^ 77);
         let mut tot = 0;
         for (ei, ctx) in envs().iter().enumerate() {
@@ -556,6 +553,8 @@ mod x86 {
         if !have_cpu() {
             return;
         }
+        // keys::tests change the global long-ID settings: hold their lock
+        let _g = crate::keys::LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let mut r = Rng::new(seed0() ^ 5);
         let al = b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
         for _ in 0..2_000_000 {
@@ -589,6 +588,8 @@ mod x86 {
         if !have_cpu() {
             return;
         }
+        // keys::tests change the global long-ID settings: hold their lock
+        let _g = crate::keys::LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let mut r = Rng::new(seed0() ^ 99);
         let mut tot = 0;
         for (ei, ctx) in envs().iter().enumerate() {
@@ -609,6 +610,8 @@ mod x86 {
         if !have_cpu() {
             return;
         }
+        // keys::tests change the global long-ID settings: hold their lock
+        let _g = crate::keys::LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
         #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
         unsafe fn ph(p: &k5::Probe, k: u64, h: u64) -> u64 {
             p.person_hash(k, h)
@@ -654,6 +657,8 @@ mod x86 {
         if !have_cpu() {
             return;
         }
+        // keys::tests change the global long-ID settings: hold their lock
+        let _g = crate::keys::LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
         #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
         unsafe fn pv(t: &LinkTable, k: u64, h: u64) -> Option<u64> {
             let (slots, mask, amask, _) = t.view();

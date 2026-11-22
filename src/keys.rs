@@ -1069,7 +1069,7 @@ pub fn unmix(h: u64) -> u64 {
 }
 
 /// Tests that change or depend on the global long-key state (seed, bits,
-/// interner mode) hold this: one at a time (keys tests, k4test).
+/// interner mode) hold this: one at a time (keys tests, k4test, k5test).
 #[cfg(test)]
 pub(crate) static LONG_TEST: Mutex<()> = Mutex::new(());
 
