@@ -38,6 +38,9 @@ const LATE: i64 = 86_400_000;
 /// k4 (fused event-line kernel, k4.rs) when SS_K4 is not set: off. It is
 /// exact (SS_K4CHECK, k4test) but measured at most 0.5% faster on e23.
 const K4_DEFAULT: bool = true;
+/// k6 (chunk-first event-line splitter, k6.rs; decode from k4.rs) when SS_K6
+/// is not set: off. Exact (SS_K6CHECK, k6test); it takes precedence over k4.
+const K6_DEFAULT: bool = false;
 
 #[inline(always)]
 pub fn prefetch(p: *const u8) {
@@ -3131,7 +3134,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     k4::PACK2.store(std::env::var("SS_K4PACK2").map_or(true, |v| v != "0"), Ordering::Relaxed);
     k4::SPLIT_B.store(std::env::var("SS_K4SHAPEB").map_or(true, |v| v != "0"), Ordering::Relaxed);
     // event lines through the chunk-first splitter (k6.rs; AVX2 only) with SS_K6=1
-    k6::ON.store(ctx.avx2 && std::env::var("SS_K6").map_or(false, |v| v != "0"), Ordering::Relaxed);
+    k6::ON.store(ctx.avx2 && std::env::var("SS_K6").map_or(K6_DEFAULT, |v| v != "0"), Ordering::Relaxed);
     if std::env::var("SS_K6CHECK").is_ok() {
         k6::COUNT.store(true, Ordering::Relaxed);
         k6::check(&events_in, &ctx);
