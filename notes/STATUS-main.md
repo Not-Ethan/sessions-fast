@@ -1,17 +1,15 @@
 # STATUS of the main engineer (branch ss-opt4, worktree .claude/worktrees/opt4)
 
-Updated: Sun 06:00 ET.
+Updated: Sun 06:20 ET.
 
 ## Now
 - Tags: m18 = 1651a22 (0.9154 s), m19 = c870b9c (0.8278 s), m20 = 0ed00d5 (0.7904 s).
-- Decode-table single probe (6a871fb) REVERTED (6c9027d): e23 -5.8 ms (20 samples) but e60 +18.5 (6).
-- Deferred click resolution e20ceef (SS_CDEFER=1, off by default): click tasks against an empty link
-  table (person = mix(user)), per-thread buffer in parse order, one prefetched resolve pass after the
-  thread's last task into the same Parts<CRec>. SS_CDEFERCHECK=1 compares every record both ways.
-  sess4.sh on ss-bench: image x14, checks on dev5/e23/e60 (v3, NOEXEC, K5=0), timing x14 vs CDEFER=1.
-- Record wanted from the click LINE decoder (agreed with the orchestrator): per valid click
-  {user key u64, mix(user key) u64, click key u64 (keys::click_key), ts - (window_start - 7 days) u32,
-  campaign index u32} = 32 bytes, appended in input order to a per-thread buffer, no person lookup.
+- m21 candidate = 86d13ad: m20 + b1f1c6a (input release off by default; SS_RELEASE=1) + e20ceef/c5f6e1a
+  (click deferral switches, off) + c7874ab (#12) + a842591 (row 3) + 32cf0ef (row 6, new long-ID hash) +
+  86d13ad (k4-v2f). On ss-bench: sess5 (x15 = 32cf0ef: checks + mirrored timing m20 | x15 | CDEFER=2 |
+  RELEASE=1), then sess6 builds x16 = 86d13ad and runs ~/xgate21.sh x16 (log ~/xgate_x16.log).
+- Click deferral SS_CDEFER=1 REJECTED: exact (records identical on dev5/e23/e60) but e60 +27.7 ms,
+  e23 +11.3 ms (fresh ~490 MB buffer at e60). SS_CDEFER=2 (512-click batches) being timed.
 - The public mirror of the top cluster carries an opt-out notice on every source file: not read, not used,
   not credited (orchestrator withdrew the instruction).
 
@@ -54,6 +52,11 @@ Updated: Sun 06:00 ET.
   e23 all within 2.5 ms.
 
 - Decode-table single probe (x13 vs m20): e23 762.7 vs 768.5 (20 samples), e60 2102.2 vs 2083.7 (6): reverted.
+
+- Click deferral (x14): e60 x14 2081.2 vs CDEFER=1 2108.9 (8 samples); e23 760.0 vs 771.3 (12).
+- Record wanted from the click LINE decoder: per valid click {user key u64, mix(user key) u64, click key
+  u64 (keys::click_key), ts - (window_start - 7 days) u32, campaign index u32} = 32 bytes, appended in
+  input order to a per-thread buffer, no person lookup.
 
 ## Known slow-but-exact paths (do not "fix" the order)
 - Click IDs that do not pack are references (file, length, offset) into the click file mapping. The
