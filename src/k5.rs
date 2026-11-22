@@ -261,15 +261,20 @@ mod imp {
         x.trailing_zeros() as usize
     }
 
-    /// `fastev::window` (see there): (violation bits, content starts, content ends).
+    /// `fastev::window` in the shorter form (k4's `window_r`): with qr = q & r and
+    /// qs = qr & fs the quoted starts, the quotes in r must be exactly qs and
+    /// the closing quotes cl, so bad = (qr & !fs) ^ cl; quoted starts are
+    /// never adjacent, nor are closing quotes: cs = fs ^ (qs * 3), ce = d ^
+    /// (cl * 3). Same bad == 0 and the same starts / ends inside r.
     #[inline(always)]
-    fn window(d: u64, q: u64, r: u64) -> (u64, u64, u64) {
+    fn window_r(d: u64, q: u64, r: u64) -> (u64, u64, u64) {
         let fs = (d << 1) | 1;
-        let qs = q & fs & r;
+        let qr = q & r;
+        let qs = qr & fs;
         let cl = ((!d).wrapping_add(qs) & d) >> 1;
-        let bad = ((q ^ (qs | cl)) | (qs & cl)) & r;
-        let cs = (fs & !q) | (qs << 1);
-        let ce = (d & !(cl << 1)) | cl;
+        let bad = (qr & !fs) ^ cl;
+        let cs = fs ^ qs.wrapping_mul(3);
+        let ce = d ^ cl.wrapping_mul(3);
         (bad, cs, ce)
     }
 
@@ -319,10 +324,12 @@ mod imp {
     }
 
     /// 13 digits at q: (value, nonzero unless all 13 bytes are digits).
-    /// (k4's `f3_13`.) Reads q..q+16.
+    /// (k4's `f3_13`.) Reads q-3..q+13: the timestamp is the fourth field,
+    /// so it starts at byte 3 or later of the line.
     #[inline(always)]
     unsafe fn f3_13(q: *const u8) -> (u64, u32) {
-        let v = _mm_slli_si128::<3>(_mm_loadu_si128(q as *const __m128i));
+        // lanes 3..16 = q[0..13] (lanes 0..3 = q[-3..0], masked out below)
+        let v = _mm_loadu_si128(q.sub(3) as *const __m128i);
         let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
         let ok = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) as u32;
         let dz = _mm_and_si128(d, _mm_setr_epi8(0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
@@ -345,7 +352,8 @@ mod imp {
         } else if (n == 20) | (n == 25) {
             let a = rd64(q);
             let d4 = rd32(q.add(8));
-            let e = k.tab.0.get_unchecked(dslot(d4));
+            // dslot(d4) in one instruction: bits 0, 1 and 8..12 in order
+            let e = k.tab.0.get_unchecked(_pext_u32(d4, 0x0F03) as usize);
             let dm = (a ^ e.pat) | ((d4 & 0xFF_FFFF) ^ e.dd) as u64;
             let (sec, omin, okm, rm) = tvec1(q);
             let b19 = *q.add(19);
@@ -410,17 +418,17 @@ mod imp {
         let codes = _mm256_and_si256(_mm256_add_epi8(_mm256_add_epi8(v, off), us), inlen);
         let t = _mm256_maddubs_epi16(codes, _mm256_set1_epi16(0x0140));
         let u = _mm256_madd_epi16(t, _mm256_set1_epi32(0x0001_1000));
-        let ul = _mm256_castsi256_si128(u);
-        let uh = _mm256_extracti128_si256::<1>(u);
-        let a01 = _mm_cvtsi128_si64(ul) as u64;
-        let a2 = _mm_extract_epi32::<2>(ul) as u32 as u64;
-        let b01 = _mm_cvtsi128_si64(uh) as u64;
-        let b2 = _mm_extract_epi32::<2>(uh) as u32 as u64;
-        let key = |l01: u64, l2: u64, n: usize| ((((l01 & 0xFFFF_FFFF) << 36) | ((l01 >> 32) << 12) | (l2 >> 12)) << 4) | n as u64;
+        // per lane, dwords [l0, l1, l2, l3]; the key of pack_wide is
+        // l0 << 40 | l1 << 16 | ((l2 >> 12) << 4) | n: key bytes 0..8 are
+        // l2 bytes 1, 2, l1 bytes 0..3, l0 bytes 0..3 (one byte shuffle), key
+        // bits 0..4 then hold l2 bits 8..12, replaced by n (k4's pack2)
+        let kv = _mm256_shuffle_epi8(u, _mm256_setr_epi8(9, 10, 4, 5, 6, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, 9, 10, 4, 5, 6, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1));
+        let ka = (_mm_cvtsi128_si64(_mm256_castsi256_si128(kv)) as u64 & !0xF) | na as u64;
+        let kb = (_mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(kv)) as u64 & !0xF) | nb as u64;
         let inv = _mm256_movemask_epi8(invalid) as u32;
         let oka = ((inv & 0xFFFF) == 0) & (na.wrapping_sub(1) < 10);
         let okb = ((inv >> 16) == 0) & (nb.wrapping_sub(1) < 10);
-        (key(a01, a2, na), oka, key(b01, b2, nb), okb)
+        (ka, oka, kb, okb)
     }
 
     /// `ctx.campaigns.get` of the field at q (n bytes, 16 readable).
@@ -652,13 +660,13 @@ mod imp {
         let base = b.as_ptr();
         let lim = b.len().saturating_sub(MARGIN);
         let pf = fastev::PF_DIST.load(Ordering::Relaxed);
-        let pf_lim = (base as usize + b.len()).saturating_sub(64);
         let mut off = task.start;
         if b.len() >= MARGIN {
             while off < task.end && off <= lim {
                 let p = base.add(off);
                 if pf != 0 {
-                    crate::prefetch((p as usize + pf).min(pf_lim) as *const u8);
+                    // a prefetch never faults: no clamp (wrapping address, never dereferenced)
+                    crate::prefetch(p.wrapping_add(pf));
                 }
                 let (c0, n0, q0) = masks64(p);
                 let d = c0 | n0;
@@ -666,7 +674,7 @@ mod imp {
                 if d3 != 0 {
                     // the line fits the 64-byte window
                     let r = upto(d3);
-                    let (bad, cs, ce) = window(d, q0, r);
+                    let (bad, cs, ce) = window_r(d, q0, r);
                     let last = d3 & d3.wrapping_neg();
                     let nl = (n0 ^ last) & r;
                     if (bad | nl) == 0 {
