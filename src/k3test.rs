@@ -41,8 +41,9 @@ mod x86 {
     struct Rng(u64);
 
     impl Rng {
+        /// SS_K3TEST_SEED=k (default 0) moves every test to other seeds.
         fn new(seed: u64) -> Rng {
-            Rng(seed ^ 0x2545_F491_4F6C_DD1D)
+            Rng(seed ^ 0x2545_F491_4F6C_DD1D ^ seed0().wrapping_mul(0x9E37_79B9_7F4A_7C15))
         }
         fn next(&mut self) -> u64 {
             self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -64,6 +65,16 @@ mod x86 {
         fn pick<'a, T>(&mut self, v: &'a [T]) -> &'a T {
             &v[self.below(v.len() as u64) as usize]
         }
+    }
+
+    fn seed0() -> u64 {
+        std::env::var("SS_K3TEST_SEED").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    }
+
+    /// SS_K3TEST_SCALE=k (default 1) multiplies the number of fuzzed lines
+    /// (mutations, combos) for a deeper search.
+    fn scale() -> usize {
+        std::env::var("SS_K3TEST_SCALE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1usize).max(1)
     }
 
     // ------------------------------------------------------------ environment
@@ -1279,7 +1290,7 @@ mod x86 {
         for (k, e) in [env_default(), env_small_buckets()].iter().enumerate() {
             let mut g = Gen::new(e, 41 + k as u64);
             let mut r = Rng::new(141 + k as u64);
-            let n = if k == 0 { 600_000 } else { 150_000 };
+            let n = scale() * if k == 0 { 600_000 } else { 150_000 };
             let mut lines = Vec::with_capacity(n);
             while lines.len() < n {
                 let f = g.ev();
@@ -1299,7 +1310,7 @@ mod x86 {
         for (k, e) in [env_default(), env_small_buckets(), env_at("2028-02-26T00:00:00Z", 5, 1 << 20, 1 << 14, 16, false)].iter().enumerate() {
             let mut g = Gen::new(e, 241 + k as u64);
             let mut r = Rng::new(341 + k as u64);
-            let n = if k == 0 { 400_000 } else { 100_000 };
+            let n = scale() * if k == 0 { 400_000 } else { 100_000 };
             let mut lines = Vec::with_capacity(n);
             while lines.len() < n {
                 let mut f = g.ev();
@@ -1322,7 +1333,7 @@ mod x86 {
         for (k, e) in [env_default(), env_small_buckets()].iter().enumerate() {
             let mut g = Gen::new(e, 251 + k as u64);
             let mut r = Rng::new(351 + k as u64);
-            let n = if k == 0 { 300_000 } else { 100_000 };
+            let n = scale() * if k == 0 { 300_000 } else { 100_000 };
             let mut lines = Vec::with_capacity(n);
             while lines.len() < n {
                 let f = g.cl();
@@ -1400,7 +1411,7 @@ mod x86 {
             return;
         }
         for (k, e) in [env_default(), env_small_buckets(), env_big()].iter().enumerate() {
-            let lines = combo_lines(e, Kind::Ev, 401 + k as u64, if k == 0 { 300_000 } else { 100_000 });
+            let lines = combo_lines(e, Kind::Ev, 401 + k as u64, scale() * if k == 0 { 300_000 } else { 100_000 });
             let chunks: &[usize] = if k == 2 { &[4096, 1 << 40] } else { &[1, 4096, 1 << 40] };
             check_lines(e, Kind::Ev, &lines, 1000, chunks, &format!("ev combos (env {})", k));
         }
@@ -1412,7 +1423,7 @@ mod x86 {
             return;
         }
         for (k, e) in [env_default(), env_small_buckets(), env_big()].iter().enumerate() {
-            let lines = combo_lines(e, Kind::Cl, 501 + k as u64, if k == 0 { 200_000 } else { 100_000 });
+            let lines = combo_lines(e, Kind::Cl, 501 + k as u64, scale() * if k == 0 { 200_000 } else { 100_000 });
             let chunks: &[usize] = if k == 2 { &[4096, 1 << 40] } else { &[1, 4096, 1 << 40] };
             check_lines(e, Kind::Cl, &lines, 1000, chunks, &format!("cl combos (env {})", k));
         }
@@ -1430,7 +1441,7 @@ mod x86 {
         let mut r = Rng::new(602);
         let mut ev = Vec::new();
         let mut cl = Vec::new();
-        for _ in 0..150_000 {
+        for _ in 0..150_000 * scale() {
             let l = join(&g.ev(), if r.chance(0.1) { r.below(128) as u32 } else { 0 });
             ev.push(mutate_value(&mut r, &l));
             let l = join(&g.cl(), if r.chance(0.1) { r.below(16) as u32 } else { 0 });
@@ -1692,7 +1703,7 @@ mod x86 {
         for (k, e) in [env_default(), env_small_buckets()].iter().enumerate() {
             let mut g = Gen::new(e, 71 + k as u64);
             let mut r = Rng::new(171 + k as u64);
-            let n = if k == 0 { 400_000 } else { 100_000 };
+            let n = scale() * if k == 0 { 400_000 } else { 100_000 };
             let mut lines = Vec::with_capacity(n);
             while lines.len() < n {
                 let f = g.cl();
