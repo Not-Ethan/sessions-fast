@@ -480,51 +480,58 @@ unsafe fn split_wide(p: *const u8, c0: u64, n0: u64, q0: u64, c1: u64, n1: u64, 
 }
 
 /// The lean split (variant 3): one set of masks of the 128 bytes at p, the
-/// line end from the newline masks, fields 0 and 1 from window 1 (the 64
-/// bytes at p) and fields 2..=6 from window 2 = the 64 bytes that end at the
-/// line's newline (bit i of window 2 = byte le - 63 + i). Requirements (else
-/// not ok; the caller takes the old splitters): a newline within the 128
-/// bytes (le <= 127), the second delimiter D2 below 64 and le - D2 <= 64
-/// (window 2 holds every byte after D2), exactly four delimiters strictly
-/// between D2 and le
-/// (window 2 then holds every byte after D2), and the dialect's quote rule
-/// (`window`) in both regions: window 1 over [0, D2], window 2 over (D2, le].
-/// Then the line's delimiters before le are exactly six (all commas, le being
-/// the first newline) and every field holds no quote or exactly two, as its
-/// first and last byte: the fields and length of `fastev::cut` / `cut_wide`
-/// for every line it accepts (the checker and the tests compare them).
+/// line end from the newline masks, fields 0..K from window 1 (the 64 bytes
+/// at p) and fields K..=6 from window 2 = the 64 bytes that end at the line's
+/// newline (bit i of window 2 = byte le - 63 + i). K = 2 (shape A, ~94% of
+/// lines) or 3 (shape B: fields 2..=6 longer than 63 bytes, short IDs).
+/// Requirements (else not ok; the caller tries shape B, then the old
+/// splitters): a newline within the 128 bytes (le <= 127), the K-th delimiter
+/// DK below 64 and le - DK <= 64 (window 2 holds every byte after DK),
+/// exactly 6 - K delimiters strictly between DK and le, and the dialect's
+/// quote rule (`window`) in both regions: window 1 over [0, DK], window 2
+/// over (DK, le]. Then the line's delimiters before le are exactly six (all
+/// commas, le being the first newline) and every field holds no quote or
+/// exactly two, as its first and last byte: the fields and length of
+/// `fastev::cut` / `cut_wide` for every line it accepts (the checker and the
+/// tests compare them).
 #[inline(always)]
-unsafe fn split_lean(c0: u64, n0: u64, q0: u64, c1: u64, n1: u64, q1: u64) -> fastev::Cut {
+unsafe fn split_lean<const K: usize>(c0: u64, n0: u64, q0: u64, c1: u64, n1: u64, q1: u64) -> fastev::Cut {
     let le = if n0 != 0 { tz(n0) } else { 64 + tz(n1) }; // 128: no newline
     let d0 = c0 | n0;
     let d1 = c1 | n1;
-    // window 1: fields 0, 1 (region [0, D2])
-    let x1 = blsr(d0);
+    // window 1: fields 0..K (region [0, DK])
+    let mut x1 = blsr(d0);
+    if K == 3 {
+        x1 = blsr(x1);
+    }
     let r1 = upto(x1);
     let (b1, cs1, ce1) = window(d0, q0, r1);
-    let e2 = tz(x1); // D2 (64 if absent)
+    let ek = tz(x1); // DK (64 if absent)
     // window 2: bit i = byte le - 63 + i (zeros below byte 0)
     let sh = 127usize.wrapping_sub(le) & 127;
     let dw = ((((d1 as u128) << 64) | d0 as u128) << sh >> 64) as u64;
     let qw = ((((q1 as u128) << 64) | q0 as u128) << sh >> 64) as u64;
-    // D2 at bit b2 = b2p1 - 1 of window 2; b2p1 = 0: D2 is the byte just
-    // below window 2, whose bit 0 is then field 2's start (`fs` bit 0)
-    let b2p1 = (e2 + 64).wrapping_sub(le); // valid iff <= 63
-    let r2 = (!0u64).wrapping_shl(b2p1 as u32); // bits (b2, 63]
+    // DK at bit bk = bkp1 - 1 of window 2; bkp1 = 0: DK is the byte just
+    // below window 2, whose bit 0 is then field K's start (`fs` bit 0)
+    let bkp1 = (ek + 64).wrapping_sub(le); // valid iff <= 63
+    let r2 = (!0u64).wrapping_shl(bkp1 as u32); // bits (bk, 63]
     let fs = (dw << 1) | 1;
     let qs = qw & fs & r2;
     let cl = ((!dw).wrapping_add(qs) & dw) >> 1;
     let b2bad = ((qw ^ (qs | cl)) | (qs & cl)) & r2;
     let cs2 = ((fs & !qw) | (qs << 1)) & r2;
     let ce2 = ((dw & !(cl << 1)) | cl) & r2;
-    // delimiters in (D2, le]: four commas, then the newline at bit 63
+    // delimiters in (DK, le]: 6 - K commas, then the newline at bit 63
     let y = dw & r2;
-    let y4 = blsr(blsr(blsr(blsr(y))));
-    let ok = (le < 128) & (x1 != 0) & (b2p1 < 64) & (y4 == 1u64 << 63) & ((b1 | b2bad) == 0);
+    let mut yr = blsr(blsr(blsr(y)));
+    if K == 2 {
+        yr = blsr(yr);
+    }
+    let ok = (le < 128) & (x1 != 0) & (bkp1 < 64) & (yr == 1u64 << 63) & ((b1 | b2bad) == 0);
     let mut s = [0usize; 7];
     let mut n = [0usize; 7];
     let (mut cs, mut ce) = (cs1, ce1);
-    for j in 0..2 {
+    for j in 0..K {
         s[j] = tz(cs);
         n[j] = tz(ce).wrapping_sub(tz(cs));
         cs = blsr(cs);
@@ -532,7 +539,7 @@ unsafe fn split_lean(c0: u64, n0: u64, q0: u64, c1: u64, n1: u64, q1: u64) -> fa
     }
     let w = le.wrapping_sub(63);
     let (mut cs, mut ce) = (cs2, ce2);
-    for j in 2..7 {
+    for j in K..7 {
         s[j] = w.wrapping_add(tz(cs));
         n[j] = tz(ce).wrapping_sub(tz(cs));
         cs = blsr(cs);
@@ -599,6 +606,9 @@ pub struct Stats {
     pub range_fb: usize,
     /// lines at the buffer end through `fastev::event_task_fast` (ranges)
     pub tail: usize,
+    /// lines the lean split did not take (through `slow_line`; also counted
+    /// in fast / line_fb / range_fb)
+    pub slow: usize,
 }
 
 /// The cut line at p (fields `c.s[j]`, `c.n[j]`; 32 bytes readable from every
@@ -633,22 +643,29 @@ unsafe fn decode_body<S: EvSink, const P2: bool>(k: &K4, ctx: &Ctx, p: *const u8
     let (dbad2, d2e) = date(q2, &k.tab);
     let (dbad3, d3e) = date(q3, &k.tab);
     let (sec2, omin, sec3, tok, trng) = tvec(q2, q3);
-    let ntok = !tok as u64;
-    let trng = trng as u64;
+    // both checks in one word: bad separator / digit lanes (bits 0..32) and
+    // out-of-range words (bits 32..64); only zero / nonzero matters below
+    let bad = (!tok) as u64 | ((trng as u64) << 32);
+    const IMASK: u64 = 0x1FF_0000 | (0x3F_0000 << 32);
+    const F1MASK: u64 = 0x1FF | (0x3F << 32);
+    const F2MASK: u64 = 0x3EFF | (0xF3F << 32);
     // ingest_ts: F1, date in the table, time well-formed and in range
-    let ibad = (ntok & 0x1FF_0000) | (trng & 0x3F_0000) | dbad3 | (n3 ^ 20) as u64;
+    let ibad = (bad & IMASK) | dbad3 | (n3 ^ 20) as u64;
     // ts: F1 / F2 (date in the table) or 13 digits, as an offset from ws
     let civ = d2e.off_ms.wrapping_add(sec2 as i64 * 1000);
     let b19 = *q2.add(19) as u32;
     // F2: '+' subtracts the offset, '-' adds it (0x2C - sign = 1 / -1)
     let f2v = civ.wrapping_sub((omin as i64 * 60_000).wrapping_mul(0x2C - b19 as i64));
     let (f3v, f3bad) = f3_13(q2);
-    let f1bad = (ntok & 0x1FF) | (trng & 0x3F) | dbad2 | (n2 ^ 20) as u64;
-    let f2bad = (ntok & 0x3EFF) | (trng & 0xF3F) | dbad2 | (b19.wrapping_sub(0x2B) & 0xFFFF_FFFD) as u64;
     let is13 = n2 == 13;
     let is25 = n2 == 25;
+    // F1 (20 bytes) or F2 (25 bytes, sign at 19): lanes and words of the form,
+    // date in the table, the length / sign
+    let fmask = sel(is25, F2MASK, F1MASK);
+    let fform = sel(is25, (b19.wrapping_sub(0x2B) & 0xFFFF_FFFD) as u64, (n2 ^ 20) as u64);
+    let f12bad = (bad & fmask) | dbad2 | fform;
     let t_off = sel(is13, (f3v as i64).wrapping_sub(ws) as u64, sel(is25, f2v as u64, civ as u64)) as i64;
-    let tbad = sel(is13, f3bad as u64, sel(is25, f2bad, f1bad));
+    let tbad = sel(is13, f3bad as u64, f12bad);
     // type exactly as event_pay (wide): 8 bytes from the field start
     let n4 = c.n[4];
     let w4 = rd64(p.add(c.s[4]));
@@ -716,7 +733,10 @@ fn line_fb<S: EvSink>(p: *const u8, c: &fastev::Cut, ctx: &Ctx, sink: &mut S) {
 unsafe fn line_fb_lean<S: EvSink>(p: *const u8, ctx: &Ctx, sink: &mut S) {
     let (c0, n0, q0) = masks64(p);
     let (c1, n1, q1) = masks64(p.add(64));
-    let c = split_lean(c0, n0, q0, c1, n1, q1);
+    let mut c = split_lean::<2>(c0, n0, q0, c1, n1, q1);
+    if !c.ok {
+        c = split_lean::<3>(c0, n0, q0, c1, n1, q1);
+    }
     debug_assert!(c.ok);
     line_fb(p, &c, ctx, sink);
 }
@@ -805,7 +825,10 @@ unsafe fn task_k4<S: EvSink, const SPL: usize, const P2: bool>(b: &[u8], task: T
         if SPL == 3 {
             let (c0, n0, q0) = masks64(p);
             let (c1, n1, q1) = masks64(p.add(64));
-            let c = split_lean(c0, n0, q0, c1, n1, q1);
+            let mut c = split_lean::<2>(c0, n0, q0, c1, n1, q1);
+            if !c.ok {
+                c = split_lean::<3>(c0, n0, q0, c1, n1, q1);
+            }
             if c.ok {
                 if decode_body::<S, P2>(k, ctx, p, &c, sink) {
                     st.fast += 1;
@@ -865,6 +888,7 @@ unsafe fn task_k4<S: EvSink, const SPL: usize, const P2: bool>(b: &[u8], task: T
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn slow_line<S: EvSink, const P2: bool>(b: &[u8], off: usize, file: u32, k: &K4, ctx: &Ctx, sink: &mut S, safe_end: usize, st: &mut Stats) -> usize {
+    st.slow += 1;
     let p = b.as_ptr().add(off);
     let mut c = fastev::cut::<true>(p);
     if !c.ok {
@@ -959,6 +983,7 @@ pub fn check(ev: &Input, ctx: &Ctx) {
         tot.line_fb += st.line_fb;
         tot.range_fb += st.range_fb;
         tot.tail += st.tail;
+        tot.slow += st.slow;
         lines += b[task.start..task.end].iter().filter(|&&c| c == b'\n').count();
         copies += want.0.len();
         valid += want.0.iter().filter(|c| c.2.is_some()).count();
@@ -993,7 +1018,7 @@ pub fn check(ev: &Input, ctx: &Ctx) {
     }
     let pct = |x: usize| x as f64 * 100.0 / lines.max(1) as f64;
     eprintln!(
-        "k4check: {} {} tasks, {} lines, {} copies ({} valid); k4 fast {} ({:.3}%), event_line fallback {} ({:.3}%), scanner lines {} ({:.4}%), buffer-end ranges {}",
+        "k4check: {} {} tasks, {} lines, {} copies ({} valid); k4 fast {} ({:.3}%), event_line fallback {} ({:.3}%), scanner lines {} ({:.4}%), buffer-end ranges {}; not taken by the lean split {} ({:.3}%)",
         if bad == 0 { "OK" } else { "FAILED" },
         ev.tasks.len(),
         lines,
@@ -1005,7 +1030,9 @@ pub fn check(ev: &Input, ctx: &Ctx) {
         pct(tot.line_fb),
         tot.range_fb,
         pct(tot.range_fb),
-        tot.tail
+        tot.tail,
+        tot.slow,
+        pct(tot.slow)
     );
     if bad != 0 {
         std::process::exit(1);
