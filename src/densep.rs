@@ -114,10 +114,12 @@ pub fn stats() -> String {
 /// Decides between the dense and the general pipeline before any heavy
 /// work: None = general.
 pub fn decide(ev: &Input, ctx: &Ctx) -> Option<Dense> {
-    // SS_DENSE: unset or "1" = dense when the checks below pass, "0" =
-    // general, "force" = dense on any input (tests)
+    // SS_DENSE: "1" = dense when the checks below pass, "force" = dense on
+    // any input (tests), anything else (default) = general. Off by default since scorer version 5: v5 IDs pass through a keyed
+    // bijection that cannot be recovered, so the dense path never engages
+    // there (SS_DENSE=1 / force to use it, e.g. on version 4 data).
     let mode = std::env::var("SS_DENSE").unwrap_or_default();
-    if mode == "0" {
+    if mode != "1" && mode != "force" {
         return None;
     }
     let force = mode == "force";
@@ -413,6 +415,8 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
         v.finish();
         v
     });
+    // every long ID keyed: checked, decode table for names (keys.rs)
+    keys::verify_longs(threads);
     marks.mark("d.clicks");
     stat("d_over_cl", parts::WC_OVER_LINES.load(Ordering::Relaxed));
     // 4. exceptional slots' roots, the person table
@@ -1173,6 +1177,9 @@ fn dense_links(links_in: &Input, ctx: &Ctx, d: &Dense, xm: &Xmap, proot: &[Atomi
         }
         v
     });
+    // long IDs of the links checked and decodable before the union compares
+    // keys (keys.rs)
+    keys::verify_longs(threads);
     // every exceptional ID of a link is interned now (later ones are unlinked)
     let xkeys = xm.key_table();
     let xpar: Vec<AtomicU32> = (0..xkeys.len()).map(|_| AtomicU32::new(0)).collect();

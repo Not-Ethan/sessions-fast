@@ -6,10 +6,26 @@
 //! packed keys, numeric order equals byte-wise string order and equality equals
 //! string equality.
 //!
+//! A "long" ID, exactly one byte of that alphabet followed by exactly 32
+//! lowercase hexadecimal digits (`[0-9a-f]`, the generator's 128-bit suffix
+//! form), gets `(h << 4) | 0xE` with h a 60-bit keyed hash of (first byte,
+//! 128-bit value), computed without any shared state. Every thread logs
+//! (key, first byte, value) of each long ID it keys; `verify_longs` (after the
+//! links are parsed, and after all parsing) checks that no key stands for two
+//! different IDs and builds the table that decodes long keys. If two IDs ever
+//! share a key, `collision()` is set and the caller reruns the whole job with
+//! another seed (`reset_longs`); after `LONG_TRIES` seeds long IDs go to the
+//! interner. So long keys are equal iff the strings are equal, for any input.
+//! Their order: long vs long by (first byte, value), which is the byte-wise
+//! order of the strings since all have the same width and hex digits sort in
+//! value order; anything else by comparing the strings.
+//!
 //! Every other string is interned in a global side table and gets the key
 //! `(index << 4) | 0xF`. Such keys are equal iff the strings are equal; their
 //! order is resolved by comparing the actual bytes (rare, slow path).
 //!
+//! The low 4 bits tell the kinds apart for every bit pattern: 1..=10 packed
+//! (the length), 0xE long, 0xF interned; 0 and 11..=13 are never produced.
 //! Key 0 is never produced and serves as "empty".
 
 use std::cmp::Ordering;
@@ -140,7 +156,7 @@ pub unsafe fn pack_wide(s: &[u8]) -> Option<u64> {
 pub unsafe fn key_of_wide(s: &[u8]) -> u64 {
     match pack_wide(s) {
         Some(k) => k,
-        None => intern(s),
+        None => other(s),
     }
 }
 
@@ -149,7 +165,294 @@ pub unsafe fn key_of_wide(s: &[u8]) -> u64 {
 pub fn key_of(s: &[u8]) -> u64 {
     match pack(s) {
         Some(k) => k,
-        None => intern(s),
+        None => other(s),
+    }
+}
+
+/// Key of a string that does not pack: long form or interned.
+#[inline(always)]
+fn other(s: &[u8]) -> u64 {
+    if s.len() == 33 && !LONG_OFF.load(AO::Relaxed) {
+        if let Some((hi, lo)) = hex32(&s[1..]) {
+            if CODE[s[0] as usize] & INVALID == 0 {
+                return long_key(s[0], hi, lo);
+            }
+        }
+    }
+    intern(s)
+}
+
+// ---------------------------------------------------------------- long IDs
+
+/// Hash seeds tried in turn (rerun after a collision); then the interner.
+pub const LONG_TRIES: u64 = 3;
+static LONG_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x5EED_0000_0000_0001);
+/// Long IDs go to the interner (after LONG_TRIES collisions, or SS_LONGOFF).
+static LONG_OFF: AtomicBool = AtomicBool::new(false);
+/// Hash bits kept (SS_LONGBITS, tests: few bits force collisions), <= 60.
+static LONG_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
+static COLLISION: AtomicBool = AtomicBool::new(false);
+static ANY_LONG: AtomicBool = AtomicBool::new(false);
+
+/// One logged long ID: key, first byte, the 32 hex digits as two u64.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct LEnt {
+    key: u64,
+    pre: u64,
+    hi: u64,
+    lo: u64,
+}
+
+thread_local! {
+    static LOG: std::cell::RefCell<Vec<LEnt>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+/// Logs of finished threads (`flush_thread`).
+static LOGS: Mutex<Vec<Vec<LEnt>>> = Mutex::new(Vec::new());
+
+/// The decode table of long keys: entries sorted by key in 4096 partitions
+/// by the key's top 12 bits; partition p holds arr[start[p] .. start[p] + n[p]].
+struct LongTab {
+    arr: Vec<LEnt>,
+    start: Vec<usize>,
+    n: Vec<usize>,
+}
+static TAB: std::sync::atomic::AtomicPtr<LongTab> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+const TAB_BITS: u32 = 12;
+
+/// Settings from the environment (SS_LONGBITS, SS_LONGOFF); call once at start.
+pub fn long_settings() {
+    if let Some(b) = std::env::var("SS_LONGBITS").ok().and_then(|v| v.parse::<u32>().ok()) {
+        LONG_BITS.store(b.clamp(1, 60), AO::Relaxed);
+    }
+    if std::env::var("SS_LONGOFF").is_ok() {
+        LONG_OFF.store(true, AO::Relaxed);
+    }
+}
+
+/// 32 lowercase hex digits as (first 16, last 16) values; None for any other byte.
+#[inline(always)]
+fn hex32(s: &[u8]) -> Option<(u64, u64)> {
+    debug_assert!(s.len() == 32);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let a = hex16_sse(s.as_ptr());
+        let b = hex16_sse(s.as_ptr().add(16));
+        if let (Some(x), Some(y)) = (a, b) {
+            return Some((x, y));
+        }
+        return None;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut v = [0u64; 2];
+        for (h, c) in s.iter().enumerate() {
+            let d = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                _ => return None,
+            };
+            v[h / 16] = (v[h / 16] << 4) | d as u64;
+        }
+        Some((v[0], v[1]))
+    }
+}
+
+/// 16 lowercase hex digits at p (16 readable bytes) as a value (first digit
+/// most significant), None unless all 16 are `[0-9a-f]`. SSE4.1 (x86-64-v2).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn hex16_sse(p: *const u8) -> Option<u64> {
+    use std::arch::x86_64::*;
+    let v = _mm_loadu_si128(p as *const __m128i);
+    let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+    let isd = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+    let l = _mm_sub_epi8(v, _mm_set1_epi8(b'a' as i8));
+    let isl = _mm_cmpeq_epi8(_mm_min_epu8(l, _mm_set1_epi8(5)), l);
+    if _mm_movemask_epi8(_mm_or_si128(isd, isl)) != 0xFFFF {
+        return None;
+    }
+    let nib = _mm_or_si128(_mm_and_si128(isd, d), _mm_and_si128(isl, _mm_add_epi8(l, _mm_set1_epi8(10))));
+    // pairs (first digit high): 16 * a + b per 16-bit lane
+    let w = _mm_maddubs_epi16(nib, _mm_set1_epi16(0x0110));
+    let b = _mm_packus_epi16(w, w);
+    Some((_mm_cvtsi128_si64(b) as u64).swap_bytes())
+}
+
+#[inline(always)]
+fn long_hash(pre: u64, hi: u64, lo: u64) -> u64 {
+    let seed = LONG_SEED.load(AO::Relaxed);
+    let a = mix(hi ^ seed);
+    let b = mix(lo.wrapping_add(seed.rotate_left(17)) ^ pre.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    mix(a ^ b.rotate_left(29))
+}
+
+#[inline(always)]
+fn long_key(pre: u8, hi: u64, lo: u64) -> u64 {
+    let h = long_hash(pre as u64, hi, lo) >> 4;
+    let bits = LONG_BITS.load(AO::Relaxed);
+    let h = if bits >= 60 { h } else { h & ((1u64 << bits) - 1) };
+    let key = (h << 4) | 0xE;
+    LOG.with(|l| l.borrow_mut().push(LEnt { key, pre: pre as u64, hi, lo }));
+    key
+}
+
+#[inline(always)]
+pub fn is_long(k: u64) -> bool {
+    k & 0xF == 0xE
+}
+
+/// Moves this thread's log of long IDs to the shared list (main::par calls
+/// it at the end of every worker; also before a verification).
+pub fn flush_thread() {
+    let v = LOG.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    if !v.is_empty() {
+        ANY_LONG.store(true, AO::Relaxed);
+        LOGS.lock().unwrap().push(v);
+    }
+}
+
+/// A key collision was seen by a verification (the job must run again).
+pub fn collision() -> bool {
+    COLLISION.load(AO::Relaxed)
+}
+
+pub fn any_long() -> bool {
+    ANY_LONG.load(AO::Relaxed)
+}
+
+/// Before a rerun after a collision: next seed (or the interner after
+/// LONG_TRIES seeds), logs and tables cleared. Returns the attempt number.
+pub fn reset_longs(attempt: u64) {
+    LOG.with(|l| l.borrow_mut().clear());
+    LOGS.lock().unwrap().clear();
+    TAB.store(std::ptr::null_mut(), AO::Release);
+    COLLISION.store(false, AO::Relaxed);
+    if attempt >= LONG_TRIES {
+        LONG_OFF.store(true, AO::Relaxed);
+    } else {
+        LONG_SEED.store(mix(0x5EED_0000_0000_0001 ^ attempt.wrapping_mul(0xA24B_AED4_963E_E407)), AO::Relaxed);
+    }
+}
+
+/// Checks every long ID logged so far (all threads, flushed) and builds the
+/// decode table: sets `collision()` if one key stands for two IDs. Returns
+/// the number of distinct long IDs (0 and no work when there are none).
+pub fn verify_longs(threads: usize) -> usize {
+    let par = |f: &(dyn Fn(usize) + Sync)| {
+        crate::par(threads, f);
+    };
+    flush_thread();
+    let lists = LOGS.lock().unwrap();
+    let total: usize = lists.iter().map(|v| v.len()).sum();
+    if total == 0 {
+        return 0;
+    }
+    let np = 1usize << TAB_BITS;
+    let part = |k: u64| (k >> (64 - TAB_BITS)) as usize;
+    let nl = lists.len();
+    // counts per (list, partition), then offsets
+    let mut cnt = vec![0usize; nl * np];
+    {
+        let cp = cnt.as_mut_ptr() as usize;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        par(&|_| loop {
+            let l = next.fetch_add(1, AO::Relaxed);
+            if l >= nl {
+                break;
+            }
+            let c = unsafe { std::slice::from_raw_parts_mut((cp as *mut usize).add(l * np), np) };
+            for e in &lists[l] {
+                c[part(e.key)] += 1;
+            }
+        });
+    }
+    let mut start = vec![0usize; np + 1];
+    let mut off = vec![0usize; nl * np];
+    let mut run = 0usize;
+    for p in 0..np {
+        start[p] = run;
+        for l in 0..nl {
+            off[l * np + p] = run;
+            run += cnt[l * np + p];
+        }
+    }
+    start[np] = run;
+    let mut arr: Vec<LEnt> = Vec::with_capacity(total);
+    let ap = arr.as_mut_ptr() as usize;
+    {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let offp = off.as_mut_ptr() as usize;
+        par(&|_| loop {
+            let l = next.fetch_add(1, AO::Relaxed);
+            if l >= nl {
+                break;
+            }
+            let o = unsafe { std::slice::from_raw_parts_mut((offp as *mut usize).add(l * np), np) };
+            for e in &lists[l] {
+                let p = part(e.key);
+                unsafe { (ap as *mut LEnt).add(o[p]).write(*e) };
+                o[p] += 1;
+            }
+        });
+        unsafe { arr.set_len(total) };
+    }
+    drop(lists);
+    // per partition: sort, check, keep the distinct entries at its start
+    let mut n = vec![0usize; np];
+    let coll = AtomicBool::new(false);
+    {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let np_ = n.as_mut_ptr() as usize;
+        let startr = &start;
+        par(&|_| loop {
+            let p = next.fetch_add(1, AO::Relaxed);
+            if p >= np {
+                break;
+            }
+            let s = unsafe { std::slice::from_raw_parts_mut((ap as *mut LEnt).add(startr[p]), startr[p + 1] - startr[p]) };
+            s.sort_unstable();
+            let mut k = 0usize;
+            for i in 0..s.len() {
+                if k > 0 && s[k - 1].key == s[i].key {
+                    if s[k - 1] != s[i] {
+                        coll.store(true, AO::Relaxed);
+                    }
+                    continue;
+                }
+                s[k] = s[i];
+                k += 1;
+            }
+            unsafe { *(np_ as *mut usize).add(p) = k };
+        });
+    }
+    if coll.load(AO::Relaxed) {
+        COLLISION.store(true, AO::Relaxed);
+    }
+    let distinct = n.iter().sum();
+    let tab = Box::new(LongTab { arr, start, n });
+    TAB.store(Box::into_raw(tab), AO::Release);
+    distinct
+}
+
+/// (first byte, hi, lo) of a long key, from the decode table.
+fn long_value(k: u64) -> (u64, u64, u64) {
+    let t = TAB.load(AO::Acquire);
+    assert!(!t.is_null(), "long key without a decode table");
+    let t = unsafe { &*t };
+    let p = (k >> (64 - TAB_BITS)) as usize;
+    let s = &t.arr[t.start[p]..t.start[p] + t.n[p]];
+    let i = s.partition_point(|e| e.key < k);
+    assert!(i < s.len() && s[i].key == k, "long key missing from the decode table");
+    (s[i].pre, s[i].hi, s[i].lo)
+}
+
+fn long_string(k: u64, out: &mut Vec<u8>) {
+    let (pre, hi, lo) = long_value(k);
+    out.push(pre as u8);
+    for v in [hi, lo] {
+        for i in (0..16).rev() {
+            out.push(b"0123456789abcdef"[((v >> (4 * i)) & 15) as usize]);
+        }
     }
 }
 
@@ -168,9 +471,10 @@ fn intern(s: &[u8]) -> u64 {
     k
 }
 
+/// Not a packed key: interned (0xF) or long (0xE).
 #[inline(always)]
 pub fn is_fallback(k: u64) -> bool {
-    k & 0xF == FALLBACK_TAG
+    k & 0xF >= 0xE
 }
 
 pub fn any_fallback() -> bool {
@@ -180,7 +484,11 @@ pub fn any_fallback() -> bool {
 /// Appends the string of `k` to `out`.
 #[inline]
 pub fn decode_into(k: u64, out: &mut Vec<u8>) {
-    if is_fallback(k) {
+    if is_long(k) {
+        long_string(k, out);
+        return;
+    }
+    if k & 0xF == FALLBACK_TAG {
         let guard = INTERNER.lock().unwrap();
         let it = guard.as_ref().expect("fallback key without interner");
         out.extend_from_slice(&it.strings[((k >> 4) - 1) as usize]);
@@ -204,7 +512,7 @@ pub fn decode(k: u64) -> Vec<u8> {
 /// Byte-wise order of the strings behind two keys.
 #[inline(always)]
 pub fn cmp(a: u64, b: u64) -> Ordering {
-    if (a & 0xF) != FALLBACK_TAG && (b & 0xF) != FALLBACK_TAG {
+    if !is_fallback(a) && !is_fallback(b) {
         a.cmp(&b)
     } else {
         cmp_slow(a, b)
@@ -216,6 +524,10 @@ pub fn cmp(a: u64, b: u64) -> Ordering {
 fn cmp_slow(a: u64, b: u64) -> Ordering {
     if a == b {
         return Ordering::Equal;
+    }
+    if is_long(a) && is_long(b) {
+        // same width, hex digits in value order: (first byte, value) order
+        return long_value(a).cmp(&long_value(b));
     }
     decode(a).cmp(&decode(b))
 }
@@ -301,6 +613,145 @@ mod tests {
                     assert_eq!(unsafe { pack_wide(&s[..n]) }, want);
                 }
             }
+        }
+    }
+
+    /// Long-ID tests share the global long-key state: one at a time.
+    static LONG_TEST: Mutex<()> = Mutex::new(());
+
+    fn hex_id(pre: u8, hi: u64, lo: u64) -> Vec<u8> {
+        let mut s = vec![pre];
+        s.extend_from_slice(format!("{:016x}{:016x}", hi, lo).as_bytes());
+        s
+    }
+
+    /// Long keys: exact shape test, round trip through the decode table,
+    /// equality and byte-wise order against the strings, mixed with packed,
+    /// interned and near-long shapes.
+    #[test]
+    fn long_keys_exact() {
+        let _g = LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        reset_longs(0);
+        LONG_OFF.store(false, AO::Relaxed);
+        LONG_BITS.store(60, AO::Relaxed);
+        let base = 0x0123_4567_89ab_cdefu64;
+        let mut samples: Vec<Vec<u8>> = Vec::new();
+        for &(hi, lo) in &[(base, base), (base, base ^ 1), (base ^ 1, base), (base, base ^ (1 << 63)), (base ^ (1 << 63), base), (0, 0), (u64::MAX, u64::MAX), (0, u64::MAX), (u64::MAX, 0)] {
+            for &pre in b"uekU-_z0" {
+                samples.push(hex_id(pre, hi, lo));
+            }
+        }
+        // near shapes: interner (uppercase hex, 31 / 33 / 34 / 64 digits, bad byte, non-alphabet prefix)
+        let mut up = hex_id(b'u', base, base);
+        up[5] = b'A';
+        samples.push(up.clone());
+        samples.push(b"u0123456789abcdef0123456789abcde".to_vec());
+        samples.push(b"u0123456789abcdef0123456789abcdef0".to_vec());
+        samples.push(b"u0123456789abcdef0123456789abcdef01".to_vec());
+        samples.push([b"u".as_slice(), &[b'0'; 64]].concat());
+        let mut g = hex_id(b'u', base, base);
+        g[32] = b'g';
+        samples.push(g);
+        samples.push(hex_id(b' ', base, base));
+        samples.push(hex_id(0xC3, base, base));
+        // short and packed IDs that interleave in byte order with the long ones
+        for s in [&b"u"[..], b"u0", b"u01", b"u0123456789", b"u0123", b"uz", b"u1", b"e0", b"k", b"U", b"u-", b"zzzzzzzzzz", b"u0123456789abcdef0123456789abcdef"] {
+            samples.push(s.to_vec());
+        }
+        let keys: Vec<u64> = samples.iter().map(|s| key_of(s)).collect();
+        // long form only for the exact shape
+        for (s, &k) in samples.iter().zip(&keys) {
+            let long_shape = s.len() == 33 && CODE[s[0] as usize] & INVALID == 0 && s[1..].iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c));
+            assert_eq!(is_long(k), long_shape, "{:?}", String::from_utf8_lossy(s));
+        }
+        assert_eq!(verify_longs(2), samples.iter().zip(&keys).filter(|(_, &k)| is_long(k)).map(|(s, _)| s.clone()).collect::<std::collections::HashSet<_>>().len());
+        assert!(!collision());
+        for (s, &k) in samples.iter().zip(&keys) {
+            assert_eq!(&decode(k), s, "{:?}", String::from_utf8_lossy(s));
+        }
+        for i in 0..samples.len() {
+            for j in 0..samples.len() {
+                assert_eq!(cmp(keys[i], keys[j]), samples[i].cmp(&samples[j]), "{:?} {:?}", String::from_utf8_lossy(&samples[i]), String::from_utf8_lossy(&samples[j]));
+                assert_eq!(keys[i] == keys[j], samples[i] == samples[j]);
+            }
+        }
+        // the wide variant agrees
+        for s in &samples {
+            let mut w = s.clone();
+            let n = w.len();
+            w.extend_from_slice(&[0xAB; 16]);
+            assert_eq!(unsafe { key_of_wide(&w[..n]) }, key_of(s));
+        }
+        reset_longs(0);
+    }
+
+    /// Few hash bits: keys collide, verification says so; the next seeds
+    /// and finally the interner (as main's rerun loop does) give exact keys.
+    #[test]
+    fn long_key_collisions_detected() {
+        let _g = LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        reset_longs(0);
+        LONG_OFF.store(false, AO::Relaxed);
+        LONG_BITS.store(4, AO::Relaxed);
+        let ids: Vec<Vec<u8>> = (0..200u64).map(|i| hex_id(b'u', mix(i), mix(i + 1000))).collect();
+        let mut attempt = 0;
+        loop {
+            let keys: Vec<u64> = ids.iter().map(|s| key_of(s)).collect();
+            verify_longs(3);
+            if !collision() {
+                // exact: distinct IDs have distinct keys and decode back
+                let set: std::collections::HashSet<u64> = keys.iter().copied().collect();
+                assert_eq!(set.len(), ids.len());
+                for (s, &k) in ids.iter().zip(&keys) {
+                    assert_eq!(&decode(k), s);
+                }
+                break;
+            }
+            attempt += 1;
+            assert!(attempt <= LONG_TRIES, "no exact keys after the interner fallback");
+            reset_longs(attempt);
+        }
+        assert_eq!(attempt, LONG_TRIES, "4 hash bits for 200 IDs must collide for every seed");
+        assert!(LONG_OFF.load(AO::Relaxed));
+        LONG_BITS.store(60, AO::Relaxed);
+        LONG_OFF.store(false, AO::Relaxed);
+        reset_longs(0);
+    }
+
+    /// The SSE hex decoder agrees with a scalar one on random strings.
+    #[test]
+    fn hex32_matches_scalar() {
+        let mut x: u64 = 0x1234_5678_9ABC_DEF1;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alpha = b"0123456789abcdefABCDEFgz/:`@G \xff";
+        for _ in 0..300_000 {
+            let mut s = [0u8; 32];
+            let bad = next() % 4 == 0;
+            for c in s.iter_mut() {
+                *c = b"0123456789abcdef"[(next() % 16) as usize];
+            }
+            if bad {
+                let k = (next() % 32) as usize;
+                s[k] = if next() % 2 == 0 { alpha[(next() % alpha.len() as u64) as usize] } else { (next() & 0xFF) as u8 };
+            }
+            let want = (|| {
+                let mut v = [0u64; 2];
+                for (h, c) in s.iter().enumerate() {
+                    let d = match c {
+                        b'0'..=b'9' => c - b'0',
+                        b'a'..=b'f' => c - b'a' + 10,
+                        _ => return None,
+                    };
+                    v[h / 16] = (v[h / 16] << 4) | d as u64;
+                }
+                Some((v[0], v[1]))
+            })();
+            assert_eq!(hex32(&s), want, "{:?}", String::from_utf8_lossy(&s));
         }
     }
 

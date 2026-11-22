@@ -287,6 +287,8 @@ fn par<R: Send>(threads: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
                 s.spawn(move || {
                     PHASE_SPAWN_NS.fetch_max(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let r = f(t);
+                    // long IDs this worker keyed, for keys::verify_longs
+                    keys::flush_thread();
                     let ns = sys::thread_cpu_ns();
                     PHASE_CPU_NS.fetch_add(ns, Ordering::Relaxed);
                     PHASE_MAX_NS.fetch_max(ns, Ordering::Relaxed);
@@ -420,12 +422,16 @@ fn link_worker(
         link_task(links_in, task, &mut v);
     }
     *pairs[t].lock().unwrap() = v;
+    // the long IDs of the links must be checked (and decodable) before the
+    // union compares their keys
+    keys::flush_thread();
     bar.wait();
     if t == 0 {
         LINK_MARKS[0].store(sys::unix_ns(), Ordering::Relaxed);
     }
     if t == 0 {
         let total: usize = pairs.iter().map(|m| m.lock().unwrap().len()).sum();
+        keys::verify_longs(pairs.len());
         let _ = cell.set(LinkTable::with_pairs(total, pairs.len()));
     }
     bar.wait();
@@ -2376,7 +2382,19 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .min(64);
     let verbose = std::env::var("SS_VERBOSE").is_ok();
+    keys::long_settings();
     let mut report = run(&data_dir, &out_dir, threads, verbose);
+    // two long IDs shared a key (keys.rs): the whole job again with another
+    // hash seed, finally with long IDs in the interner (exact either way)
+    let mut attempt = 0u64;
+    while keys::collision() {
+        attempt += 1;
+        keys::reset_longs(attempt);
+        let _ = std::fs::remove_dir_all(out_dir.join("user_daily"));
+        let _ = std::fs::remove_dir_all(out_dir.join("campaign_daily"));
+        report = run(&data_dir, &out_dir, threads, verbose);
+        report.push_str(&format!(" long_key_rerun={}", attempt));
+    }
     if ingest_far_rerun() {
         // exact order for far ingest_ts values: the whole job again, into
         // clean output directories
@@ -2590,6 +2608,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
             None
         };
         let (lt, bouts) = parse_b(&links_in, &events_in, &clicks_in, &ctx, lb, gt.as_ref());
+        // every long ID keyed so far: no two IDs share a key (else main
+        // reruns the job), and the decode table for names and order
+        keys::verify_longs(threads);
         marks.mark("parse");
         if bouts.iter().any(|o| o.overflow) {
             pipeline = "B-overflow->legacy";
@@ -2612,6 +2633,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let mut legacy_bufs = None;
     if b_result.is_none() {
         let (lt, pouts) = parse_all(&links_in, &events_in, &clicks_in, &ctx);
+        keys::verify_longs(threads);
         marks.mark("parse");
         let (ebufs, cbufs): (Vec<Parts<ERec>>, Vec<Parts<CRec>>) = pouts.into_iter().map(|po| (po.e.0, po.c)).unzip();
         let sbufs = dedup(&ebufs, &lt, &ctx);
