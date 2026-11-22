@@ -859,31 +859,33 @@ pub fn click_cmp(a: u64, b: u64) -> Ordering {
     click_cmp_bytes(a, b)
 }
 
-#[cold]
 #[inline(never)]
 fn click_cmp_bytes(a: u64, b: u64) -> Ordering {
+    // the side table is locked only if a side reference is involved
+    let side_needed = |h: u64| h & 0xF == 0 && (h >> 4) >> 50 == CREF_SIDE;
+    let guard = if side_needed(a) || side_needed(b) { Some(CSIDE.lock().unwrap()) } else { None };
     let maps = unsafe { &*CMAPS_PTR.load(AO::Acquire) };
-    let side = CSIDE.lock().unwrap();
     let (mut ba, mut bb) = ([0u8; 33], [0u8; 33]);
-    let bytes = |h: u64, buf: &mut [u8; 33]| -> Vec<u8> {
+    let bytes = |h: u64, buf: &mut [u8; 33]| -> &[u8] {
         if h & 0xF != 0 {
             let n = stack_string(h, buf);
-            return buf[..n].to_vec();
+            return unsafe { std::slice::from_raw_parts(buf.as_ptr(), n) };
         }
         let r = h >> 4;
         let file = r >> 50;
         if file == CREF_SIDE {
-            return side[(r & ((1 << 50) - 1)) as usize].clone();
+            let v = &guard.as_ref().unwrap()[(r & ((1 << 50) - 1)) as usize];
+            return unsafe { std::slice::from_raw_parts(v.as_ptr(), v.len()) };
         }
         let (base, mlen) = maps[file as usize];
         let len = ((r >> 40) & 1023) as usize;
         let off = (r & ((1 << 40) - 1)) as usize;
         assert!(off + len <= mlen, "click reference outside its file");
-        unsafe { std::slice::from_raw_parts((base + off) as *const u8, len) }.to_vec()
+        unsafe { std::slice::from_raw_parts((base + off) as *const u8, len) }
     };
     let x = bytes(a, &mut ba);
     let y = bytes(b, &mut bb);
-    x.cmp(&y)
+    x.cmp(y)
 }
 
 /// A well-mixed 64-bit hash of a key (splitmix64 finalizer, a bijection).
