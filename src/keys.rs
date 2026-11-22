@@ -222,7 +222,10 @@ const TAB_BITS: u32 = 8;
 const NPART: usize = 1 << TAB_BITS;
 
 thread_local! {
-    static LOG: std::cell::RefCell<Option<Parts<LEnt>>> = const { std::cell::RefCell::new(None) };
+    /// This thread's log (Box::into_raw; null = none yet). A raw pointer in a
+    /// Cell: no destructor to register, so each access is a plain TLS load
+    /// (a RefCell<Option<..>> went through LocalKey::try_with every time).
+    static LOG: std::cell::Cell<*mut Parts<LEnt>> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 /// Logs of finished threads (`flush_thread`).
 static LOGS: Mutex<Vec<Parts<LEnt>>> = Mutex::new(Vec::new());
@@ -321,11 +324,20 @@ fn long_key(pre: u8, hi: u64, lo: u64) -> u64 {
     let h = if bits >= 60 { h } else { h & ((1u64 << bits) - 1) };
     let key = (h << 4) | 0xE;
     LOG.with(|l| {
-        let mut l = l.borrow_mut();
-        let p = l.get_or_insert_with(|| Parts::with_wc(NPART, LOG_HINT.load(AO::Relaxed) / NPART * 5 / 4 + 64, true));
-        unsafe { p.push_unchecked((key >> (64 - TAB_BITS)) as usize, LEnt { key, pre: pre as u64, hi, lo }) };
+        let mut p = l.get();
+        if p.is_null() {
+            p = new_log();
+            l.set(p);
+        }
+        unsafe { (*p).push_unchecked((key >> (64 - TAB_BITS)) as usize, LEnt { key, pre: pre as u64, hi, lo }) };
     });
     key
+}
+
+#[cold]
+#[inline(never)]
+fn new_log() -> *mut Parts<LEnt> {
+    Box::into_raw(Box::new(Parts::with_wc(NPART, LOG_HINT.load(AO::Relaxed) / NPART * 5 / 4 + 64, true)))
 }
 
 #[inline(always)]
@@ -336,10 +348,12 @@ pub fn is_long(k: u64) -> bool {
 /// Moves this thread's log of long IDs to the shared list (main::par calls
 /// it at the end of every worker; also before a verification).
 pub fn flush_thread() {
-    if let Some(mut v) = LOG.with(|l| l.borrow_mut().take()) {
+    let p = LOG.with(|l| l.replace(std::ptr::null_mut()));
+    if !p.is_null() {
+        let mut v = unsafe { Box::from_raw(p) };
         v.finish();
         if v.total() > 0 {
-            LOGS.lock().unwrap().push(v);
+            LOGS.lock().unwrap().push(*v);
         }
     }
 }
@@ -352,7 +366,10 @@ pub fn collision() -> bool {
 /// Before a rerun after a collision: next seed (or the interner after
 /// LONG_TRIES seeds), logs and tables cleared. Returns the attempt number.
 pub fn reset_longs(attempt: u64) {
-    LOG.with(|l| *l.borrow_mut() = None);
+    let p = LOG.with(|l| l.replace(std::ptr::null_mut()));
+    if !p.is_null() {
+        drop(unsafe { Box::from_raw(p) });
+    }
     LOGS.lock().unwrap().clear();
     TAB.store(std::ptr::null_mut(), AO::Release);
     COLLISION.store(false, AO::Relaxed);
