@@ -485,16 +485,48 @@ mod imp {
             if !self.own {
                 return self.lt.person_hash(k, h);
             }
-            match probe_view(self.slots, self.mask, k, h) {
-                Some(v) => {
-                    if self.mixed {
-                        v
-                    } else {
-                        keys::mix(v)
+            if !crate::links::PROBE_SEL.load(Ordering::Relaxed) {
+                return match probe_view(self.slots, self.mask, k, h) {
+                    Some(v) => {
+                        if self.mixed {
+                            v
+                        } else {
+                            keys::mix(v)
+                        }
                     }
-                }
-                None => h,
+                    None => h,
+                };
             }
+            // found / not found selected, not branched on (it is random per
+            // line, and the branch sits right behind the table's cache miss)
+            let (found, v) = probe_sel(self.slots, self.mask, k, h);
+            let r = if self.mixed { v } else { keys::mix(v) };
+            crate::links::sel64(found, r, h)
+        }
+    }
+
+    /// `probe_view` with the result selected instead of branched on:
+    /// (k is in the table, its raw slot value if so, else some in-bounds
+    /// slot's value). The group loop ends at the first group holding a
+    /// match or an empty slot, as `probe_view`'s. Inlines into AVX2 code only.
+    #[inline(always)]
+    pub(crate) unsafe fn probe_sel(slots: *const u64, mask: usize, k: u64, h: u64) -> (bool, u64) {
+        let kk = _mm256_set1_epi64x(k as i64);
+        let z = _mm256_setzero_si256();
+        let mut i = h as usize & mask & !3;
+        loop {
+            let g = slots.add(2 * i) as *const __m256i;
+            let a = _mm256_loadu_si256(g);
+            let b = _mm256_loadu_si256(g.add(1));
+            let m = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, kk))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, kk))) << 4)) as u32 & 0x55;
+            let e = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, z))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, z))) << 4)) as u32 & 0x55;
+            if (m | e) != 0 {
+                // the first matching slot's value (slot 0's if none matches:
+                // m's bits are at 0, 2, 4, 6, so bit 8 gives index 8 & 7 = 0)
+                let v = *slots.add(2 * i + ((m | 0x100).trailing_zeros() & 7) as usize + 1);
+                return (m != 0, v);
+            }
+            i = (i + 4) & mask;
         }
     }
 
@@ -732,7 +764,7 @@ mod imp {
 
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
-pub(crate) use imp::{probe_view, Probe};
+pub(crate) use imp::{probe_sel, probe_view, Probe};
 
 /// Whether `main::click_task_avx2` should take k5 for this task.
 #[inline(always)]

@@ -39,6 +39,16 @@ pub const FINALIZE_BLOCK: usize = 1 << 16;
 
 /// SS_SCALARPROBE=1: the scalar group probe in AVX2 builds too (A/B).
 pub static SCALAR_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// AVX2 person lookups select found / not found instead of branching on it
+/// (`k5::probe_sel`; SS_PROBESEL=0: the branching form, A/B).
+pub static PROBE_SEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// a if c else b, without a branch.
+#[inline(always)]
+pub fn sel64(c: bool, a: u64, b: u64) -> u64 {
+    let m = (c as u64).wrapping_neg();
+    (a & m) | (b & !m)
+}
 const IDX_BLOCK: u32 = 4096;
 
 fn arena<T>(n: usize) -> &'static [T] {
@@ -324,6 +334,14 @@ impl LinkTable {
     #[inline(always)]
     pub fn person_hash(&self, k: u64, h: u64) -> u64 {
         debug_assert_eq!(h, keys::mix(k));
+        // AVX2 builds: found / not found selected, not branched on (random
+        // per line, right behind the table's cache miss); SS_PROBESEL=0 off
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if !self.slots.is_empty() && self.amask == !3 && PROBE_SEL.load(Ordering::Relaxed) && !SCALAR_PROBE.load(Ordering::Relaxed) {
+            let (found, v) = unsafe { crate::k5::probe_sel(self.slots.as_ptr() as *const u64, self.mask, k, h) };
+            let r = if self.mixed { v } else { keys::mix(v) };
+            return sel64(found, r, h);
+        }
         match self.probe(k, h) {
             Some(v) => {
                 if self.mixed {

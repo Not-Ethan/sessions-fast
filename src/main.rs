@@ -3115,6 +3115,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     sys::POPW.store(std::env::var("SS_POPW").is_ok(), Ordering::Relaxed);
     sys::POISON.store(std::env::var("SS_POISON").is_ok(), Ordering::Relaxed);
     links::SCALAR_PROBE.store(std::env::var("SS_SCALARPROBE").map_or(false, |v| v == "1"), Ordering::Relaxed);
+    links::PROBE_SEL.store(std::env::var("SS_PROBESEL").map_or(true, |v| v != "0"), Ordering::Relaxed);
     sys::RECYCLE.store(std::env::var("SS_RECYCLE").map_or(true, |v| v != "0"), Ordering::Relaxed);
     // 128-byte splitters for lines with long IDs unless SS_WIDECUT=0
     fastev::WIDE.store(std::env::var("SS_WIDECUT").map_or(true, |v| v != "0"), Ordering::Relaxed);
