@@ -28,8 +28,49 @@ Merge-ready by 8:00 AM ET; tag every checker-clean step k6-vN.
   after b.len()-288), k = j+1; if none: next segment at the line start (slow_line if it is the segment's
   first line: longer than the scan / end of b).
 
-## Measurements
-(none yet)
+## Entry format (STABLE from k6-v1; the batch decode reads it directly)
+One segment = the bytes [a, s_end) of one buffer `b`, where `a` is a line start, s_end = min(task end,
+b.len() - 64, a + 4096). Bytes of the last 64-byte block at or past s_end are treated as ordinary bytes.
+`stage1(p = b + a, nb, lastmask, e)` fills `Ring { e: [u32; CAP], fl: [u8; CAP] }` (repr(C); fl is at
+byte offset 4*CAP from e) and returns `cnt`:
+- `e[i]` (u32) = offset from `a` of the i-th "entry" in byte order. Entries are every delimiter (comma or
+  newline) in the segment, plus every position flagged bad by the quote rule (see k6.rs header; a bad
+  position is either a delimiter or a non-delimiter byte inside the malformed line). `e[0]` = u32::MAX
+  (i.e. -1: the virtual newline just before `a`). Real entries are 1..cnt-1.
+- `fl[i]` (u8) flag byte of entry i: bit 0 (1) = the byte just before it is a quote (for a delimiter that
+  ends a simple line's field: the field is quoted); bit 1 (2) = it is a newline; bit 2 (4) = it is a bad
+  position (the line containing it is malformed). `fl[0]` = 2.
+- Sentinels: entries cnt..cnt+15 have flag 4 (bad) and e = 64*nb; so an 8-byte flag load at any k <= cnt
+  is in bounds and a line that runs past the scanned bytes is never simple.
+- Lines: entry k-1 is always the previous line's newline (or entry 0). The line whose first entry is k
+  starts at a + e[k-1] + 1 (u32 wrapping add). It is SIMPLE iff the 8 flag bytes at k, read as one
+  little-endian u64 x, satisfy (x & 0x0006_0606_0606_0606) == 0x0002_0000_0000_0000, i.e. entries
+  k..k+5 are neither newline nor bad and entry k+6 is a newline and not bad. A simple line has exactly
+  7 fields, ends at its first newline e[k+6], and field j (0..6) is, as offsets from a:
+  start s_j = e[k+j-1] + 1 + q_j, length n_j = e[k+j] - s_j - q_j, with q_j = fl[k+j] & 1.
+  Every field start has >= 64 readable bytes of b after it. The next line's first entry is k + 7.
+- NOT simple at k: let j = first index >= k with fl[j] & 2 (j < cnt). If it exists, the line is
+  [a + e[k-1] + 1, a + e[j]] (malformed, empty, or wrong field count): it must go through the old
+  routine as a one-line range (k6: `k4::slow_line`, or `k4::tail_fb` for the rest of the task if the line
+  starts after b.len() - k4::MARGIN), then continue at k = j + 1. If no such j < cnt: the line runs past
+  the scanned bytes; the next segment starts at that line start (if it is the segment's first line,
+  i.e. starts at a, it goes to `slow_line` as above: longer than the scan or at the end of b).
+- Order: lines must be handed on (decoded / sink / fallback) in increasing k; the interner and long-ID
+  logs are order-sensitive.
+
+## Measurements (dev5, NullSink line bench, 1 thread; callgrind on the x86-64-v2 profiling build)
+k4 baseline re-measured on this tree (k4-v2a): 539.1/line (loop 151.6 + split 86.3 = 237.9, ids 93.1,
+ts 87.4, validity 86.9, sink 13.9, other 13.2, scanner 4.7).
+| version | total | k6-s1 | k6-cut | k6-loop | loop | ts | validity | ids | sink | other | line bench ms (k4 / k6) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| v0 (c59d4d4) | 558.3 | 140.9 | 54.0 | 15.3 | 29.4 | 93.9 | 101.8 | 92.4 | 12.9 | 12.9 | - |
+| v1 (stage1 out of line, Cut in place) | 520.3 | 128.0 | 23.0 | 14.2 | 29.2 | 86.9 | 106.0 | 97.1 | 12.9 | 18.3 | 62.7-63.7 / 58.8-59.4 (5 rounds) |
+("loop" = k4.rs decode helpers dslot/sel/rd* ~25 + prefetch; split+loop for k6 v1 = 128+23+14.2+29.2 = 194.4
+vs k4 237.9. The decode costs +19 in validity inside the k6 loop: Cut read from memory + spills.)
+Exactness: k6test 14/14; SS_K6CHECK OK dev5 (slow_line 0.040%), e7 (21.6M lines, slow_line 0.042%).
 
 ## Next
-- build + tests on ss-k5; SS_K6CHECK dev5/e7/e23/e60; callgrind line bench by stage; llvm-mca.
+- e23/e60 checker -> tag k6-v1 -> image ss-k6-v1, lifetimes 10x e23 + 4x e60 (k4 vs k6 one image).
+- stage 1 register pressure (fss from dp via shld, cin in a register, one base register for e/fl, const
+  prefetch): written, not yet measured (v1b). Then v3 scorecard + v3 line bench.
+- batch surface for the two-loop decode (simple-run iterator over a segment).

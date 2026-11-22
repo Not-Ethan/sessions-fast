@@ -85,28 +85,35 @@ const SEG: usize = NB * 64;
 const CAP: usize = SEG + 64;
 /// Sentinel entries after the last real one (flag `F_BAD`).
 const NSENT: usize = 16;
+/// Byte offset of `Ring::fl` from `Ring::e`.
+const FL_OFF: usize = 4 * CAP;
+/// Stage 1 software prefetch distance (bytes ahead of the block).
+const PFD: usize = 1024;
 
-const F_NL: u8 = 2;
-const F_BAD: u8 = 4;
+/// Flag bits of an entry (see STATUS-k6.md, "Entry format"): the byte
+/// before it is a quote / it is a newline / it is a bad position.
+#[allow(dead_code)]
+pub(crate) const F_Q: u8 = 1;
+pub(crate) const F_NL: u8 = 2;
+pub(crate) const F_BAD: u8 = 4;
 const L1: u64 = 0x0101_0101_0101_0101;
 /// Flag bytes of entries k..k+7: no newline or bad flag in bytes 0..5, the
 /// newline flag (and no bad flag) in byte 6.
-const PAT_M: u64 = 0x0006_0606_0606_0606;
-const PAT: u64 = 0x0002_0000_0000_0000;
+pub(crate) const PAT_M: u64 = 0x0006_0606_0606_0606;
+pub(crate) const PAT: u64 = 0x0002_0000_0000_0000;
 
 /// The index of one segment.
 #[repr(C, align(64))]
-struct Ring {
-    e: [u32; CAP],
-    fl: [u8; CAP],
+pub(crate) struct Ring {
+    pub(crate) e: [u32; CAP],
+    pub(crate) fl: [u8; CAP],
 }
 
 /// Stage 1 state carried from block to block.
 struct S1 {
-    /// previous block's delimiters, quotes, field starts; carry of `od`
+    /// previous block's delimiters and quotes; carry of `od`
     dp: u64,
     qp: u64,
-    fsp: u64,
     cin: u8,
     /// next entry index
     kb: usize,
@@ -128,7 +135,9 @@ unsafe fn rd32(p: *const u8) -> u32 {
 /// ordinary bytes). Appends its entries and flags at `st.kb`.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn block(st: &mut S1, p: *const u8, blk: usize, vm: u64, e: *mut u32, fl: *mut u8) {
+unsafe fn block(st: &mut S1, p: *const u8, blk: usize, vm: u64, e: *mut u32) {
+    // the flags live at a fixed offset from the entries (one base register)
+    let fl = (e as *mut u8).add(FL_OFF);
     let q = p.add(blk * 64);
     let a = _mm256_loadu_si256(q as *const __m256i);
     let b = _mm256_loadu_si256(q.add(32) as *const __m256i);
@@ -139,7 +148,8 @@ unsafe fn block(st: &mut S1, p: *const u8, blk: usize, vm: u64, e: *mut u32, fl:
     let d = c | n;
     let fs = (d << 1) | (st.dp >> 63);
     let qs = (qq << 1) | (st.qp >> 63);
-    let fss = (fs << 1) | (st.fsp >> 63);
+    // fs << 1 with the previous block's fs bit 63 (= its d bit 62)
+    let fss = (d << 2) | (st.dp >> 62);
     let op = qq & fs;
     let mut sum = 0u64;
     let cout = _addcarry_u64(st.cin, !d, op, &mut sum);
@@ -147,7 +157,6 @@ unsafe fn block(st: &mut S1, p: *const u8, blk: usize, vm: u64, e: *mut u32, fl:
     let bad = (qs & !fss & !d) | (d & ((od ^ qs) | (qs & fss)));
     st.dp = d;
     st.qp = qq;
-    st.fsp = fs;
     st.cin = cout;
     let base = (blk * 64) as u32;
     let kb = st.kb;
@@ -201,16 +210,17 @@ unsafe fn block_slow(f: u64, qs: u64, n: u64, bad: u64, base: u32, ep: *mut u32,
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 #[inline(never)]
-unsafe fn stage1(p: *const u8, nb: usize, lastmask: u64, e: *mut u32, fl: *mut u8, pf: usize) -> usize {
+pub(crate) unsafe fn stage1(p: *const u8, nb: usize, lastmask: u64, e: *mut u32) -> usize {
+    let fl = (e as *mut u8).add(FL_OFF);
     *e = u32::MAX;
     *fl = F_NL;
     // the byte before p ends a line: a delimiter there, no quote, no carry
-    let mut st = S1 { dp: 1 << 63, qp: 0, fsp: 0, cin: 0, kb: 1 };
+    let mut st = S1 { dp: 1 << 63, qp: 0, cin: 0, kb: 1 };
     for blk in 0..nb - 1 {
-        super::prefetch(p.wrapping_add(blk * 64 + pf));
-        block(&mut st, p, blk, !0u64, e, fl);
+        super::prefetch(p.wrapping_add(blk * 64 + PFD));
+        block(&mut st, p, blk, !0u64, e);
     }
-    block(&mut st, p, nb - 1, lastmask, e, fl);
+    block(&mut st, p, nb - 1, lastmask, e);
     let kb = st.kb;
     let big = (nb * 64) as u32;
     for i in 0..NSENT {
@@ -221,6 +231,27 @@ unsafe fn stage1(p: *const u8, nb: usize, lastmask: u64, e: *mut u32, fl: *mut u
 }
 
 // ---------------------------------------------------------------- stage 2
+
+/// The line whose first entry is k is simple (7 fields, quotes only around
+/// whole fields, wholly inside the scanned bytes). k <= the entry count.
+#[inline(always)]
+pub(crate) unsafe fn is_simple(fl: *const u8, k: usize) -> bool {
+    rd64(fl.add(k)) & PAT_M == PAT
+}
+
+/// A batch of simple lines from entry k: returns k' = k + 7m, m <= max,
+/// such that the lines k, k+7, ..., k'-7 are simple and (if m < max) the
+/// line k' is not. For a batch decode reading the entries directly.
+#[allow(dead_code)]
+#[inline(always)]
+pub(crate) unsafe fn simple_run(fl: *const u8, k: usize, max: usize) -> usize {
+    let mut j = k;
+    let end = k + 7 * max;
+    while j < end && is_simple(fl, j) {
+        j += 7;
+    }
+    j
+}
 
 /// The fields of the simple line whose first entry is k, into `*c` (a
 /// `fastev::Cut` relative to the segment start): s_j = e[k+j-1] + 1 + q_j,
@@ -294,10 +325,10 @@ unsafe fn task_k6<S: EvSink, const P2: bool>(b: &[u8], task: Task, ctx: &Ctx, si
     // the scan stops 64 bytes before the end of b
     let scan_lim = b.len() - 64;
     let base = b.as_ptr();
-    let pf = fastev::PF_DIST.load(Ordering::Relaxed);
     let mut ring = MaybeUninit::<Ring>::uninit();
     let e = addr_of_mut!((*ring.as_mut_ptr()).e) as *mut u32;
     let fl = addr_of_mut!((*ring.as_mut_ptr()).fl) as *mut u8;
+    debug_assert_eq!(fl as usize - e as usize, FL_OFF);
     // the cut of the current line (written by cut_into, read by the decode)
     let mut cut = fastev::Cut { ok: true, s: [0; 7], n: [0; 7], len: 0 };
     let cp: *mut fastev::Cut = &mut cut;
@@ -311,12 +342,11 @@ unsafe fn task_k6<S: EvSink, const P2: bool>(b: &[u8], task: Task, ctx: &Ctx, si
         let nb = nbytes.div_ceil(64);
         let r = nbytes & 63;
         let lastmask = if r == 0 { !0u64 } else { (1u64 << r) - 1 };
-        let cnt = stage1(base.add(a), nb, lastmask, e, fl, pf);
+        let cnt = stage1(base.add(a), nb, lastmask, e);
         let p = base.add(a);
         let mut k = 1usize;
         loop {
-            let x = rd64(fl.add(k));
-            if x & PAT_M == PAT {
+            if is_simple(fl, k) {
                 cut_into(cp, e, fl, k);
                 if k4::decode_body::<S, P2>(kp, ctx, p, &*cp, sink) {
                     st.fast += 1;
