@@ -427,7 +427,9 @@ fn link_worker(
     if t == 0 {
         let total: usize = pairs.iter().map(|m| m.lock().unwrap().len()).sum();
         keys::verify_longs(pairs.len());
+        sys::set_label("links");
         let _ = cell.set(LinkTable::with_pairs(total, pairs.len()));
+        sys::set_label("other");
     }
     bar.wait();
     if t == 0 {
@@ -1554,9 +1556,14 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
             LINKS_US.store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         let lt = cell.get().unwrap();
+        sys::set_label("p.arec");
+        let pa = Parts::with_wc(pe, cap_a, true);
+        sys::set_label("p.srec");
+        let pss = Parts::with_wc(ps, cap_s, true);
+        sys::set_label("other");
         let mut sink = BSink {
-            a: Parts::with_wc(pe, cap_a, true),
-            s: Parts::with_wc(ps, cap_s, true),
+            a: pa,
+            s: pss,
             ring: [Pending::default(); BRING],
             rh: 0,
             rn: 0,
@@ -1581,7 +1588,9 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
         if gt.is_some() {
             sink.use_bulk = true;
         }
+        sys::set_label("p.crec");
         let mut c: Parts<CRec> = Parts::with_wc(ps, cap_c, true);
+        sys::set_label("other");
         let batched = std::env::var("SS_BATCH").is_ok();
         let mut evb = EvBatch::new();
         loop {
@@ -2454,6 +2463,7 @@ fn main() {
 /// The whole pipeline on one dataset. Returns the verbose report line.
 fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String {
     keys::new_run();
+    let memacct = std::env::var("SS_MEMACCT").is_ok();
     sys::NOHUGE.store(std::env::var("SS_NOHUGE").is_ok(), Ordering::Relaxed);
     scan::USE_V1.store(std::env::var("SS_SCAN1").is_ok(), Ordering::Relaxed);
     parts::OLD_LINE_OVER.store(std::env::var("SS_OLDOVER").map_or(false, |v| v == "1"), Ordering::Relaxed);
@@ -2630,6 +2640,16 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         // reruns the job), and the decode table for names and order
         keys::verify_longs(threads);
         marks.mark("parse");
+        if memacct {
+            let recs = |f: &dyn Fn(&BOut) -> usize| bouts.iter().map(f).sum::<usize>();
+            eprintln!(
+                "{} | live MB: arec={:.0} srec={:.0} crec={:.0}",
+                sys::mem_report("after-parse"),
+                (recs(&|o| o.a.total()) * 16) as f64 / 1048576.0,
+                (recs(&|o| o.s.total()) * 16) as f64 / 1048576.0,
+                (recs(&|o| o.c.total()) * 32) as f64 / 1048576.0
+            );
+        }
         if bouts.iter().any(|o| o.overflow) {
             pipeline = "B-overflow->legacy";
             std::mem::forget(bouts);
@@ -2644,6 +2664,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
                 keys::verify_ev_longs(threads, Some(&multi));
             }
             marks.mark("dedup");
+            if memacct {
+                eprintln!("{}", sys::mem_report("after-dedup"));
+            }
             b_result = Some((lt, bouts));
         }
         std::mem::forget(gt);
@@ -2693,6 +2716,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         }
         let mut outs = sess::sessions2(&sbufs, &cbufs, &ctx, &ud, &dead);
         marks.mark("sessions");
+        if memacct {
+            eprintln!("{}", sys::mem_report("after-sessions"));
+        }
         sess::write_campaign_daily2(&cd.join("part-0.parquet"), &mut outs, &ctx);
         marks.mark("write");
         outs.iter().map(|o| o.nrows).sum()

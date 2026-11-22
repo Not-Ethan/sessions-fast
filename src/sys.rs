@@ -166,7 +166,88 @@ pub fn alloc_arena(bytes: usize) -> *mut u8 {
     #[cfg(not(target_os = "linux"))]
     let _ = madvise;
     ARENAS.lock().unwrap().push((p as usize, bytes));
+    LABELS.lock().unwrap().push((p as usize, bytes, LABEL.with(|l| l.get())));
     p as *mut u8
+}
+
+thread_local! {
+    static LABEL: std::cell::Cell<&'static str> = const { std::cell::Cell::new("other") };
+}
+/// Every arena with the label that was current when it was allocated
+/// (memory accounting, SS_MEMACCT).
+static LABELS: std::sync::Mutex<Vec<(usize, usize, &'static str)>> = std::sync::Mutex::new(Vec::new());
+
+/// Label for the arenas this thread allocates from now on (accounting only).
+pub fn set_label(l: &'static str) {
+    LABEL.with(|c| c.set(l));
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> i32;
+}
+
+/// SS_MEMACCT: per label, MB reserved, MB resident (touched and not
+/// released), MB of it in huge pages (smaps AnonHugePages), plus the
+/// process's RSS; one line for `phase`.
+pub fn mem_report(phase: &str) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        use std::collections::BTreeMap;
+        let labels = LABELS.lock().unwrap().clone();
+        // AnonHugePages per mapping start
+        let mut huge: Vec<(usize, usize, usize)> = Vec::new();
+        if let Ok(t) = std::fs::read_to_string("/proc/self/smaps") {
+            let (mut lo, mut hi) = (0usize, 0usize);
+            for line in t.lines() {
+                if let Some((range, _)) = line.split_once(' ') {
+                    if let Some((a, b)) = range.split_once('-') {
+                        if let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) {
+                            lo = a;
+                            hi = b;
+                            continue;
+                        }
+                    }
+                }
+                if let Some(v) = line.strip_prefix("AnonHugePages:") {
+                    let kb: usize = v.trim().trim_end_matches("kB").trim().parse().unwrap_or(0);
+                    if kb > 0 {
+                        huge.push((lo, hi, kb * 1024));
+                    }
+                }
+            }
+        }
+        let mut agg: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
+        for &(a, l, lab) in &labels {
+            let pages = l.div_ceil(4096);
+            let mut v = vec![0u8; pages];
+            let res = unsafe { mincore(a as *mut c_void, pages * 4096, v.as_mut_ptr()) };
+            let resident = if res == 0 { v.iter().filter(|&&b| b & 1 != 0).count() * 4096 } else { 0 };
+            // huge pages of mappings inside this arena
+            let h: usize = huge.iter().filter(|&&(lo, hi, _)| lo >= a && hi <= a + l.div_ceil(4096) * 4096).map(|x| x.2).sum();
+            let e = agg.entry(lab).or_insert((0, 0, 0));
+            e.0 += l;
+            e.1 += resident;
+            e.2 += h;
+        }
+        let mb = |x: usize| x as f64 / (1 << 20) as f64;
+        let mut out = format!("memacct {}:", phase);
+        for (lab, (r, t, h)) in agg {
+            out.push_str(&format!(" {}={:.0}/{:.0}/{:.0}", lab, mb(r), mb(t), mb(h)));
+        }
+        let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for k in ["VmRSS:", "RssAnon:", "RssFile:", "VmHWM:"] {
+            if let Some(l) = st.lines().find(|l| l.starts_with(k)) {
+                let kb: usize = l[k.len()..].trim().trim_end_matches("kB").trim().parse().unwrap_or(0);
+                out.push_str(&format!(" {}{:.0}", k, kb as f64 / 1024.0));
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        format!("memacct {}: (linux only)", phase)
+    }
 }
 
 /// Experiment switch (SS_NOHUGE): no MADV_HUGEPAGE on arenas.

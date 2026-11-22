@@ -827,7 +827,9 @@ pub fn sessions2(sbufs: &[&Parts<SRec>], cbufs: &[&Parts<CRec>], ctx: &Ctx, ud: 
     let bar = std::sync::Barrier::new(ctx.threads);
     let next_piece = AtomicUsize::new(0);
     par(ctx.threads, |t| {
+        sys::set_label("sess");
         let mut st = St::new(ctx, est_rows, max_ev, max_cl);
+        sys::set_label("other");
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(&(_, q)) = order.get(i) else { break };

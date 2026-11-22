@@ -371,7 +371,10 @@ fn long_key<const EV: bool>(pre: u8, hi: u64, lo: u64) -> u64 {
 #[cold]
 #[inline(never)]
 fn new_log(hint: usize) -> *mut Parts<LEnt> {
-    Box::into_raw(Box::new(Parts::with_wc(NPART, hint / NPART * 5 / 4 + 64, true)))
+    crate::sys::set_label("log");
+    let p = Parts::with_wc(NPART, hint / NPART * 5 / 4 + 64, true);
+    crate::sys::set_label("other");
+    Box::into_raw(Box::new(p))
 }
 
 #[inline(always)]
