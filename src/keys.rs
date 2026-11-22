@@ -299,6 +299,7 @@ pub fn long_settings() {
         LONG_OFF.store(true, AO::Relaxed);
     }
     VERIFY_OCC.store(std::env::var("SS_VERIFYOCC").map_or(false, |v| v == "1"), AO::Relaxed);
+    KNOWN_REQ.store(std::env::var("SS_KNOWN").map_or(false, |v| v == "1"), AO::Relaxed);
 }
 
 /// SS_VERIFYOCC=1: the verification index sized from occurrences (as before).
@@ -373,6 +374,13 @@ fn long_key<const EV: bool>(pre: u8, hi: u64, lo: u64) -> u64 {
     let bits = LONG_BITS.load(AO::Relaxed);
     let h = if bits >= 60 { h } else { h & ((1u64 << bits) - 1) };
     let key = (h << 4) | 0xE;
+    // a user ID that is exactly one of the linked long IDs (verified with
+    // the links, in the decode table) needs no log entry: its key was
+    // logged with the links, so the final verification still sees every
+    // (key, value) pair that occurs (SS_KNOWN=1, experiment)
+    if !EV && KNOWN_ON.load(AO::Relaxed) && known_exact(key, pre as u64, hi, lo) {
+        return key;
+    }
     let log = if EV { &EVLOG } else { &LOG };
     log.with(|l| {
         let mut p = l.get();
@@ -383,6 +391,34 @@ fn long_key<const EV: bool>(pre: u8, hi: u64, lo: u64) -> u64 {
         unsafe { (*p).push_unchecked((key >> (64 - TAB_BITS)) as usize, LEnt { key, pre: pre as u64, hi, lo }) };
     });
     key
+}
+
+/// Linked long IDs skip the user log while parsing events and clicks
+/// (between the link verification and the final one; SS_KNOWN=1).
+static KNOWN_ON: AtomicBool = AtomicBool::new(false);
+static KNOWN_REQ: AtomicBool = AtomicBool::new(false);
+
+/// The decode table (built by the link verification) holds exactly this ID.
+#[inline(always)]
+fn known_exact(key: u64, pre: u64, hi: u64, lo: u64) -> bool {
+    let t = TAB.load(AO::Acquire);
+    if t.is_null() {
+        return false;
+    }
+    let t = unsafe { &*t };
+    let pt = unsafe { t.parts.get_unchecked((key >> (64 - TAB_BITS)) as usize) };
+    let mut s = slot_of(key, pt.mask);
+    loop {
+        let i = unsafe { *pt.idx.get_unchecked(s) };
+        if i == 0 {
+            return false;
+        }
+        let e = unsafe { pt.ents.get_unchecked(i as usize - 1) };
+        if e.key == key {
+            return (e.pre == pre) & (e.hi == hi) & (e.lo == lo);
+        }
+        s = (s + 1) & pt.mask;
+    }
 }
 
 #[cold]
@@ -429,6 +465,7 @@ fn clear_logs() {
 /// ingest_ts rerun) are dropped; seed and interner mode are kept.
 pub fn new_run() {
     clear_logs();
+    KNOWN_ON.store(false, AO::Relaxed);
     VERIFY_CALLS.store(0, AO::Relaxed);
     TAB.store(std::ptr::null_mut(), AO::Release);
 }
@@ -466,6 +503,7 @@ pub fn collision() -> bool {
 /// LONG_TRIES seeds), logs and tables cleared. Returns the attempt number.
 pub fn reset_longs(attempt: u64) {
     clear_logs();
+    KNOWN_ON.store(false, AO::Relaxed);
     TAB.store(std::ptr::null_mut(), AO::Release);
     COLLISION.store(false, AO::Relaxed);
     if attempt >= LONG_TRIES {
@@ -480,11 +518,19 @@ pub fn reset_longs(attempt: u64) {
 /// the number of distinct long IDs (0 and no work when there are none).
 pub fn verify_longs(threads: usize) -> usize {
     let t0 = std::time::Instant::now();
+    KNOWN_ON.store(false, AO::Relaxed);
     let d = verify_longs_inner(threads);
     LOG_HINT.store(LOG_HINT_NEXT.load(AO::Relaxed), AO::Relaxed);
     let ns = t0.elapsed().as_nanos() as u64;
     VERIFY_NS.fetch_add(ns, AO::Relaxed);
-    VERIFY_SPLIT[VERIFY_CALLS.fetch_add(1, AO::Relaxed).min(1)].store(ns, AO::Relaxed);
+    let call = VERIFY_CALLS.fetch_add(1, AO::Relaxed);
+    VERIFY_SPLIT[call.min(1)].store(ns, AO::Relaxed);
+    // after the link verification the decode table holds exactly the
+    // linked long IDs: from now until the next verification, user IDs found
+    // in it are not logged
+    if call == 0 && KNOWN_REQ.load(AO::Relaxed) && !LONG_OFF.load(AO::Relaxed) {
+        KNOWN_ON.store(true, AO::Relaxed);
+    }
     d
 }
 
