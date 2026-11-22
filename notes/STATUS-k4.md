@@ -116,5 +116,16 @@ dev5 e7 e23 e60. Lifetime A/B (image ss-k4v2a, SS_K4=0 vs 1): running.
 - v2c: pack2 key assembly in SIMD (3 shifts, 2 ands, 2 ors, 2 extracts instead of 4 extracts
   + 16 scalar ops).
 
+- v2b result: exact (tests 37; SS_K4CHECK OK dev5 e7 e23 e60 d23; outputs = references
+  dev5 e7 e23 e60; lines taken by neither lean shape 2.4-2.6%, was ~6%), but SLOWER than
+  v2a-rebased in a 10-round interleaved image A/B (ss-k4rb vs ss-k4b, SS_K4=1, e23): k4b higher
+  in 10/10 rounds, about +15 ms (pairs 856.6/881.1 849.9/865.2 846.6/865.0 851.8/860.3
+  846.3/867.2 847.4/852.4 852.4/863.4, plus 3 noisy pairs); e60 x3 +29 +49 +58. Not tagged.
+  Count 551.7/line (Rust 1.85 v2, line bench) but the rebased baseline count is still to
+  measure (keys.rs changed under the rebase), so not comparable to 544.3.
+- v2c = 832b23a (v2b + pack2 SIMD keys + f3_13 load from q-3): validation + A/B vs ss-k4b running.
+- v2d = dbdc771 (v2c with shape B moved into slow_line, out of the hot loop; SS_K4SHAPEB=0
+  off): queued, A/B vs ss-k4rb.
+
 ## Next
-- validate v2b, tag; validate v2c; then decode: F2 offset without imul, type check, spills.
+- tag the best exact version that beats ss-k4rb; push decode steps to ss-k4-rebased.
