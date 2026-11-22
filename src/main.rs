@@ -1716,7 +1716,8 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
         let tbase = ((t as u64) << (lb.qbits + lb.ibits)) as u32;
         let batched = std::env::var("SS_BATCH").is_ok();
         let mut ccache = PCache::new();
-        let tl = TaskLoop { ev, cl, ctx, lt, next: &next, ntasks, populate, release, batched };
+        let defer = std::env::var("SS_CDEFER").map_or(false, |v| v == "1");
+        let tl = TaskLoop { ev, cl, ctx, lt, next: &next, ntasks, populate, release, batched, defer, est_clicks: est_clicks / ctx.threads * 5 / 4 + 1024 };
         // the lean sink unless a mode needs BSink (table mode, person cache,
         // ring instead of bulk queue, batched parsing) or SS_LEAN=0
         let lean = gt.is_none()
@@ -1785,6 +1786,65 @@ struct TaskLoop<'a> {
     populate: bool,
     release: bool,
     batched: bool,
+    /// clicks parsed with their person unresolved, resolved after the
+    /// thread's last task (SS_CDEFER=1, experiment; see `DeferC`)
+    defer: bool,
+    est_clicks: usize,
+}
+
+/// Deferred clicks (SS_CDEFER=1): click tasks run against an empty link
+/// table, so every click comes out with person = keys::mix(user key) (the
+/// value an absent user gets); they are kept in parse order in a per-thread
+/// buffer, and after the thread's last task one pass resolves each person
+/// with prefetched table probes (user key = keys::unmix(that value)) and
+/// pushes the clicks into the thread's click partitions in the same order:
+/// the same records in the same order as resolving them while parsing.
+struct DeferC {
+    ptr: *mut CRec,
+    len: usize,
+    cap: usize,
+    over: Vec<CRec>,
+}
+
+impl DeferC {
+    fn new(cap: usize) -> DeferC {
+        let cap = cap.max(1024);
+        sys::set_label("cdefer");
+        let ptr = sys::alloc_arena(cap * std::mem::size_of::<CRec>()) as *mut CRec;
+        sys::set_label("other");
+        DeferC { ptr, len: 0, cap, over: Vec::new() }
+    }
+
+    /// Resolves every buffered click's person and pushes it into `c`.
+    fn resolve<C: CSink>(&mut self, lt: &LinkTable, ps_shift: u32, c: &mut C) {
+        let a = unsafe { std::slice::from_raw_parts(self.ptr, self.len) };
+        let over = std::mem::take(&mut self.over);
+        const D: usize = 16;
+        let n = a.len() + over.len();
+        let at = |i: usize| if i < a.len() { &a[i] } else { &over[i - a.len()] };
+        for i in 0..n {
+            if i + D < n {
+                lt.prefetch_h(at(i + D).person);
+            }
+            let r = *at(i);
+            let h = r.person;
+            let person = person_hash(lt, keys::unmix(h), h);
+            c.push_click((person >> ps_shift) as usize, CRec { person, ..r });
+        }
+        self.len = 0;
+    }
+}
+
+impl CSink for DeferC {
+    #[inline(always)]
+    fn push_click(&mut self, _q: usize, r: CRec) {
+        if self.len < self.cap {
+            unsafe { self.ptr.add(self.len).write(r) };
+            self.len += 1;
+        } else {
+            self.over.push(r);
+        }
+    }
 }
 
 impl TaskLoop<'_> {
@@ -1794,6 +1854,9 @@ impl TaskLoop<'_> {
         let (ev, cl, ctx, lt) = (self.ev, self.cl, self.ctx, self.lt);
         let avx2 = ctx.avx2;
         let mut evb = if self.batched { Some(EvBatch::new()) } else { None };
+        let defer = self.defer && !cache.on;
+        let empty = LinkTable::empty();
+        let mut dc: Option<DeferC> = None;
         loop {
             let i = self.next.fetch_add(1, Ordering::Relaxed);
             if i >= self.ntasks {
@@ -1836,7 +1899,17 @@ impl TaskLoop<'_> {
                 if self.populate {
                     sys::populate_read(b.as_ptr() as usize + task.start, task.end - task.start);
                 }
-                if avx2 {
+                if defer {
+                    let d = dc.get_or_insert_with(|| DeferC::new(self.est_clicks));
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            click_task_avx2(b, task, ctx, &empty, d, safe_end, cache)
+                        }
+                    } else {
+                        click_task::<false, _>(b, task, ctx, &empty, d, safe_end, cache)
+                    }
+                } else if avx2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
                         click_task_avx2(b, task, ctx, lt, c, safe_end, cache)
@@ -1849,7 +1922,60 @@ impl TaskLoop<'_> {
                 }
             }
         }
+        if let Some(d) = dc.as_mut() {
+            d.resolve(lt, 64 - ctx.ps_bits, c);
+        }
     }
+}
+
+/// SS_CDEFERCHECK=1: every click task through the click path as configured
+/// (k5 or not) resolving persons while parsing, and through the deferred
+/// path (empty link table, then `DeferC::resolve`); the records handed to
+/// the click partitions (partition, person, click key, ts, campaign) must be
+/// identical and in the same order. Exits 1 on the first difference.
+fn cdefer_check(links_in: &Input, cl: &Input, ctx: &Ctx) {
+    let t0 = Instant::now();
+    let lb = LocBits::new(ctx.threads, ctx.ps_bits).expect("location bits");
+    let none = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
+    let (lt, _) = parse_b(links_in, &none, &none, ctx, lb, None);
+    let empty = LinkTable::empty();
+    let ps_shift = 64 - ctx.ps_bits;
+    let next = AtomicUsize::new(0);
+    let res = par(ctx.threads, |_| {
+        let mut cache = PCache { slots: vec![(0, 0); 2], shift: 63, on: false };
+        let (mut lines, mut recs) = (0usize, 0usize);
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&task) = cl.tasks.get(i) else { break };
+            let b = cl.maps[task.file as usize].bytes();
+            let safe_end = b.as_ptr() as usize + b.len();
+            let mut want = k5::RecC::default();
+            let mut d = DeferC::new(1024);
+            let mut got = k5::RecC::default();
+            if ctx.avx2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    click_task_avx2(b, task, ctx, &lt, &mut want, safe_end, &mut cache);
+                    click_task_avx2(b, task, ctx, &empty, &mut d, safe_end, &mut cache);
+                }
+            } else {
+                click_task::<false, _>(b, task, ctx, &lt, &mut want, safe_end, &mut cache);
+                click_task::<false, _>(b, task, ctx, &empty, &mut d, safe_end, &mut cache);
+            }
+            d.resolve(&lt, ps_shift, &mut got);
+            let (w, g) = (k5::norm(want.0), k5::norm(got.0));
+            if w != g {
+                let k = w.iter().zip(&g).position(|(a, b)| a != b).unwrap_or(w.len().min(g.len()));
+                eprintln!("cdefercheck: MISMATCH file {} [{}, {}): {} direct vs {} deferred records; first difference #{}: {:?} vs {:?}", task.file, task.start, task.end, w.len(), g.len(), k, w.get(k), g.get(k));
+                std::process::exit(1);
+            }
+            lines += b[task.start..task.end].iter().filter(|&&c| c == b'\n').count();
+            recs += w.len();
+        }
+        (lines, recs)
+    });
+    let (lines, recs) = res.iter().fold((0, 0), |a, r| (a.0 + r.0, a.1 + r.1));
+    eprintln!("cdefercheck: OK {} tasks, {} lines, {} click records identical ({:.0} ms)", cl.tasks.len(), lines, recs, t0.elapsed().as_secs_f64() * 1e3);
 }
 
 /// Wall time of the links step of `parse_b` (verbose report).
@@ -2897,6 +3023,10 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
         k5::check(&links_in, &clicks_in, &ctx);
         std::process::exit(0);
     }
+    if std::env::var("SS_CDEFERCHECK").is_ok() {
+        cdefer_check(&links_in, &clicks_in, &ctx);
+        std::process::exit(0);
+    }
     if std::env::var("SS_FLOOR").is_ok() {
         floor_bench(&events_in, &ctx);
         std::process::exit(0);
@@ -2957,7 +3087,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
             marks.mark("dedup");
             // dead now: the dedup records, the long-ID logs (checked), the
             // link table (persons resolved): later consumers reuse them
-            sys::give_back_labels(&["p.arec", "log", "links"]);
+            sys::give_back_labels(&["p.arec", "log", "links", "cdefer"]);
             if memacct {
                 eprintln!("{}", sys::mem_report("after-dedup"));
             }
