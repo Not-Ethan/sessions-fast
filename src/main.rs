@@ -2386,6 +2386,9 @@ fn write_campaign_daily(path: &Path, souts: &[SOut], ctx: &Ctx) {
 
 // ---------------------------------------------------------------- main
 
+/// Which build this is (the x86-64-v3 one has AVX2 enabled everywhere).
+const BUILD: &str = if cfg!(target_feature = "avx2") { "v3" } else { "baseline" };
+
 /// Build-time smoke test: the static binary runs, threads spawn, parsers work.
 fn self_test() {
     assert_eq!(ts::parse_ts(b"2026-10-03T19:58:10-04:00"), Some(1791071890000));
@@ -2398,7 +2401,7 @@ fn self_test() {
     assert_eq!(n, 1);
     let r = par(4, |t| t * 2);
     assert_eq!(r, vec![0, 2, 4, 6]);
-    eprintln!("self-test ok");
+    eprintln!("self-test ok ({})", BUILD);
 }
 
 fn ceil_log2(x: usize) -> u32 {
@@ -2409,8 +2412,59 @@ fn ceil_log2(x: usize) -> u32 {
     }
 }
 
+/// Path of the binary built for x86-64-v3 (Dockerfile); the baseline build
+/// hands over to it when the CPU has every feature it needs.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+const TUNED: &str = "/sessions-v3";
+
+/// Every feature of the x86-64-v3 level (beyond the v2 baseline this binary
+/// already requires), with OS support for the YMM state (the macro checks
+/// OSXSAVE/XGETBV for AVX).
+#[cfg(target_arch = "x86_64")]
+fn has_v3() -> bool {
+    std::arch::is_x86_feature_detected!("avx")
+        && std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("bmi1")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c")
+        && std::arch::is_x86_feature_detected!("lzcnt")
+        && std::arch::is_x86_feature_detected!("movbe")
+        && std::arch::is_x86_feature_detected!("popcnt")
+        && std::arch::is_x86_feature_detected!("xsave")
+}
+
+/// Baseline build only: replaces this process with the tuned binary (same
+/// arguments and environment) when it exists and the CPU supports it.
+/// Returns only if that is not possible (or SS_NOEXEC=1): then this binary
+/// runs as usual.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+fn exec_tuned() {
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os("SS_NOEXEC").is_some_and(|v| v == "1") || !has_v3() || !Path::new(TUNED).is_file() {
+        return;
+    }
+    let mut args = std::env::args_os();
+    let arg0 = args.next();
+    let mut cmd = std::process::Command::new(TUNED);
+    if let Some(a0) = arg0 {
+        cmd.arg0(a0);
+    }
+    // only returns on failure
+    let _ = cmd.args(args).exec();
+}
+
 fn main() {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    exec_tuned();
     let args: Vec<String> = std::env::args().collect();
+    // build check (Dockerfile): exit 0 iff this CPU can run the x86-64-v3 build
+    if args.len() == 2 && args[1] == "--has-v3" {
+        #[cfg(target_arch = "x86_64")]
+        std::process::exit(if has_v3() { 0 } else { 1 });
+        #[cfg(not(target_arch = "x86_64"))]
+        std::process::exit(1);
+    }
     if args.len() == 2 && args[1] == "--self-test" {
         self_test();
         return;
@@ -2772,8 +2826,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
 
     if verbose {
         return format!(
-            "sessions: {} | pipeline={} links={:.1}ms {} threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} {} wc_over_lines={} peak_rss={}MB {} | sub:{}",
+            "sessions: {} | build={} pipeline={} links={:.1}ms {} threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} {} wc_over_lines={} peak_rss={}MB {} | sub:{}",
             marks.report(),
+            BUILD,
             pipeline,
             LINKS_US.load(Ordering::Relaxed) as f64 / 1e3,
             link_report(),
