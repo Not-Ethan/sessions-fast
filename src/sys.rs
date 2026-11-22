@@ -216,6 +216,21 @@ pub fn release_inner(from: usize, to: usize) {
     }
 }
 
+/// Maps the pages of [addr, addr + len) of a file mapping for reading in one
+/// call (MADV_POPULATE_READ, Linux 5.14+; errors ignored: then the pages are
+/// simply faulted in on access).
+pub fn populate_read(addr: usize, len: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        let a = addr & !4095;
+        unsafe {
+            madvise(a as *mut c_void, len + (addr - a), 22);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (addr, len);
+}
+
 /// Releases the pages of [addr, addr + len) (MADV_DONTNEED; the start is
 /// rounded down to a page boundary).
 pub fn release(addr: usize, len: usize) {

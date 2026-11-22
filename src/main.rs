@@ -1509,6 +1509,8 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
     let est_clicks = cl.bytes / 44 + 1;
     let cap_c = est_clicks / (ctx.threads * ps) * 5 / 4 + 32;
     let release = std::env::var("SS_NORELEASE").is_err();
+    // map a chunk's pages in one call before parsing it (SS_POPULATE=1, experiment)
+    let populate = std::env::var("SS_POPULATE").is_ok();
     let ntasks = ev.tasks.len() + cl.tasks.len();
     let next = AtomicUsize::new(0);
     let avx2 = ctx.avx2;
@@ -1565,6 +1567,9 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
                 let task = ev.tasks[i];
                 let b = ev.maps[task.file as usize].bytes();
                 let safe_end = b.as_ptr() as usize + b.len();
+                if populate {
+                    sys::populate_read(b.as_ptr() as usize + task.start, task.end - task.start);
+                }
                 if batched {
                     if avx2 {
                         #[cfg(target_arch = "x86_64")]
@@ -1592,6 +1597,9 @@ fn parse_b(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, lb: LocBits, gt:
                 let task = cl.tasks[i - ev.tasks.len()];
                 let b = cl.maps[task.file as usize].bytes();
                 let safe_end = b.as_ptr() as usize + b.len();
+                if populate {
+                    sys::populate_read(b.as_ptr() as usize + task.start, task.end - task.start);
+                }
                 if avx2 {
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
