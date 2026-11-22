@@ -133,6 +133,77 @@ fn bm_click(bm: &mut Bm, nb: usize, ts: u32, camp: u32) -> u64 {
     m
 }
 
+/// The click loop of attribute_bm for NB (1 or 2) blocks of 8 sessions with
+/// the lanes held in registers across the clicks (the same rule as
+/// `bm_click`); the campaign masks as in attribute_bm.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn bm_clicks_reg<const NB: usize>(bm: &mut Bm, pc: &[Cl], amask: &mut [u64], atouched: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut lo = [_mm256_setzero_si256(); NB];
+        let mut hi = [_mm256_setzero_si256(); NB];
+        let mut bt = [_mm256_setzero_si256(); NB];
+        let mut bc = [_mm256_setzero_si256(); NB];
+        let mut mx = [_mm256_setzero_si256(); NB];
+        for b in 0..NB {
+            lo[b] = _mm256_load_si256(bm.lo.as_ptr().add(b * 8) as *const __m256i);
+            hi[b] = _mm256_load_si256(bm.hi.as_ptr().add(b * 8) as *const __m256i);
+        }
+        let ones = _mm256_set1_epi32(-1);
+        for c in pc {
+            let tsv = _mm256_set1_epi32(c.ts as i32);
+            let t1 = _mm256_set1_epi32(c.ts.wrapping_add(1) as i32);
+            let cv = _mm256_set1_epi32(c.camp as i32);
+            let mut m = 0u64;
+            for b in 0..NB {
+                let el = _mm256_and_si256(
+                    _mm256_cmpeq_epi32(_mm256_max_epu32(tsv, lo[b]), tsv),
+                    _mm256_cmpeq_epi32(_mm256_min_epu32(tsv, hi[b]), tsv),
+                );
+                m |= (_mm256_movemask_ps(_mm256_castsi256_ps(el)) as u32 as u64) << (8 * b);
+                // as bm_click (a lane that does not qualify is left as it is,
+                // up to a harmless mx bit while it has no click)
+                let t = _mm256_and_si256(t1, el);
+                let nbt = _mm256_max_epu32(bt[b], t);
+                let later = _mm256_xor_si256(_mm256_cmpeq_epi32(nbt, bt[b]), ones);
+                let diff = _mm256_andnot_si256(_mm256_cmpeq_epi32(bc[b], cv), _mm256_cmpeq_epi32(bt[b], t));
+                mx[b] = _mm256_or_si256(_mm256_andnot_si256(later, mx[b]), diff);
+                bt[b] = nbt;
+                bc[b] = _mm256_blendv_epi8(bc[b], cv, later);
+            }
+            if m != 0 {
+                let a = amask.get_unchecked_mut(c.camp as usize);
+                if *a == 0 {
+                    atouched.push(c.camp);
+                }
+                *a |= m;
+            }
+        }
+        for b in 0..NB {
+            _mm256_store_si256(bm.bt.as_mut_ptr().add(b * 8) as *mut __m256i, bt[b]);
+            _mm256_store_si256(bm.bc.as_mut_ptr().add(b * 8) as *mut __m256i, bc[b]);
+            _mm256_store_si256(bm.mx.as_mut_ptr().add(b * 8) as *mut __m256i, mx[b]);
+        }
+    }
+}
+
+/// `bm_clicks_reg` without AVX2: the per-click loop.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn bm_clicks_reg<const NB: usize>(bm: &mut Bm, pc: &[Cl], amask: &mut [u64], atouched: &mut Vec<u32>) {
+    for c in pc {
+        let m = bm_click(bm, NB, c.ts, c.camp);
+        if m != 0 {
+            let a = &mut amask[c.camp as usize];
+            if *a == 0 {
+                atouched.push(c.camp);
+            }
+            *a |= m;
+        }
+    }
+}
+
 /// `bm_click` without AVX2 (the same rule, one lane at a time): unused in
 /// the baseline binary (attribute_bm is off there), kept for the tests.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
@@ -899,14 +970,21 @@ impl St {
                 bm.mx[i] = 0;
             }
         }
-        for c in pc {
-            let m = bm_click(&mut self.bm, nb, c.ts, c.camp);
-            if m != 0 {
-                let a = &mut self.amask[c.camp as usize];
-                if *a == 0 {
-                    self.atouched.push(c.camp);
+        // up to 16 sessions: the lanes stay in registers for all clicks
+        if nb == 1 {
+            bm_clicks_reg::<1>(&mut self.bm, pc, &mut self.amask, &mut self.atouched);
+        } else if nb == 2 {
+            bm_clicks_reg::<2>(&mut self.bm, pc, &mut self.amask, &mut self.atouched);
+        } else {
+            for c in pc {
+                let m = bm_click(&mut self.bm, nb, c.ts, c.camp);
+                if m != 0 {
+                    let a = &mut self.amask[c.camp as usize];
+                    if *a == 0 {
+                        self.atouched.push(c.camp);
+                    }
+                    *a |= m;
                 }
-                *a |= m;
             }
         }
         // assists: per campaign, its sessions counted per day run (sessions
