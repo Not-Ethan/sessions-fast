@@ -299,17 +299,16 @@ pub(crate) unsafe fn pack2(a: *const u8, na: usize, b: *const u8, nb: usize) -> 
     let u = _mm256_madd_epi16(t, _mm256_set1_epi32(0x0001_1000));
     // per lane, dwords [l0, l1, l2, l3] (24-bit groups of 4 codes); the key of
     // pack_wide is (((l0 << 36) | (l1 << 12) | (l2 >> 12)) << 4) | n
-    //   = l0 << 40 | l1 << 16 | ((l2 >> 12) << 4) | n, built in the low qword:
-    let top = _mm256_slli_epi64::<40>(u); // l0 << 40 (l1 shifted out)
-    let mid = _mm256_and_si256(_mm256_srli_epi64::<16>(u), _mm256_set1_epi64x(!0xFFFF)); // l1 << 16
-    let bot = _mm256_and_si256(_mm256_srli_epi64::<8>(_mm256_srli_si256::<8>(u)), _mm256_set1_epi64x(0xFFF0)); // (l2 >> 12) << 4
-    let k = _mm256_or_si256(_mm256_or_si256(top, mid), bot);
-    let ka = _mm_cvtsi128_si64(_mm256_castsi256_si128(k)) as u64;
-    let kb = _mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(k)) as u64;
+    //   = l0 << 40 | l1 << 16 | ((l2 >> 12) << 4) | n: bytes 0..8 of the key
+    // are l2 bytes 1, 2, l1 bytes 0..3, l0 bytes 0..3 (one byte shuffle); key
+    // bits 0..4 then hold l2 bits 8..12, replaced by n
+    let kv = _mm256_shuffle_epi8(u, _mm256_setr_epi8(9, 10, 4, 5, 6, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, 9, 10, 4, 5, 6, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1));
+    let ka = (_mm_cvtsi128_si64(_mm256_castsi256_si128(kv)) as u64 & !0xF) | na as u64;
+    let kb = (_mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(kv)) as u64 & !0xF) | nb as u64;
     let inv = _mm256_movemask_epi8(invalid) as u32;
     let oka = ((inv & 0xFFFF) == 0) & (na.wrapping_sub(1) < 10);
     let okb = ((inv >> 16) == 0) & (nb.wrapping_sub(1) < 10);
-    (ka | na as u64, oka, kb | nb as u64, okb)
+    (ka, oka, kb, okb)
 }
 
 // ---------------------------------------------------------------- split
@@ -339,6 +338,25 @@ fn window(d: u64, q: u64, r: u64) -> (u64, u64, u64) {
     let bad = ((q ^ (qs | cl)) | (qs & cl)) & r;
     let cs = (fs & !q) | (qs << 1);
     let ce = (d & !(cl << 1)) | cl;
+    (bad, cs, ce)
+}
+
+/// `window` in the shorter form (fs given; region r): with qr = q & r and qs
+/// = qr & fs the quoted starts, the quotes in r must be exactly qs and the
+/// closing quotes cl, so bad = (qr & !fs) ^ cl (a one-byte quoted field puts
+/// its cl on a field start, which qr & !fs lacks); quoted starts are never
+/// adjacent, nor are closing quotes, so qs * 3 = qs | qs << 1 and cl * 3 =
+/// cl | cl << 1: cs = fs ^ (qs * 3), ce = d ^ (cl * 3). Same (bad == 0, and
+/// then the same starts / ends inside r) as `window` (the checker and the
+/// tests compare them).
+#[inline(always)]
+fn window_r(d: u64, q: u64, r: u64, fs: u64) -> (u64, u64, u64) {
+    let qr = q & r;
+    let qs = qr & fs;
+    let cl = ((!d).wrapping_add(qs) & d) >> 1;
+    let bad = (qr & !fs) ^ cl;
+    let cs = fs ^ qs.wrapping_mul(3);
+    let ce = d ^ cl.wrapping_mul(3);
     (bad, cs, ce)
 }
 
@@ -508,7 +526,7 @@ unsafe fn split_lean<const K: usize>(c0: u64, n0: u64, q0: u64, c1: u64, n1: u64
         x1 = blsr(x1);
     }
     let r1 = upto(x1);
-    let (b1, cs1, ce1) = window(d0, q0, r1);
+    let (b1, cs1, ce1) = window_r(d0, q0, r1, (d0 << 1) | 1);
     let ek = tz(x1); // DK (64 if absent)
     // window 2: bit i = byte le - 63 + i (zeros below byte 0)
     let sh = 127usize.wrapping_sub(le) & 127;
@@ -519,11 +537,8 @@ unsafe fn split_lean<const K: usize>(c0: u64, n0: u64, q0: u64, c1: u64, n1: u64
     let bkp1 = (ek + 64).wrapping_sub(le); // valid iff <= 63
     let r2 = (!0u64).wrapping_shl(bkp1 as u32); // bits (bk, 63]
     let fs = (dw << 1) | 1;
-    let qs = qw & fs & r2;
-    let cl = ((!dw).wrapping_add(qs) & dw) >> 1;
-    let b2bad = ((qw ^ (qs | cl)) | (qs & cl)) & r2;
-    let cs2 = ((fs & !qw) | (qs << 1)) & r2;
-    let ce2 = ((dw & !(cl << 1)) | cl) & r2;
+    let (b2bad, cs2, ce2) = window_r(dw, qw, r2, fs);
+    let (cs2, ce2) = (cs2 & r2, ce2 & r2);
     // delimiters in (DK, le]: 6 - K commas, then the newline at bit 63
     let y = dw & r2;
     let mut yr = blsr(blsr(blsr(y)));
