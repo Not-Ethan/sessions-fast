@@ -477,24 +477,44 @@ mod imp {
             if !self.own {
                 return self.lt.person_hash(k, h);
             }
-            let kk = _mm256_set1_epi64x(k as i64);
-            let z = _mm256_setzero_si256();
-            let mut i = h as usize & self.mask & self.amask;
-            loop {
-                let g = self.slots.add(2 * i) as *const __m256i;
-                let a = _mm256_loadu_si256(g);
-                let b = _mm256_loadu_si256(g.add(1));
-                let m = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, kk))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, kk))) << 4)) as u32 & 0x55;
-                let e = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, z))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, z))) << 4)) as u32 & 0x55;
-                if m != 0 {
-                    let v = *self.slots.add(2 * i + m.trailing_zeros() as usize + 1);
-                    return if self.mixed { v } else { keys::mix(v) };
+            match probe_view(self.slots, self.mask, k, h) {
+                Some(v) => {
+                    if self.mixed {
+                        v
+                    } else {
+                        keys::mix(v)
+                    }
                 }
-                if e != 0 {
-                    return h;
-                }
-                i = (i + 4) & self.mask;
+                None => h,
             }
+        }
+    }
+
+    /// `LinkTable::probe` over `LinkTable::view()` (`slots`, `mask`; only
+    /// for amask == !3 and mask != 0): the raw finalized slot value of key
+    /// `k` (hash `h`), if `k` is in the table. Same probe sequence (4-slot
+    /// groups from h & mask & !3, wrapping), same rule: in the first group
+    /// holding a match or an empty slot, the first matching slot's value,
+    /// or None if the group holds no match. Each group is compared in two
+    /// ymm registers (keys at even u64 lanes). Inlines into AVX2 code only.
+    #[inline(always)]
+    pub(crate) unsafe fn probe_view(slots: *const u64, mask: usize, k: u64, h: u64) -> Option<u64> {
+        let kk = _mm256_set1_epi64x(k as i64);
+        let z = _mm256_setzero_si256();
+        let mut i = h as usize & mask & !3;
+        loop {
+            let g = slots.add(2 * i) as *const __m256i;
+            let a = _mm256_loadu_si256(g);
+            let b = _mm256_loadu_si256(g.add(1));
+            let m = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, kk))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, kk))) << 4)) as u32 & 0x55;
+            let e = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, z))) | (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, z))) << 4)) as u32 & 0x55;
+            if m != 0 {
+                return Some(*slots.add(2 * i + m.trailing_zeros() as usize + 1));
+            }
+            if e != 0 {
+                return None;
+            }
+            i = (i + 4) & mask;
         }
     }
 
@@ -704,7 +724,7 @@ mod imp {
 
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
-pub(crate) use imp::Probe;
+pub(crate) use imp::{probe_view, Probe};
 
 /// Whether `main::click_task_avx2` should take k5 for this task.
 #[inline(always)]

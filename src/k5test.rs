@@ -632,4 +632,79 @@ mod x86 {
         let p = k5::Probe::new(&e);
         assert_eq!(unsafe { ph(&p, 0x15, crate::keys::mix(0x15)) }, crate::keys::mix(0x15));
     }
+
+    /// probe_view (the liftable group probe) against the table's own
+    /// lookups: found iff person_of_h finds the key, and the same value
+    /// through person_hash; adversarial keys (unmix of chosen hashes) pile
+    /// dozens of keys into one probe group, including the last group of the
+    /// table (wrap-around), next to random keys.
+    #[test]
+    fn k5test_probe_adversarial() {
+        if !have_cpu() {
+            return;
+        }
+        #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+        unsafe fn pv(t: &LinkTable, k: u64, h: u64) -> Option<u64> {
+            let (slots, mask, amask, _) = t.view();
+            assert!(mask != 0 && amask == !3);
+            k5::probe_view(slots, mask, k, h)
+        }
+        #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+        unsafe fn ph(p: &k5::Probe, k: u64, h: u64) -> u64 {
+            p.person_hash(k, h)
+        }
+        let mut r = Rng::new(seed0() ^ 4321);
+        for &(npairs, crowd) in &[(4usize, 6usize), (16, 30), (64, 100), (5000, 300)] {
+            let t = LinkTable::with_pairs(npairs + crowd, 1);
+            let (_, mask, _, _) = t.view();
+            let mut alloc = crate::links::IdxAlloc::new();
+            // keys whose hashes all start in the last group (wrap-around)
+            // or in group 0: unmix gives the key of a chosen hash
+            let crowd_key = |r: &mut Rng, last: bool| -> u64 {
+                loop {
+                    let hh = (r.next() & !(mask as u64)) | if last { (mask & !3) as u64 | r.below(4) } else { r.below(4) };
+                    let k = crate::keys::unmix(hh);
+                    if k != 0 {
+                        return k;
+                    }
+                }
+            };
+            let mut keys_in = Vec::new();
+            for i in 0..crowd {
+                let a = crowd_key(&mut r, i % 2 == 0);
+                let b = crowd_key(&mut r, i % 3 == 0);
+                t.link(a, b, &mut alloc);
+                keys_in.push(a);
+                keys_in.push(b);
+            }
+            for _ in 0..npairs {
+                let a = r.next() | 1;
+                let b = if r.chance(0.5) { r.next() | 1 } else { *r.pick(&keys_in) };
+                t.link(a, b, &mut alloc);
+                keys_in.push(a);
+                keys_in.push(b);
+            }
+            for b in 0..t.root_blocks() {
+                t.finalize_roots(b);
+            }
+            for b in 0..t.val_blocks() {
+                t.finalize_vals(b);
+            }
+            let p = k5::Probe::new(&t);
+            for i in 0..100_000 {
+                let k = match i % 4 {
+                    0 => *r.pick(&keys_in),
+                    1 => {
+                        let last = r.chance(0.5);
+                        crowd_key(&mut r, last)
+                    }
+                    _ => r.next() | 1,
+                };
+                let h = crate::keys::mix(k);
+                let got = unsafe { pv(&t, k, h) };
+                assert_eq!(got.is_some(), t.person_of_h(k, h).is_some(), "key {:x}, {} pairs + {} crowded", k, npairs, crowd);
+                assert_eq!(unsafe { ph(&p, k, h) }, t.person_hash(k, h), "key {:x}, {} pairs + {} crowded", k, npairs, crowd);
+            }
+        }
+    }
 }
