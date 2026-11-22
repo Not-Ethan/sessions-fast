@@ -338,12 +338,36 @@ pub fn reset_longs(attempt: u64) {
 /// decode table: sets `collision()` if one key stands for two IDs. Returns
 /// the number of distinct long IDs (0 and no work when there are none).
 pub fn verify_longs(threads: usize) -> usize {
+    let t0 = std::time::Instant::now();
+    let d = verify_longs_inner(threads);
+    VERIFY_NS.fetch_add(t0.elapsed().as_nanos() as u64, AO::Relaxed);
+    d
+}
+
+/// Wall time spent in verify_longs (ns) and the last count of logged
+/// entries / distinct long IDs (statistics for SS_VERBOSE).
+pub static VERIFY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LONG_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LONG_DISTINCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// "long_entries=.. long_distinct=.. long_verify_ms=.." for the verbose report.
+pub fn long_stats() -> String {
+    format!(
+        "long_entries={} long_distinct={} long_verify_ms={:.1}",
+        LONG_ENTRIES.load(AO::Relaxed),
+        LONG_DISTINCT.load(AO::Relaxed),
+        VERIFY_NS.load(AO::Relaxed) as f64 / 1e6
+    )
+}
+
+fn verify_longs_inner(threads: usize) -> usize {
     let par = |f: &(dyn Fn(usize) + Sync)| {
         crate::par(threads, f);
     };
     flush_thread();
     let lists = LOGS.lock().unwrap();
     let total: usize = lists.iter().map(|v| v.len()).sum();
+    LONG_ENTRIES.store(total as u64, AO::Relaxed);
     if total == 0 {
         return 0;
     }
@@ -429,6 +453,7 @@ pub fn verify_longs(threads: usize) -> usize {
         COLLISION.store(true, AO::Relaxed);
     }
     let distinct = n.iter().sum();
+    LONG_DISTINCT.store(distinct as u64, AO::Relaxed);
     let tab = Box::new(LongTab { arr, start, n });
     TAB.store(Box::into_raw(tab), AO::Release);
     distinct

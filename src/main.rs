@@ -2712,7 +2712,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
 
     if verbose {
         return format!(
-            "sessions: {} | pipeline={} links={:.1}ms {} threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} wc_over_lines={} peak_rss={}MB {} | sub:{}",
+            "sessions: {} | pipeline={} links={:.1}ms {} threads={} avx2={} pe_bits={} ps_bits={} user_rows={} fallback_keys={} {} wc_over_lines={} peak_rss={}MB {} | sub:{}",
             marks.report(),
             pipeline,
             LINKS_US.load(Ordering::Relaxed) as f64 / 1e3,
@@ -2723,6 +2723,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
             ps_bits,
             rows,
             keys::any_fallback(),
+            keys::long_stats(),
             parts::WC_OVER_LINES.load(Ordering::Relaxed),
             sys::peak_rss_mb(),
             sys::anon_summary(),
