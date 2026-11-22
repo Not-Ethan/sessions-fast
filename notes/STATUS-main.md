@@ -1,15 +1,16 @@
 # STATUS of the main engineer (branch ss-opt4, worktree .claude/worktrees/opt4)
 
-Updated: Sun 04:50 ET.
+Updated: Sun 05:00 ET.
 
 ## Now
-- ss-milestone-18 = 1651a22 TAGGED (gate ~/xgate_x3.log on ss-bench: 32 MATCH, nothing else).
-- Milestone 19 candidate = c870b9c (m18 + 9da10b2 TLS + 41c0a81 AVX2 probe + k5 click kernel + k4 event
-  kernel, both on by default + k5 test lock). Image ss-a3-x7. Gate ~/xgate19.sh x7 running (log
-  ~/xgate_x7.log); tag ss-milestone-19 when it passes.
-- Milestone 20 candidate in preparation = d143e10 (c870b9c + quick-wins #8 e7b9c10, #9 a367c84,
-  #10 d143e10). Image ss-a3-x8.
-- #6-B parked: estimated only 7-9 ms at e60 after A; needs k4/k5/BSink changes to pass the value.
+- Tags: ss-milestone-18 = 1651a22 (real scorer 0.9154 s), ss-milestone-19 = c870b9c (0.8278 s).
+- m20 candidate = c7c5560: m19 + #8 (e7b9c10) + #10 (d143e10) + #9 reverted (no gain, orchestrator) +
+  7fa2005 (one AVX2 probe: links.rs calls k5::probe_view) + 6b2a0c5 (overflow-line statistic per Parts,
+  not a contended global atomic; line_over was 1.6% of perf samples). #18 to be added when confirmed.
+- m21 candidate = 2d599cd lean sink (panel row 5; SS_LEAN=0 = BSink) + 9a0a833 (SS_SUBB experiment).
+- Queued on ss-bench (sess1.sh): images x9/x10/x11, PGO experiment (pgo.sh: instrumented v3, trained on
+  dev5+e7, images ss-pgo-on/off), then a quiet mirrored timing session m19|m20|m21|lean0|subb32k|pgo.
+- #6-B rejected (orchestrator). Row 7 (table layout) waits for the orchestrator's engine-design note.
 
 ## Measured (ss-bench, a3-m17 = cdadcff, SS_VERBOSE + SS_MEMACCT, one run each)
 - e23: user-ID log 3.35M entries / 184K distinct long IDs; event-ID log 2.69M entries; long verify
