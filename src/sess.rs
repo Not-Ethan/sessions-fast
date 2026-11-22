@@ -579,11 +579,14 @@ impl St {
         }
         self.acc.lap(P_ATTR);
         // 5. one row per day
-        self.ubuf.clear();
-        self.ubuf.extend_from_slice(&[0; 4]);
-        keys::decode_into(keys::unmix(name), &mut self.ubuf);
-        let ulen = (self.ubuf.len() - 4) as u32;
-        self.ubuf[..4].copy_from_slice(&ulen.to_le_bytes());
+        // name 0 (key 0 is never produced): the caller has set ubuf
+        if name != 0 {
+            self.ubuf.clear();
+            self.ubuf.extend_from_slice(&[0; 4]);
+            keys::decode_into(keys::unmix(name), &mut self.ubuf);
+            let ulen = (self.ubuf.len() - 4) as u32;
+            self.ubuf[..4].copy_from_slice(&ulen.to_le_bytes());
+        }
         let mut i = 0;
         while i < ns {
             let j = self.sess[i].dend as usize;
@@ -759,6 +762,15 @@ impl PersonSess {
     #[inline]
     pub(crate) fn person(&mut self, p: u64, name: u64, es: &[SRec], cs: &mut [Cl], ctx: &Ctx) {
         self.0.person(p, name, es, cs, ctx)
+    }
+
+    /// The next person's name as its ID string (then `person` with name 0).
+    #[inline]
+    pub(crate) fn set_name(&mut self, id: &[u8]) {
+        let u = &mut self.0.ubuf;
+        u.clear();
+        u.extend_from_slice(&(id.len() as u32).to_le_bytes());
+        u.extend_from_slice(id);
     }
 
     /// Writes this thread's user_daily part (thread 0 always) and returns

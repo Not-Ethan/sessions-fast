@@ -345,14 +345,22 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     let xm = Xmap::new();
     // 1. links (the general code), then slot -> root slot (stored + 1; 0 =
     // the slot is its own person)
-    let lb = super::LocBits::new(threads, ctx.ps_bits).unwrap();
-    let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
-    let (lt, _) = super::parse_b(links_in, &empty, &empty, ctx, lb, None);
-    marks.mark("d.links");
     let xbase = d.xbase() as usize;
     let proot: &'static [AtomicU32] = arena(xbase);
     let xroot: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
-    link_roots(&lt, &d, &xm, proot, &xroot, threads);
+    if std::env::var("SS_DLINKS").map_or(true, |v| v != "0") {
+        let np = dense_links(links_in, ctx, &d, &xm, proot, &xroot, threads, marks);
+        stat("d_link_pairs", np);
+        if std::env::var("SS_LINKCHECK").is_ok() {
+            link_check(links_in, ctx, &d, &xm, proot, &xroot, threads);
+        }
+    } else {
+        let lb = super::LocBits::new(threads, ctx.ps_bits).unwrap();
+        let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
+        let (lt, _) = super::parse_b(links_in, &empty, &empty, ctx, lb, None);
+        marks.mark("d.links");
+        link_roots(&lt, &d, &xm, proot, &xroot, threads);
+    }
     marks.mark("d.slots");
     // 2. events
     // bucket capacities (overflow is exact, only slower): copies spread
@@ -823,6 +831,7 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
     }
     let bar = std::sync::Barrier::new(threads);
     let next_piece = AtomicUsize::new(0);
+    let old_pmix = std::env::var("SS_PMIX").is_ok();
     let outs = super::par(threads, |t| {
         let mut st = PersonSess::new(ctx, est_rows);
         let mut es: Vec<SRec> = Vec::new();
@@ -862,7 +871,17 @@ pub fn run(links_in: &Input, ev: &Input, cl: &Input, ctx: &Ctx, d: Dense, ud: &P
                 a = base + i;
                 b = base + j;
             }
-            let pm = pmix(p, &d, &xkeys);
+            // the person's name: a dense slot's ID string straight into the
+            // row buffer (name 0), else the interned key (SS_PMIX=1: every
+            // name through pmix, as before)
+            let pm = if (p as usize) < xbase && !old_pmix {
+                let mut nb = [0u8; 9];
+                let n = slot_name(p, &d, &mut nb);
+                st.set_name(&nb[..n]);
+                0
+            } else {
+                pmix(p, &d, &xkeys)
+            };
             let pp = p as u64;
             let (fa, fb) = if !has_foreign { (0, 0) } else { (foreign.partition_point(|c| c.person < pp), foreign.partition_point(|c| c.person <= pp)) };
             if fa == fb {
@@ -951,6 +970,300 @@ fn link_roots(lt: &LinkTable, d: &Dense, xm: &Xmap, proot: &[AtomicU32], xroot: 
         }
         xroot.lock().unwrap().extend(local);
     });
+}
+
+/// The link lines of one task as slot pairs (self-links skipped): the same
+/// scanner and drop rules as main::link_task (malformed lines and lines with
+/// an empty side dropped), each side's slot as `user_slot_w`.
+#[inline(always)]
+fn dlink_task_x<const AVX2: bool>(b: &[u8], task: Task, d: &Dense, xm: &Xmap, v: &mut Vec<(u32, u32)>) {
+    let safe_end = b.as_ptr() as usize + b.len();
+    v.reserve((task.end - task.start) / 16 + 16);
+    scan::for_each_record_x::<2, _, AVX2>(b, task.start, task.end, #[inline(always)] |f| {
+        if f[0].is_empty() || f[1].is_empty() {
+            return;
+        }
+        // f[0] starts before f[1]: 16 readable bytes from f[1] cover f[0] too
+        let wide = f[1].as_ptr() as usize + 16 <= safe_end;
+        let sa = user_slot_w(f[0], d, xm, wide);
+        let sb = user_slot_w(f[1], d, xm, wide);
+        if sa != sb {
+            v.push((sa, sb));
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn dlink_task_avx2(b: &[u8], task: Task, d: &Dense, xm: &Xmap, v: &mut Vec<(u32, u32)>) {
+    dlink_task_x::<true>(b, task, d, xm, v)
+}
+
+/// The ID string of a dense slot: `u` + base 36 of its scrambled number
+/// (at most 8 digits: v < 2^40 < 36^8), into `buf`; returns its length.
+#[inline(always)]
+fn slot_name(s: u32, d: &Dense, buf: &mut [u8; 9]) -> usize {
+    let u = (s as u64 / 8) * 512 + (s as u64 % 8);
+    let mut v = scramble(u, d.ku);
+    let mut dig = [0u8; 8];
+    let mut n = 0;
+    loop {
+        dig[n] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize];
+        v /= 36;
+        n += 1;
+        if v == 0 || n == 8 {
+            break;
+        }
+    }
+    buf[0] = b'u';
+    for i in 0..n {
+        buf[1 + i] = dig[n - 1 - i];
+    }
+    n + 1
+}
+
+/// Packed key (keys.rs) of a slot's ID string: canonical `u` + base 36 for a
+/// dense slot, the interned key for an exceptional one.
+#[inline]
+fn slot_key(s: u32, d: &Dense, xkeys: &[u64]) -> u64 {
+    if s < d.xbase() {
+        let mut buf = [0u8; 9];
+        let n = slot_name(s, d, &mut buf);
+        keys::key_of(&buf[..n])
+    } else {
+        xkeys[(s - d.xbase()) as usize]
+    }
+}
+
+/// 36^k for k = 0..=8.
+const P36: [u64; 9] = {
+    let mut t = [1u64; 9];
+    let mut k = 1;
+    while k < 9 {
+        t[k] = t[k - 1] * 36;
+        k += 1;
+    }
+    t
+};
+
+/// Byte-wise order of two distinct slots' ID strings (`slot_key` order).
+/// Two dense slots: both are `u` + canonical base 36 (no leading zero), so
+/// with m digits each the numbers compare; otherwise the shorter one's
+/// number against the longer one's leading digits (a proper prefix sorts
+/// first), without building either string.
+#[inline(always)]
+fn slot_less(a: u32, b: u32, d: &Dense, xkeys: &[u64]) -> bool {
+    let xb = d.xbase();
+    if a < xb && b < xb {
+        let va = scramble((a as u64 / 8) * 512 + (a as u64 % 8), d.ku);
+        let vb = scramble((b as u64 / 8) * 512 + (b as u64 % 8), d.ku);
+        let nd = |v: u64| -> usize {
+            let mut m = 1;
+            while m < 8 && v >= P36[m] {
+                m += 1;
+            }
+            m
+        };
+        let (ma, mb) = (nd(va), nd(vb));
+        if ma == mb {
+            va < vb
+        } else if ma < mb {
+            // a < b unless b's first ma digits are below a's number
+            vb >= va * P36[mb - ma]
+        } else {
+            va < vb * P36[ma - mb]
+        }
+    } else {
+        keys::cmp(slot_key(a, d, xkeys), slot_key(b, d, xkeys)) == std::cmp::Ordering::Less
+    }
+}
+
+/// Union-find over slots for `dense_links`: dense slots use `proot` itself
+/// as the parent table, exceptional slots `xpar` (parent + 1; 0 = root).
+struct SlotUf<'a> {
+    proot: &'a [AtomicU32],
+    xpar: &'a [AtomicU32],
+    xbase: u32,
+    d: &'a Dense,
+    xkeys: &'a [u64],
+}
+
+impl SlotUf<'_> {
+    #[inline(always)]
+    fn ent(&self, s: u32) -> &AtomicU32 {
+        if s < self.xbase {
+            &self.proot[s as usize]
+        } else {
+            &self.xpar[(s - self.xbase) as usize]
+        }
+    }
+
+    /// Root with path halving (union phase only).
+    #[inline(always)]
+    fn find(&self, mut x: u32) -> u32 {
+        loop {
+            let p = self.ent(x).load(Ordering::Acquire);
+            if p == 0 {
+                return x;
+            }
+            let p = p - 1;
+            let gp = self.ent(p).load(Ordering::Acquire);
+            if gp == 0 {
+                return p;
+            }
+            // x is not a root, so it is never hooked; gp is an ancestor of x
+            self.ent(x).store(gp, Ordering::Release);
+            x = gp - 1;
+        }
+    }
+
+    /// Root without writes (finalize: no halving store may overwrite a
+    /// compressed entry).
+    #[inline(always)]
+    fn find_ro(&self, mut x: u32) -> u32 {
+        loop {
+            let p = self.ent(x).load(Ordering::Relaxed);
+            if p == 0 {
+                return x;
+            }
+            x = p - 1;
+        }
+    }
+
+    /// Joins two slots; the root with the byte-wise smaller ID stays root,
+    /// so every component's root is its smallest ID (the person's name).
+    #[inline(always)]
+    fn union(&self, a: u32, b: u32) {
+        let (mut a, mut b) = (a, b);
+        loop {
+            a = self.find(a);
+            b = self.find(b);
+            if a == b {
+                return;
+            }
+            if !slot_less(a, b, self.d, self.xkeys) {
+                std::mem::swap(&mut a, &mut b);
+            }
+            if self.ent(b).compare_exchange(0, a + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return;
+            }
+        }
+    }
+}
+
+/// Links straight into slots (replaces parse_b's link table + link_roots;
+/// SS_DLINKS=0 restores those): parse every link line into a slot pair,
+/// union-find over slots, then every linked slot's entry holds its root + 1
+/// (proot for dense slots; roots keep 0 = own person) and xroot every
+/// exceptional linked slot with its root. Returns the number of link pairs.
+fn dense_links(links_in: &Input, ctx: &Ctx, d: &Dense, xm: &Xmap, proot: &[AtomicU32], xroot: &Mutex<Vec<(u32, u32)>>, threads: usize, marks: &mut super::Marks) -> usize {
+    let next = AtomicUsize::new(0);
+    let pairs: Vec<Vec<(u32, u32)>> = super::par(threads, |_| {
+        let mut v = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&task) = links_in.tasks.get(i) else { break };
+            let b = links_in.maps[task.file as usize].bytes();
+            #[cfg(target_arch = "x86_64")]
+            if ctx.avx2 {
+                unsafe { dlink_task_avx2(b, task, d, xm, &mut v) };
+                continue;
+            }
+            dlink_task_x::<false>(b, task, d, xm, &mut v);
+        }
+        v
+    });
+    // every exceptional ID of a link is interned now (later ones are unlinked)
+    let xkeys = xm.key_table();
+    let xpar: Vec<AtomicU32> = (0..xkeys.len()).map(|_| AtomicU32::new(0)).collect();
+    let uf = SlotUf { proot, xpar: &xpar, xbase: d.xbase(), d, xkeys: &xkeys };
+    super::par(threads, |t| {
+        const AHEAD: usize = 8;
+        let v = &pairs[t];
+        for k in 0..v.len() {
+            if k + AHEAD < v.len() {
+                let (a, b) = v[k + AHEAD];
+                super::prefetch(uf.ent(a) as *const AtomicU32 as *const u8);
+                super::prefetch(uf.ent(b) as *const AtomicU32 as *const u8);
+            }
+            uf.union(v[k].0, v[k].1);
+        }
+    });
+    marks.mark("d.links");
+    // finalize: roots of every endpoint without writes, then the stores
+    let roots: Vec<Vec<(u32, u32)>> = super::par(threads, |t| {
+        let mut r = Vec::new();
+        for &(a, b) in &pairs[t] {
+            for s in [a, b] {
+                let x = uf.find_ro(s);
+                if x != s {
+                    r.push((s, x));
+                }
+            }
+        }
+        r
+    });
+    let xbase = d.xbase();
+    let local: Vec<Vec<(u32, u32)>> = super::par(threads, |t| {
+        let mut xl = Vec::new();
+        for &(s, x) in &roots[t] {
+            if s < xbase {
+                proot[s as usize].store(x + 1, Ordering::Relaxed);
+            } else {
+                xl.push((s - xbase, x));
+            }
+        }
+        xl
+    });
+    let mut xr = xroot.lock().unwrap();
+    for l in local {
+        xr.extend(l);
+    }
+    pairs.iter().map(|v| v.len()).sum()
+}
+
+/// SS_LINKCHECK (with the dense links on): the general link table +
+/// link_roots on the same input and Xmap must give every slot the same
+/// person as `dense_links` did. Exits nonzero on a difference.
+fn link_check(links_in: &Input, ctx: &Ctx, d: &Dense, xm: &Xmap, proot: &[AtomicU32], xroot: &Mutex<Vec<(u32, u32)>>, threads: usize) {
+    let lb = super::LocBits::new(threads, ctx.ps_bits).unwrap();
+    let empty = Input { maps: Vec::new(), tasks: Vec::new(), bytes: 0 };
+    let (lt, _) = super::parse_b(links_in, &empty, &empty, ctx, lb, None);
+    let xbase = d.xbase();
+    let proot2: &'static [AtomicU32] = arena(xbase as usize);
+    let xroot2: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+    link_roots(&lt, d, xm, proot2, &xroot2, threads);
+    let nx = xm.key_table().len();
+    let pmap = |pr: &[AtomicU32], xr: &Mutex<Vec<(u32, u32)>>| -> (Vec<u32>, Vec<u32>) {
+        let dense: Vec<u32> = (0..xbase).map(|s| match pr[s as usize].load(Ordering::Relaxed) { 0 => s, v => v - 1 }).collect();
+        let mut x: Vec<u32> = (0..nx as u32).map(|i| xbase + i).collect();
+        for &(i, r) in xr.lock().unwrap().iter() {
+            x[i as usize] = r;
+        }
+        (dense, x)
+    };
+    let (a, ax) = pmap(proot, xroot);
+    let (b, bx) = pmap(proot2, &xroot2);
+    let bad = (0..xbase as usize).filter(|&s| a[s] != b[s]).count();
+    let badx = (0..nx).filter(|&i| ax[i] != bx[i]).count();
+    let linked = (0..xbase as usize).filter(|&s| b[s] != s as u32).count();
+    if bad != 0 || badx != 0 {
+        let xkeys = xm.key_table();
+        for s in (0..xbase as usize).filter(|&s| a[s] != b[s]).take(10) {
+            eprintln!(
+                "linkcheck: slot {} ({:?}): dense {} ({:?}) general {} ({:?})",
+                s,
+                String::from_utf8_lossy(&keys::decode(slot_key(s as u32, d, &xkeys))),
+                a[s],
+                String::from_utf8_lossy(&keys::decode(slot_key(a[s], d, &xkeys))),
+                b[s],
+                String::from_utf8_lossy(&keys::decode(slot_key(b[s], d, &xkeys)))
+            );
+        }
+        eprintln!("linkcheck: MISMATCH {} dense slots, {} exceptional slots ({} linked non-root slots)", bad, badx, linked);
+        std::process::exit(1);
+    }
+    eprintln!("linkcheck: OK {} dense slots ({} linked to another root), {} exceptional slots", xbase, linked, nx);
 }
 
 /// keys.rs's 6-bit alphabet (packed keys).
@@ -1191,4 +1504,68 @@ pub(crate) fn cl_line(f: &[&[u8]; 4], ctx: &Ctx, d: &Dense, xm: &Xmap, v: &mut P
     let ck = if wide { unsafe { keys::key_of_wide(f[0]) } } else { keys::key_of(f[0]) };
     let q = ((us >> 16) as usize).min(nbc - 1);
     v.push(q, DC { us, camp: camp as u32, ts: (t - cws) as u32, _p: 0, ck, _q: 0 });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// slot_less agrees with the byte-wise order of the packed keys of the
+    /// slots' ID strings (slot_key), over random dense slots, slots near
+    /// digit-count edges, and exceptional slots.
+    #[test]
+    fn slot_less_matches_key_order() {
+        let xkeys: Vec<u64> = [&b"U1"[..], b"u0abc", b"uzzzzzzzzz", b"u", b"a", b"uZ", b"u00", b"u-1"].iter().map(|s| keys::key_of(s)).collect();
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for &pmax in &[1u64 << 10, 3_000_000, 1 << 27] {
+            for k in 0..4 {
+                let ku = next() & MASK;
+                let d = Dense { ke: 0, ku, bound: 1 << 20, pmax, n_est: 0, s_est: 0, lines_est: 0, pfrac: 0.0, bshift: 16 };
+                let xb = d.xbase();
+                let pick = |r: u64| -> u32 {
+                    if r % 50 == 0 {
+                        xb + (r / 50 % xkeys.len() as u64) as u32
+                    } else {
+                        (r % xb as u64) as u32
+                    }
+                };
+                for _ in 0..200_000 {
+                    let a = pick(next());
+                    let b = pick(next());
+                    if a == b {
+                        continue;
+                    }
+                    let want = keys::cmp(slot_key(a, &d, &xkeys), slot_key(b, &d, &xkeys)) == std::cmp::Ordering::Less;
+                    assert_eq!(slot_less(a, b, &d, &xkeys), want, "pmax {} key {} slots {} {}", pmax, k, a, b);
+                }
+            }
+        }
+        // slots whose numbers sit on digit-count edges: search slots whose
+        // scrambled value is below 36^m for small m (keys chosen so that
+        // some exist) by brute force over the inverse
+        let d = Dense { ke: 0, ku: 0x12345, bound: 1 << 20, pmax: 1 << 27, n_est: 0, s_est: 0, lines_est: 0, pfrac: 0.0, bshift: 16 };
+        let mut edge = Vec::new();
+        for m in 1..=8usize {
+            for v in [P36[m - 1], P36[m - 1] + 1, P36[m] - 1, P36[m] / 2] {
+                let u = unscramble(v, d.ku);
+                if (u >> 9) < d.pmax && (u & 511) < 8 {
+                    edge.push(((u >> 9) * 8 + (u & 511)) as u32);
+                }
+            }
+        }
+        for &a in &edge {
+            for &b in &edge {
+                if a != b {
+                    let want = keys::cmp(slot_key(a, &d, &xkeys), slot_key(b, &d, &xkeys)) == std::cmp::Ordering::Less;
+                    assert_eq!(slot_less(a, b, &d, &xkeys), want, "edge slots {} {}", a, b);
+                }
+            }
+        }
+    }
 }

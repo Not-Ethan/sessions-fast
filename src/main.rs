@@ -2461,7 +2461,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize, verbose: bool) -> String
     let centries: Vec<(&[u8], u16)> = crows.iter().enumerate().map(|(i, &(c, _))| (c, i as u16)).collect();
     marks.mark("lookups");
     let chunk = env_usize("SS_CHUNK").unwrap_or(2 << 20);
-    let links_in = load_input(&data_dir.join("links"), chunk);
+    // links are small (about 1/20 of the events): smaller chunks balance
+    // the link parse over the threads (SS_LCHUNK overrides)
+    let links_in = load_input(&data_dir.join("links"), env_usize("SS_LCHUNK").unwrap_or(chunk / 8).max(1));
     let events_in = load_input(&data_dir.join("events"), chunk);
     // click tasks run last in the parse phase: half-size chunks shorten the
     // tail where threads wait for the slowest (join idle 14-24 -> 6-8
