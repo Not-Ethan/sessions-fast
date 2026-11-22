@@ -64,6 +64,91 @@ struct Slot {
     sidx: u32,
 }
 
+/// Session lanes of attribute_bm (64 sessions, 32-byte aligned for AVX2).
+#[repr(C, align(32))]
+struct Bm {
+    /// qualifying click offsets of session i: lo[i] ..= hi[i]
+    lo: [u32; 64],
+    hi: [u32; 64],
+    /// latest qualifying click ts + 1 (0: none yet)
+    bt: [u32; 64],
+    /// campaign of the first click seen at that ts
+    bc: [u32; 64],
+    /// non-zero: clicks at that ts name more than one campaign
+    mx: [u32; 64],
+}
+
+/// attribute_bm is used in builds with AVX2 (the x86-64-v3 binary).
+const BM_BUILD: bool = cfg!(all(target_arch = "x86_64", target_feature = "avx2"));
+
+/// One click (offset ts, campaign) against the first nb * 8 session lanes:
+/// updates bt / bc / mx of the qualifying lanes and returns their mask.
+/// Later and tie are decided against the state before this click.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn bm_click(bm: &mut Bm, nb: usize, ts: u32, camp: u32) -> u64 {
+    use std::arch::x86_64::*;
+    debug_assert!(nb <= 8);
+    let mut m = 0u64;
+    // ts + 1 does not overflow: click offsets are below 2^31 + 2^30
+    unsafe {
+        let tsv = _mm256_set1_epi32(ts as i32);
+        let t1 = _mm256_set1_epi32(ts.wrapping_add(1) as i32);
+        let cv = _mm256_set1_epi32(camp as i32);
+        for b in 0..nb {
+            let o = b * 8;
+            let lo = _mm256_load_si256(bm.lo.as_ptr().add(o) as *const __m256i);
+            let hi = _mm256_load_si256(bm.hi.as_ptr().add(o) as *const __m256i);
+            // unsigned: lo <= ts <= hi
+            let el = _mm256_and_si256(
+                _mm256_cmpeq_epi32(_mm256_max_epu32(tsv, lo), tsv),
+                _mm256_cmpeq_epi32(_mm256_min_epu32(tsv, hi), tsv),
+            );
+            let bits = _mm256_movemask_ps(_mm256_castsi256_ps(el)) as u32 as u64;
+            if bits == 0 {
+                continue;
+            }
+            m |= bits << o;
+            let pbt = bm.bt.as_mut_ptr().add(o) as *mut __m256i;
+            let pbc = bm.bc.as_mut_ptr().add(o) as *mut __m256i;
+            let pmx = bm.mx.as_mut_ptr().add(o) as *mut __m256i;
+            let bt = _mm256_load_si256(pbt);
+            let bc = _mm256_load_si256(pbc);
+            // later: ts + 1 > bt (unsigned); tie: ts + 1 == bt (implies a winner)
+            let gt = _mm256_andnot_si256(_mm256_cmpeq_epi32(_mm256_min_epu32(t1, bt), t1), el);
+            let eq = _mm256_and_si256(_mm256_cmpeq_epi32(bt, t1), el);
+            let diff = _mm256_andnot_si256(_mm256_cmpeq_epi32(bc, cv), eq);
+            let mx = _mm256_load_si256(pmx);
+            _mm256_store_si256(pmx, _mm256_or_si256(_mm256_andnot_si256(gt, mx), diff));
+            _mm256_store_si256(pbt, _mm256_blendv_epi8(bt, t1, gt));
+            _mm256_store_si256(pbc, _mm256_blendv_epi8(bc, cv, gt));
+        }
+    }
+    m
+}
+
+/// `bm_click` without AVX2 (the same rule, one lane at a time): unused in
+/// the baseline binary (attribute_bm is off there), kept for the tests.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn bm_click(bm: &mut Bm, nb: usize, ts: u32, camp: u32) -> u64 {
+    let mut m = 0u64;
+    let t1 = ts.wrapping_add(1);
+    for i in 0..nb * 8 {
+        if bm.lo[i] <= ts && ts <= bm.hi[i] {
+            m |= 1u64 << i;
+            if t1 > bm.bt[i] {
+                bm.bt[i] = t1;
+                bm.bc[i] = camp;
+                bm.mx[i] = 0;
+            } else if t1 == bm.bt[i] && camp != bm.bc[i] {
+                bm.mx[i] = 1;
+            }
+        }
+    }
+    m
+}
+
 /// Append-only buffer in a lazily-faulted huge-page arena (never freed);
 /// moves to a larger arena if the estimate was short.
 struct Buf<T: Copy> {
@@ -163,6 +248,15 @@ struct St {
     bf_max: usize,
     /// time-sorted events take the one-scan path (SS_NOSORTED=1: off)
     sorted_fast: bool,
+    /// session-bitmask attribution (AVX2 builds; SS_ATTRBM=0: off) for
+    /// persons with 1..=64 sessions and at least `bm_min` clicks
+    bm_on: bool,
+    bm_min: usize,
+    bm: Box<Bm>,
+    /// per campaign: the sessions it assists (attribute_bm), and the
+    /// campaigns with a non-zero mask
+    amask: Vec<u64>,
+    atouched: Vec<u32>,
 
     /// per campaign: id of the last session it assisted (attribute_small)
     stamp: Vec<u32>,
@@ -233,6 +327,10 @@ const IDLE: Slot = Slot { mn: u32::MAX, mx: 0, cnt: 0, sidx: 0 };
 
 impl St {
     fn new(ctx: &Ctx, est_rows: usize, max_ev: usize, max_cl: usize) -> St {
+        St::new_parts(ctx.ncamp, ctx.ndays, &ctx.cat_names, est_rows, max_ev, max_cl)
+    }
+
+    fn new_parts(ncamp: usize, ndays: usize, cat_names: &[Vec<u8>], est_rows: usize, max_ev: usize, max_cl: usize) -> St {
         let nw = SLOTS_ALL / 64;
         St {
             hist: Vec::new(),
@@ -243,23 +341,27 @@ impl St {
             cl: Buf::new(max_cl),
             bf_max: crate::env_usize("SS_BF").unwrap_or(16),
             sorted_fast: std::env::var("SS_NOSORTED").is_err(),
+            bm_on: BM_BUILD && std::env::var("SS_ATTRBM").map_or(true, |v| v != "0"),
+            bm_min: crate::env_usize("SS_ATTRBM_MIN").unwrap_or(1).max(1),
+            bm: Box::new(Bm { lo: [0; 64], hi: [0; 64], bt: [0; 64], bc: [0; 64], mx: [0; 64] }),
+            amask: vec![0; ncamp.max(1)],
+            atouched: Vec::new(),
 
-            stamp: vec![0; ctx.ncamp.max(1)],
+            stamp: vec![0; ncamp.max(1)],
             stamp_id: 0,
             slot: vec![IDLE; nw * 64],
             bits: vec![0; nw],
             pur: Vec::new(),
             sess: Vec::new(),
-            catsum: vec![0; ctx.ndays * 256],
+            catsum: vec![0; ndays * 256],
             touched: Vec::new(),
-            daytop: vec![(0, u32::MAX); ctx.ndays],
-            wcount: vec![0; ctx.ncamp.max(1)],
-            wpos: vec![0; ctx.ncamp.max(1)],
-            since: vec![0; ctx.ncamp.max(1)],
+            daytop: vec![(0, u32::MAX); ndays],
+            wcount: vec![0; ncamp.max(1)],
+            wpos: vec![0; ncamp.max(1)],
+            since: vec![0; ncamp.max(1)],
             active: Vec::new(),
             ubuf: Vec::with_capacity(64),
-            cat_plain: ctx
-                .cat_names
+            cat_plain: cat_names
                 .iter()
                 .map(|c| {
                     let mut v = (c.len() as u32).to_le_bytes().to_vec();
@@ -279,8 +381,8 @@ impl St {
             },
             out: Out2 {
                 nrows: 0,
-                cred: vec![Cred::default(); ctx.ndays * (ctx.ncamp + 1)],
-                assist: vec![0; ctx.ndays * ctx.ncamp],
+                cred: vec![Cred::default(); ndays * (ncamp + 1)],
+                assist: vec![0; ndays * ncamp],
             },
             acc: prof::Acc::new(),
         }
@@ -636,7 +738,9 @@ impl St {
         }
         let pc = &mut cs[..m];
         let small = pc.len() <= self.bf_max;
-        if pc.len() > 1 && !small {
+        // the bitmask path takes the clicks in any order
+        let bm = self.bm_on && ns <= 64 && pc.len() >= self.bm_min;
+        if pc.len() > 1 && !small && !bm {
             pc.sort_unstable_by_key(|c| c.ts);
         }
         let pc = &*pc;
@@ -650,7 +754,9 @@ impl St {
         }
         self.acc.lap(P_CSORT);
         // 4. attribution
-        if small {
+        if bm {
+            self.attribute_bm(pc, ctx.ncamp, ctx.ndays);
+        } else if small {
             self.attribute_small(pc, ctx.ncamp, ctx.ndays);
         } else {
             self.attribute_window(pc, ctx.ncamp, ctx.ndays);
@@ -745,6 +851,89 @@ impl St {
                 }
             }
             let credit = if best == usize::MAX { ncamp } else { pc[best].camp as usize };
+            let cr = &mut self.out.cred[credit * ndays + s.day as usize];
+            cr.s += 1;
+            cr.p += s.purch;
+            cr.r += s.rev;
+        }
+    }
+
+    /// Credits and assists of the current person's 1..=64 sessions from its
+    /// clicks in any order. Per click: the mask of the sessions it qualifies
+    /// for (start <= c.ts <= start + 7 days, offsets as in attribute_small),
+    /// 8 sessions per vector; each session keeps its latest qualifying ts
+    /// (+ 1; 0 = none), the campaign of the first click seen at that ts, and
+    /// whether clicks at that ts name another campaign. Assists: the masks of
+    /// a campaign's clicks are ORed (a session counts once per campaign) and
+    /// counted per day run. Credit: no click: organic; one campaign at the
+    /// latest ts: that one; several: the smallest click_id among the clicks at
+    /// that ts (all of which qualify), as attribute_small.
+    fn attribute_bm(&mut self, pc: &[Cl], ncamp: usize, ndays: usize) {
+        let ns = self.sess.len();
+        debug_assert!(ns >= 1 && ns <= 64);
+        let nb = ns.div_ceil(8);
+        {
+            let bm = &mut *self.bm;
+            for i in 0..nb * 8 {
+                if i < ns {
+                    let st = self.sess[i].start;
+                    bm.lo[i] = st;
+                    // start < 2^31 and WEEK < 2^30: no overflow
+                    bm.hi[i] = st + WEEK as u32;
+                } else {
+                    // never qualifies (no u32 is >= MAX and <= 0 at once)
+                    bm.lo[i] = u32::MAX;
+                    bm.hi[i] = 0;
+                }
+                bm.bt[i] = 0;
+                bm.bc[i] = 0;
+                bm.mx[i] = 0;
+            }
+        }
+        for c in pc {
+            let m = bm_click(&mut self.bm, nb, c.ts, c.camp);
+            if m != 0 {
+                let a = &mut self.amask[c.camp as usize];
+                if *a == 0 {
+                    self.atouched.push(c.camp);
+                }
+                *a |= m;
+            }
+        }
+        // assists: per campaign, its sessions counted per day run (sessions
+        // are in time order; dend ends the run of session s)
+        for k in 0..self.atouched.len() {
+            let ci = self.atouched[k] as usize;
+            let mut mask = std::mem::take(&mut self.amask[ci]);
+            while mask != 0 {
+                let s = mask.trailing_zeros() as usize;
+                let j = self.sess[s].dend as usize;
+                let below = if j >= 64 { u64::MAX } else { (1u64 << j) - 1 };
+                self.out.assist[ci * ndays + self.sess[s].day as usize] += (mask & below).count_ones();
+                mask &= !below;
+            }
+        }
+        self.atouched.clear();
+        // credits
+        for i in 0..ns {
+            let s = self.sess[i];
+            let bt = self.bm.bt[i];
+            let credit = if bt == 0 {
+                ncamp
+            } else if self.bm.mx[i] == 0 {
+                self.bm.bc[i] as usize
+            } else {
+                // clicks at the latest ts name several campaigns: the smallest
+                // click_id among them (rare)
+                let t = bt - 1;
+                let mut best = usize::MAX;
+                for (k, c) in pc.iter().enumerate() {
+                    if c.ts == t && (best == usize::MAX || keys::click_cmp(c.ck, pc[best].ck) == CmpOrd::Less) {
+                        best = k;
+                    }
+                }
+                pc[best].camp as usize
+            };
             let cr = &mut self.out.cred[credit * ndays + s.day as usize];
             cr.s += 1;
             cr.p += s.purch;
@@ -1016,5 +1205,165 @@ pub fn write_campaign_daily2(path: &Path, outs: &mut [Out2], ctx: &Ctx) {
     if std::env::var_os("SS_VERBOSE").is_some() {
         let t3 = t0.elapsed();
         eprintln!("campaign_daily: merge {:.2} ms, rows {:.2} ms, write {:.2} ms ({} rows)", t1.as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3, (t3 - t2).as_secs_f64() * 1e3, days.len);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// attribute_bm against attribute_small and attribute_window (clicks
+    /// sorted) on generated persons, cell by cell over the accumulated credit
+    /// and assist tables; attribute_bm twice, with the clicks in two shuffled
+    /// orders. Clicks at exactly the session start and exactly 7 days before,
+    /// 1 ms outside each side, equal-ts clicks with the same and with
+    /// different campaigns, short and long click ids, repeated clicks, zero
+    /// clicks; 1 to 64 sessions over several days (65 only for the old paths,
+    /// which attribute_bm never takes).
+    #[test]
+    fn attribute_bm_matches_old_paths() {
+        let _g = crate::keys::LONG_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let (ncamp, ndays) = (5usize, 26usize);
+        // click ids: a "file" of short (packed) and long / odd (referenced) ids
+        let mut buf: Vec<u8> = Vec::new();
+        let mut pos: Vec<(usize, usize)> = Vec::new();
+        for i in 0..400u64 {
+            let id: Vec<u8> = match i % 4 {
+                0 => format!("k{}", i).into_bytes(),
+                1 => format!("k{:032x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).into_bytes(),
+                2 => format!("K{:032x}", i).into_bytes(),
+                _ => format!(" k{}", i).into_bytes(),
+            };
+            pos.push((buf.len(), id.len()));
+            buf.extend_from_slice(&id);
+            buf.push(b'\n');
+        }
+        crate::keys::set_click_maps(vec![(buf.as_ptr() as usize, buf.len())]);
+        let cks: Vec<u64> = pos.iter().map(|&(o, n)| crate::keys::click_key(0, buf.as_ptr(), &buf[o..o + n], false)).collect();
+        let mk = || St::new_parts(ncamp, ndays, &[], 64, 64, 64);
+        let (mut a, mut b, mut c, mut d) = (mk(), mk(), mk(), mk());
+        let mut r = Rng(0x1234_5678_9ABC_DEF1);
+        let sizes = [1usize, 7, 8, 9, 16, 17, 32, 63, 64, 65, 2, 3, 5, 12, 40];
+        for round in 0..6000 {
+            let ns = sizes[round % sizes.len()];
+            // sessions: increasing starts within a 24-day window (offsets below
+            // 2^31, as run() guarantees), days from them
+            let mut sess = Vec::with_capacity(ns);
+            let mut t = r.below(DAY as u64);
+            let span = 23 * DAY as u64 / ns as u64;
+            for _ in 0..ns {
+                t += 1 + match r.below(4) {
+                    0 => r.below(60_000),
+                    1 => r.below(span / 4 + 1),
+                    _ => r.below(span),
+                };
+                debug_assert!(t < (1 << 31));
+                let purch = r.below(3) == 0;
+                sess.push(Sess { start: t as u32, day: (t / DAY as u64) as u32, cnt: 1, purch: purch as u32, rev: if purch { 1 + r.below(5000) } else { 0 }, dend: 0 });
+            }
+            let mut end = ns as u32;
+            for i in (0..ns).rev() {
+                if i + 1 < ns && sess[i + 1].day != sess[i].day {
+                    end = i as u32 + 1;
+                }
+                sess[i].dend = end;
+            }
+            // clicks (offsets base window_start - 7 days: session s qualifies
+            // click c iff start <= c.ts <= start + 7 days)
+            let nc = match r.below(5) {
+                0 => 0,
+                1 => 1 + r.below(2),
+                2 => 1 + r.below(16),
+                _ => r.below(90),
+            } as usize;
+            let mut pc: Vec<Cl> = Vec::with_capacity(nc);
+            // distinct clicks have distinct click_ids (copies are deduplicated
+            // as identical values): ids drawn without replacement
+            let mut ids: Vec<usize> = (0..cks.len()).collect();
+            for i in (1..ids.len()).rev() {
+                let j = r.below(i as u64 + 1) as usize;
+                ids.swap(i, j);
+            }
+            for n in 0..nc {
+                let s = sess[r.below(ns as u64) as usize].start as i64;
+                let w = WEEK;
+                let ts = match r.below(8) {
+                    0 => s,
+                    1 => s + w,
+                    2 => s - 1,
+                    3 => s + w + 1,
+                    4 if !pc.is_empty() => pc[r.below(pc.len() as u64) as usize].ts as i64,
+                    _ => s - 2 * DAY + r.below((w + 4 * DAY) as u64) as i64,
+                }
+                .max(0) as u32;
+                let camp = r.below(ncamp as u64) as u32;
+                let ck = cks[ids[n]];
+                pc.push(Cl { person: 7, ck, ts, camp });
+                if r.below(6) == 0 {
+                    // a repeated click (same id, campaign and ts)
+                    pc.push(*pc.last().unwrap());
+                }
+            }
+            for st in [&mut a, &mut b, &mut c, &mut d] {
+                st.sess.clear();
+                st.sess.extend_from_slice(&sess);
+            }
+            a.attribute_small(&pc, ncamp, ndays);
+            let mut sorted = pc.clone();
+            sorted.sort_unstable_by_key(|c| c.ts);
+            b.attribute_window(&sorted, ncamp, ndays);
+            if ns <= 64 {
+                let mut p1 = pc.clone();
+                let mut p2 = pc.clone();
+                for p in [&mut p1, &mut p2] {
+                    for i in (1..p.len()).rev() {
+                        let j = r.below(i as u64 + 1) as usize;
+                        p.swap(i, j);
+                    }
+                }
+                c.attribute_bm(&p1, ncamp, ndays);
+                d.attribute_bm(&p2, ncamp, ndays);
+            } else {
+                // never taken for more than 64 sessions: the old path instead
+                c.attribute_small(&pc, ncamp, ndays);
+                d.attribute_window(&sorted, ncamp, ndays);
+            }
+            if std::env::var("BMDEBUG").is_ok() {
+                let ok = a.out.cred.iter().zip(&b.out.cred).all(|(p, q)| p.s == q.s && p.p == q.p && p.r == q.r) && a.out.assist == b.out.assist;
+                if !ok {
+                    eprintln!("round {} ns {} sessions {:?}", round, ns, sess.iter().map(|s| (s.start, s.day, s.dend)).collect::<Vec<_>>());
+                    eprintln!("clicks {:?}", pc.iter().map(|c| (c.ts, c.camp, c.ck)).collect::<Vec<_>>());
+                    for (k, (p, q)) in a.out.cred.iter().zip(&b.out.cred).enumerate() {
+                        if p.s != q.s { eprintln!("cred cell {} camp {} day {}: small {} window {}", k, k / ndays, k % ndays, p.s, q.s); }
+                    }
+                    panic!("small vs window");
+                }
+            }
+            if round % 500 == 499 || round == 5999 {
+                for (name, x) in [("window", &b), ("bm", &c), ("bm shuffled", &d)] {
+                    for (k, (p, q)) in a.out.cred.iter().zip(&x.out.cred).enumerate() {
+                        assert!(p.s == q.s && p.p == q.p && p.r == q.r, "{} cred cell {} round {}", name, k, round);
+                    }
+                    assert_eq!(a.out.assist, x.out.assist, "{} assist round {}", name, round);
+                }
+            }
+        }
+        // the tables saw real work
+        assert!(a.out.cred[..ncamp * ndays].iter().map(|c| c.s).sum::<u32>() > 10_000);
+        assert!(a.out.assist.iter().sum::<u32>() > 10_000);
+        crate::keys::set_click_maps(Vec::new());
     }
 }
