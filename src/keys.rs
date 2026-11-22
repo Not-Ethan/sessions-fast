@@ -286,14 +286,12 @@ thread_local! {
 static LOGS: Mutex<Vec<Parts<LEnt>>> = Mutex::new(Vec::new());
 static EVLOGS: Mutex<Vec<Parts<LEnt>>> = Mutex::new(Vec::new());
 
-/// One partition of the decode table: the distinct long IDs of the
-/// partition in an open-addressing table of entries (key 0 = empty slot; no
-/// key is 0), so a lookup touches one entry's line, not an index then an
-/// entry. Load at most 2/3.
+/// One partition of the decode table: the distinct long IDs of the partition
+/// and an open-addressing index over them (entry index + 1; 0 = empty).
 struct PartTab {
-    tab: Vec<LEnt>,
+    ents: Vec<LEnt>,
+    idx: Vec<u32>,
     mask: usize,
-    n: usize,
 }
 /// The decode table of long keys, NPART partitions by the key's top bits.
 struct LongTab {
@@ -426,12 +424,13 @@ fn known_exact(key: u64, pre: u64, hi: u64, lo: u64) -> bool {
     let pt = unsafe { t.parts.get_unchecked((key >> (64 - TAB_BITS)) as usize) };
     let mut s = slot_of(key, pt.mask);
     loop {
-        let e = unsafe { pt.tab.get_unchecked(s) };
+        let i = unsafe { *pt.idx.get_unchecked(s) };
+        if i == 0 {
+            return false;
+        }
+        let e = unsafe { pt.ents.get_unchecked(i as usize - 1) };
         if e.key == key {
             return (e.pre == pre) & (e.hi == hi) & (e.lo == lo);
-        }
-        if e.key == 0 {
-            return false;
         }
         s = (s + 1) & pt.mask;
     }
@@ -517,7 +516,8 @@ pub fn long_regions() -> Vec<(usize, usize)> {
         }
     };
     for pt in &t.parts {
-        add(pt.tab.as_ptr() as usize, pt.tab.capacity() * std::mem::size_of::<LEnt>());
+        add(pt.ents.as_ptr() as usize, pt.ents.capacity() * std::mem::size_of::<LEnt>());
+        add(pt.idx.as_ptr() as usize, pt.idx.len() * 4);
     }
     v
 }
@@ -605,39 +605,40 @@ fn verify_longs_inner(threads: usize) -> usize {
             }
             let n: usize = lists.iter().map(|v| v.len(p)).sum();
             // sized by the distinct values, not the occurrences (a long ID
-            // occurs ~18 times on average): the table starts small and
-            // doubles above load 2/3 (SS_VERIFYOCC=1: sized from occurrences)
+            // occurs ~18 times on average): the index starts small and
+            // doubles at load 1/2 (SS_VERIFYOCC=1: sized from occurrences)
             let mut size = if VERIFY_OCC.load(AO::Relaxed) { (2 * n).next_power_of_two().max(16) } else { (2 * n).next_power_of_two().clamp(16, VERIFY_START.load(AO::Relaxed)) };
             let mut mask = size - 1;
-            let mut tab: Vec<LEnt> = vec![LEnt::default(); size];
-            let mut cnt = 0usize;
+            let mut idx = vec![0u32; size];
+            let mut ents: Vec<LEnt> = Vec::with_capacity((size / 2).min(n));
             let mut bad = false;
             for v in lists.iter() {
                 for sl in v.get(p) {
                     for e in sl.iter() {
                         let mut s = slot_of(e.key, mask);
                         loop {
-                            let f = unsafe { tab.get_unchecked_mut(s) };
-                            if f.key == e.key {
-                                bad |= *f != *e;
-                                break;
-                            }
-                            if f.key == 0 {
-                                *f = *e;
-                                cnt += 1;
-                                if 3 * cnt > 2 * size {
-                                    // grow: reinsert the distinct entries
+                            let i = idx[s];
+                            if i == 0 {
+                                ents.push(*e);
+                                idx[s] = ents.len() as u32;
+                                if 2 * ents.len() > size {
+                                    // grow: reinsert the distinct keys
                                     size *= 2;
                                     mask = size - 1;
-                                    let old = std::mem::replace(&mut tab, vec![LEnt::default(); size]);
-                                    for f in old.iter().filter(|f| f.key != 0) {
+                                    idx = vec![0u32; size];
+                                    for (j, f) in ents.iter().enumerate() {
                                         let mut t = slot_of(f.key, mask);
-                                        while tab[t].key != 0 {
+                                        while idx[t] != 0 {
                                             t = (t + 1) & mask;
                                         }
-                                        tab[t] = *f;
+                                        idx[t] = j as u32 + 1;
                                     }
                                 }
+                                break;
+                            }
+                            let f = &ents[i as usize - 1];
+                            if f.key == e.key {
+                                bad |= f != e;
                                 break;
                             }
                             s = (s + 1) & mask;
@@ -648,7 +649,7 @@ fn verify_longs_inner(threads: usize) -> usize {
             if bad {
                 coll.store(true, AO::Relaxed);
             }
-            mine.push((p, PartTab { tab, mask, n: cnt }));
+            mine.push((p, PartTab { ents, idx, mask }));
         }
         done.lock().unwrap().append(&mut mine);
     });
@@ -659,7 +660,7 @@ fn verify_longs_inner(threads: usize) -> usize {
     let mut done = done.into_inner().unwrap();
     done.sort_unstable_by_key(|d| d.0);
     let parts: Vec<PartTab> = done.into_iter().map(|d| d.1).collect();
-    let distinct = parts.iter().map(|t| t.n).sum();
+    let distinct = parts.iter().map(|t| t.ents.len()).sum();
     LONG_DISTINCT.store(distinct as u64, AO::Relaxed);
     // black_box: rustc 1.85's LLVM otherwise turns the boxed table into a
     // global with an i8 "initialised" flag and fails to select its atomic swap
@@ -828,11 +829,12 @@ fn long_value(k: u64) -> (u64, u64, u64) {
     let pt = &t.parts[(k >> (64 - TAB_BITS)) as usize];
     let mut s = slot_of(k, pt.mask);
     loop {
-        let e = &pt.tab[s];
+        let i = pt.idx[s];
+        assert!(i != 0, "long key missing from the decode table");
+        let e = &pt.ents[i as usize - 1];
         if e.key == k {
             return (e.pre, e.hi, e.lo);
         }
-        assert!(e.key != 0, "long key missing from the decode table");
         s = (s + 1) & pt.mask;
     }
 }
